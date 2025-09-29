@@ -1,0 +1,229 @@
+/* ---------- Planning Workspace polish ---------- */
+:root{
+  --ws-bg: #f6f8fb;
+  --ws-card: #ffffff;
+  --ws-ink: #0f1b2d;
+  --ws-muted: #63758a;
+  --ws-accent: #f59e0b;     /* amber */
+  --ws-primary: #2563eb;    /* blue */
+  --ws-rail: #0d2741;
+}
+
+.ws-root { background: var(--ws-bg); padding-bottom: 12px; margin-top: 10px !important; }
+
+/* Toolbar */
+.ws-toolbar{
+  display:flex; align-items:center; gap:10px;
+  padding: 6px 6px 0 6px;
+}
+.ws-toolbar .ws-title { font-weight:700; color:#1b3d63; }
+.ws-tabs .btn{ border-radius:12px; font-weight:600; padding:8px 14px; }
+.ws-tabs .btn.ws-active{ background:#f8d24e; border-color:#f8d24e; color:#2a2000; box-shadow:0 1px 6px rgba(0,0,0,.08); }
+.ws-tabs .btn.ws-inactive{ background:#fff; color:#475569; border-color:#dfe6ef; }
+.ws-toolbar .ws-search input{
+  border-radius:12px; height:40px; box-shadow:none; border-color:#e2e8f0;
+}
+
+/* Left column card */
+.ws-left-card .card{ border-radius:16px; border:1px solid #e7edf6; box-shadow:0 4px 16px rgba(12,25,56,0.06); }
+.ws-caption{ font-weight:700; color:#667084; margin-bottom:6px; }
+
+/* Alphabet rail -> nice chips grid */
+.ws-alpha{
+  display:grid;
+  grid-template-columns: repeat(13, minmax(0, 1fr));
+  gap:6px;
+  margin: 6px 0 10px 0;
+}
+@media (max-width:1200px){
+  .ws-alpha{ grid-template-columns: repeat(9, minmax(0, 1fr)); }
+}
+@media (max-width:992px){
+  .ws-alpha{ grid-template-columns: repeat(6, minmax(0, 1fr)); }
+}
+.ws-alpha .form-check{ margin:0; padding:0; }
+.ws-alpha input[type="radio"]{ display:none; }
+.ws-alpha label{
+  display:flex; align-items:center; justify-content:center;
+  background:#fff; border:1px solid #e3e9f3; color:#334155;
+  border-radius:10px; height:32px; cursor:pointer;
+  font-weight:600; letter-spacing:.3px; user-select:none;
+}
+.ws-alpha input[type="radio"]:checked + label{
+  background:#0ea5e9; border-color:#0ea5e9; color:#fff;
+}
+
+/* Business Area list */
+#ba-list .list-group-item{
+  border:0; border-radius:12px; margin:4px 0; padding:10px 12px;
+  background:#fff; color:#0f172a; display:flex; align-items:center; gap:10px;
+  box-shadow:0 1px 0 rgba(14,22,40,.04), 0 1px 8px rgba(14,22,40,.04);
+}
+#ba-list .list-group-item:hover{ background:#f8fafc; }
+#ba-list .list-group-item .ba-ico{
+  width:28px; height:28px; border-radius:8px; background:#eff6ff; display:flex; align-items:center; justify-content:center;
+}
+
+/* Right column */
+.ws-right-card .card{ border-radius:16px; border:1px solid #e7edf6; box-shadow:0 4px 16px rgba(12,25,56,0.06); min-width: 310px;}
+.ws-right-card h6{ font-weight:800; color:#1b3d63; }
+.ws-chip{ display:inline-flex; align-items:center; padding:6px 10px; background:#f1f5f9; border-radius:999px; margin:0 8px 8px 0; font-weight:600; color:#334155; }
+.ws-chip .muted{ color:#64748b; font-weight:500; margin-left:6px; }
+.ws-section-title{ font-size:.9rem; color:#70839d; text-transform:uppercase; letter-spacing:.08em; margin-top:8px; }
+
+/* Plans table tweak */
+.ws-right-card table{ font-size:.85rem; }
+.ws-right-card th{ color:#334155; font-weight:700; text-transform:none; }
+
+/* Modal polish */
+.modal-content{ border-radius:18px; }
+.modal-header{ border-bottom:1px dashed #e2e8f0; }
+.modal-footer{ border-top:1px dashed #e2e8f0; }
+
+#ft-hrs, #pt-hrs { width: 200px !important; }
+.mb-2 { margin-top: .5rem !important; }
+.g-2.row.ghanu{ align-items: flex-start !important; }
+.form-check-label{ margin-top: 10px !important; }
+.form-check-input { margin-top: 14px !important; }
+#is-current{ align-items: center !important; }
+.form-control { width: 50% !important; }
+
+/* Breadcrumb + tabs + cards polish */
+.ws-tab { border-radius:12px; font-weight:700; }
+.ws-tab.ws-tab--active { filter: saturate(1.08) brightness(0.98); }
+
+/* Left grid with vertical alphabet rail */
+.ws-left-grid { display:grid; grid-template-columns:52px 1fr; gap:10px; }
+.ws-alpha-col { border-right:1px solid #e7edf6; padding-right:6px; }
+.ws-alpha-input { display:none; } /* hide radio dots */
+.ws-alpha-label {
+  display:block; text-align:center; margin:2px 0; padding:6px 0;
+  border:1px solid #e3e9f3; border-radius:8px; color:#0f1b2d; font-weight:700; cursor:pointer;
+}
+.ws-alpha-input:checked + .ws-alpha-label { background:#0ea5e9; color:#fff; border-color:#0ea5e9; }
+
+/* Modal header: dark bar like screenshot; primary buttons stay blue */
+.ws-modal-header{ background:#2f3747; color:#fff; }
+
+.breadcrumb { margin-bottom: 0 !important; }
+
+#site-new, #plan-name { width: 100% !important; }
+
+.mb-2.g-2.row.abc {
+  margin-top: 15px !important;
+  display: flex !important;
+  flex-wrap: nowrap;
+  gap: 12px !important;
+}
+
+.btn-close {
+  /* Invert colors to make it white (or a lighter shade) */
+  filter: invert(1) grayscale(100%) brightness(200%);
+}
+
+#btn-tab-current:active, #btn-tab-current:focus { background-color: #f59e0b; }
+#btn-tab-history:active, #btn-tab-history:focus { background-color: #f59e0b; color: white; }
+
+.col-md-33 { width: 25%; display: grid; align-items: center; }
+
+.lelo .DateInput { width: 200px !important; font-size: small; }
+.lelo .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+.lelo .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+/* --- Kanban layout (updated) --- */
+.ws-kanban {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  align-items: start;
+  overflow-x: visible;
+  padding-bottom: 4px;
+  gap: 10px;
+}
+
+/* each Sub Business Area column looks like a card */
+.ws-kanban-col{
+  background:#fff;
+  border:1px solid #e7edf6;
+  border-radius:16px;
+  box-shadow:0 4px 16px rgba(12,25,56,0.06);
+  display:flex;                 /* keep head/body stacked inside */
+  flex-direction:column;
+  min-width: 310px;
+}
+
+/* column header + body */
+.ws-col-head {
+  font-weight: 800;
+  color: #3a5166;
+  text-align: center;
+  padding: 10px 8px;
+  background: linear-gradient(180deg,#fafcff,#f1f5f9);
+  border-bottom: 1px solid #e7edf6;
+  border-top-left-radius: 12px;
+  border-top-right-radius: 12px;
+}
+.ws-col-body { padding: 8px; }
+
+/* Channel card inside a column */
+.ws-kanban-card{
+  background:#fff;
+  border:1px solid #e5ebf3;
+  border-radius:12px;
+  margin-bottom:10px;
+  overflow:hidden;
+}
+.ws-card-title{
+  display:flex; align-items:center;
+  background:#f8fafc;
+  padding:8px 10px;
+  font-weight:600;
+  border-bottom:1px solid #eef3f8;
+}
+.ws-card-body{ padding:8px 10px; }
+.ws-card-row{ display:flex; align-items:center; padding:4px 0; }
+.ws-card-empty{ padding:10px; border:1px dashed #e5ebf3; border-radius:10px; text-align:center; }
+/* --- end Kanban layout --- */
+
+/* #ba-detail-col{ width: 100%; } */
+
+/* Right pane vertical stack: chip directly above kanban */
+.ws-right-stack{
+  display: flex;
+  flex-direction: column;
+  gap: 12px;       /* tight, consistent spacing */
+}
+
+/* Ensure no extra unexpected spacing pushes kanban down */
+.ws-ba-card{ margin: 0 !important; }
+.ws-right-card{ margin: 0 !important; display: contents; }  /* remove wrapper visuals */
+.ws-ba-card .card-body{ padding: 10px 14px; }
+
+.ws-right-card { width: 102%; }
+
+@media (min-width: 768px) {
+  .col-md-220 { flex: 0 0 auto; width: 20%; }
+}
+
+/* ensure card bodies can expand to fill */
+.d-flex > .card.h-100 { width: 100%; }
+.d-flex > .card.h-100 .card-body { display: flex; flex-direction: column; height: 100%; }
+
+.d-flex1 { height: -webkit-fill-available; }
+
+/* misc */
+/* .ws-ba-card { width: 334px; } */
+/* hierarchical indentation inside a channel card */
+.ws-card-row.ws-l1 { padding-left: 12px; font-weight: 600; color:#334155; }
+.ws-card-row.ws-l2 { padding-left: 32px; }
+.ws-card-row.ws-l3 { padding-left: 52px; }
+
+.ws-del-btn { background: transparent; border: 0; cursor: pointer; font-size: 14px; line-height: 1; padding: 0 4px; }
+
+.teri.g-2.row {
+    align-items: baseline !important;
+}
+
+.text-end {
+  display: none;
+  justify-content: space-between;
+}

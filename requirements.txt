@@ -1,0 +1,13 @@
+dash
+dash-dict-callback
+openpyxl
+pandas
+numpy
+plotly
+flask
+flask-caching
+xlrd
+dash-bootstrap-components
+dash-table
+dash-svg
+xlsxwriter

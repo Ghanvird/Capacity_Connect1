@@ -1,0 +1,520 @@
+/* header card */
+.cap-hdr-card .card-body { padding: 8px 12px; }
+.cap-hdr-card .cap-icon { font-size: 18px; line-height: 1; }
+
+/* upper card spacing */
+.cap-upper-card .card-body { padding: 8px 12px; }
+
+/* tabs look */
+.cap-tabs .nav-link { color: #777; font-weight: 600; }
+.cap-tabs .nav-link.active {
+  color: #fff;
+  background-color: #f59d0d;
+  border-color: #f59d0d;
+}
+.cap-tab-card .card-body { padding: 8px 10px; }
+
+/* DataTable sculpting */
+.dash-table-container .row { margin-left: 0; margin-right: 0; }
+.dash-spreadsheet .dash-header { font-size: 12px; }
+.dash-spreadsheet-container .dash-spreadsheet-inner table {
+  border-collapse: separate;
+  border-spacing: 0;
+}
+
+/* left metric column emphasis */
+.dash-spreadsheet td[column_id="metric"], 
+.dash-spreadsheet th[column_id="metric"] {
+  position: sticky; left: 0; background: #fff; z-index: 2;
+  border-right: 1px solid #eee;
+}
+
+/* week headers – dim separators */
+.dash-spreadsheet th { white-space: pre-wrap; }
+
+/* light zebra */
+.dash-spreadsheet tr:nth-child(odd) td {
+  background-color: #fafafa;
+}
+
+/* small gray toolbar buttons (roster strip) */
+.btn.btn-secondary { background-color: #efefef; border: 1px solid #ddd; color: #333; }
+.btn.btn-secondary:hover { background-color: #e7e7e7; }
+
+#plan-hdr-name {
+    font-size: medium !important;
+    font-weight: 500 !important;
+}
+
+#plan-hdr-back, #plan-hdr-collapse {
+    background-color: #ffaa42;
+    color: #585858;
+}
+
+.dash-table-container .dash-spreadsheet-container .dash-spreadsheet-inner .column-header-name {
+    text-wrap: nowrap;
+    font-size: medium;
+}
+
+.mb-2.hhh {
+    margin-top: 0 !important;
+    margin-bottom: 0 !important;
+}
+
+.sandy {
+    margin-bottom: .3rem !important;
+}
+
+.avyaan {
+    margin-top: 5px !important;
+}
+
+/* Timeline styles */
+.timeline {
+  position: relative;
+  margin-left: 20px;
+  padding-left: 14px;
+  border-left: 2px dotted #c9ccd1;
+}
+.timeline-item {
+  position: relative;
+  margin-bottom: 12px;
+}
+.timeline-item::before {
+  content: "";
+  position: absolute;
+  left: -12px;
+  top: 4px;
+  width: 10px;
+  height: 10px;
+  background: #0d6efd; /* Bootstrap primary */
+  border-radius: 50%;
+  border: 2px solid #fff;
+  box-shadow: 0 0 0 2px #0d6efd;
+}
+.timeline-time {
+  display: block;
+  font-size: 0.8rem;
+  color: #6c757d;
+}
+.timeline-label {
+  display: block;
+  font-weight: 500;
+}
+
+.nav-item:focus {
+    background-color: #ffaa42;
+}
+
+.gaurav, .ankit {
+    padding: 0 !important;
+}
+
+.nav .nav-item .nav-link.active {
+    background-color: #ffaa42;
+    color: #585858;
+}
+
+#plan-tabs {
+  display: flex !important;
+  justify-content: space-between !important;
+}
+
+/* ─────────────────────────────────────────────
+   SCOPE: only style DataTables inside #cp-plan-detail
+   and those with class .cp-grid
+   ───────────────────────────────────────────── */
+#plan-upper .dash-spreadsheet-container table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+
+/* Header look */
+#plan-upper .dash-spreadsheet-container th {
+  background: #585858 !important;          /* header background */
+  color: #ffffff !important;                /* header text color */
+  font-weight: 700 !important;
+  text-transform: none !important;
+  white-space: pre !important;              /* keep line breaks in header names */
+  padding: 6px 8px;   
+
+}
+
+/* Cell borders */
+/* #plan-upper .dash-spreadsheet-container th, */
+#plan-upper .dash-spreadsheet-container td {
+  border: 1px solid #e2e8f0 !important;     /* subtle border */
+  padding: 6px 8px;
+}
+
+#tbl-fw .dash-spreadsheet-container table,
+#tbl-hc .dash-spreadsheet-container table,
+#tbl-attr .dash-spreadsheet-container table,
+#tbl-shr .dash-spreadsheet-container table,
+#tbl-train .dash-spreadsheet-container table,
+#tbl-ratio .dash-spreadsheet-container table,
+#tbl-seat .dash-spreadsheet-container table,
+#tbl-bva .dash-spreadsheet-container table,
+#tbl-nh .dash-spreadsheet-container table {
+  border-collapse: separate !important;
+  border-spacing: 0 !important;
+}
+
+#tbl-fw .dash-spreadsheet-container th,
+#tbl-hc .dash-spreadsheet-container th,
+#tbl-attr .dash-spreadsheet-container th,
+#tbl-shr .dash-spreadsheet-container th,
+#tbl-train .dash-spreadsheet-container th,
+#tbl-ratio .dash-spreadsheet-container th,
+#tbl-seat .dash-spreadsheet-container th,
+#tbl-bva .dash-spreadsheet-container th,
+#tbl-nh .dash-spreadsheet-container th {
+  background: #585858 !important;          /* header background */
+  color: #ffffff !important;                /* header text color */
+  font-weight: 700 !important;
+  text-transform: none !important;
+  white-space: pre !important;              /* keep line breaks in header names */
+  padding: 6px 8px;   
+}
+
+#tbl-fw .dash-spreadsheet-container td,
+#tbl-hc .dash-spreadsheet-container td,
+#tbl-attr .dash-spreadsheet-container td,
+#tbl-shr .dash-spreadsheet-container td,
+#tbl-train .dash-spreadsheet-container td,
+#tbl-ratio .dash-spreadsheet-container td,
+#tbl-seat .dash-spreadsheet-container td,
+#tbl-bva .dash-spreadsheet-container td,
+#tbl-nh .dash-spreadsheet-container td {
+  border: 1px solid #e2e8f0 !important;     /* subtle border */
+  padding: 6px 8px;
+}
+
+
+/* Alignments: first column left, the rest right (numbers) */
+#plan-upper .dash-spreadsheet-container td.column-0,
+#plan-upper .dash-spreadsheet-container th.column-0 {
+  text-align: left;
+}
+
+#plan-upper .dash-spreadsheet-container td.column-0 {
+  text-align: left;
+}
+
+#plan-upper .dash-spreadsheet-container td:not(.column-0),
+#plan-upper .dash-spreadsheet-container th:not(.column-0) {
+  text-align: right;
+}
+
+/* Default column widths
+   Make first column (Metric) wider; the rest uniform.
+   DataTable assigns .column-0, .column-1, ... to cells. */
+#plan-upper .cp-grid .dash-spreadsheet-container .column-0 {
+  min-width: 220px;
+  width: 240px;
+  max-width: 320px;
+}
+#plan-upper .cp-grid .dash-spreadsheet-container td:not(.column-0),
+#plan-upper .cp-grid .dash-spreadsheet-container th:not(.column-0) {
+  min-width: 110px;
+  width: 120px;
+  max-width: 160px;
+}
+
+/* Optional: sticky first column for easier horizontal scrolling */
+#plan-upper .cp-grid .dash-spreadsheet-container th.column-0,
+#plan-upper .cp-grid .dash-spreadsheet-container td.column-0 {
+  position: sticky;
+  left: 0;
+  background: #ffffff;           /* keep sticky col readable */
+  z-index: 2;                    /* above other cells */
+  box-shadow: 1px 0 0 #e2e8f0;   /* divider on the right */
+}
+
+/* Optional: zebra striping for readability */
+#plan-upper .cp-grid .dash-spreadsheet-container tr:nth-child(even) td {
+  background-color: #fafafa;
+}
+
+/* ─────────────────────────────────────────────
+   PER-TABLE OVERRIDES (use new IDs if you want
+   one table to differ from others)
+   ───────────────────────────────────────────── */
+
+/* Upper summary table wider first column */
+#plan-upper .dash-spreadsheet-container .column-0 {
+  width: 300px;
+  min-width: 280px;
+}
+
+/* Forecast & Workload: make week columns a bit narrower */
+#plan-upper .dash-spreadsheet-container td:not(.column-0),
+#plan-upper .dash-spreadsheet-container th:not(.column-0) {
+  width: 110px;
+}
+
+/* Ratios: slightly wider numbers */
+#plan-upper .dash-spreadsheet-container td:not(.column-0),
+#plan-upper .dash-spreadsheet-container th:not(.column-0) {
+  width: 130px;
+}
+
+#tbl-upper {
+    margin-left: 0 !important;
+    margin-right: 0 !important;
+}
+
+#plan-msg {
+    margin-top: 8px !important;
+    margin-left: 16px !important;
+    margin-bottom: 8px !important;
+}
+
+.mb-2.ashwini {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 12.5px !important;
+}
+
+@media (min-width: 768px) {
+    .aggarwal.col-md-3 {
+        flex: 0 0 auto;
+        width: 10%;
+    }
+}
+
+@media (min-width: 768px) {
+    .panwar.col-md-9 {
+        flex: 0 0 auto;
+        width: 90%;
+    }
+}
+
+#tbl-emp-roster th {
+  background: #efefef !important;          /* header background */
+  color: #888 !important;                /* header text color */
+  font-weight: 300 !important;       
+  padding: 6px 8px;   
+  overflow-x: auto;
+}
+
+#tbl-emp-roster
+.dash-table-container
+.dash-spreadsheet-container
+.dash-spreadsheet-inner
+.column-header--name {
+  
+  white-space: nowrap !important;
+  overflow: hidden !important;
+  text-overflow: ellipsis !important;
+}
+
+#inp-brid, #inp-name, #inp-tl, #inp-avp, #inp-role, #inp-prod-date, #inp-ftpt {
+    width: 100% !important;
+}
+
+.mb-2.govinda, .mb-2.negi {
+    margin-top: 24px !important;
+}
+
+
+#inp-prod-date .DateInput { width: 200px !important; font-size: small; }
+#inp-prod-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-prod-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#tp-date-from .DateInput { width: 200px !important; font-size: small; }
+#tp-date-from .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#tp-date-from .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#tp-date-to .DateInput { width: 200px !important; font-size: small; }
+#tp-date-to .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#tp-date-to .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#modal-roster-crumb {
+  border: 1px solid #d1cece;
+  padding-left: 5px !important;
+  border-radius: 6px;
+  padding-top: 6px !important;
+  padding-bottom: 6px !important;
+}
+
+.mb-2.rahul, .mb-2.ghanvir {
+  margin-top: 1rem !important;
+  margin-bottom: 1rem !important;
+  align-items: center;
+}
+
+.mb-2.ruhi, .mb-2.rudra, .mb-2.angad, .mb-2.ghanvir1, .mb-2.ghanvir2 {
+  margin-bottom: 1rem !important;
+  align-items: center;
+}
+
+#promo-date-from .DateInput {width: 220px !important; font-size: small;}
+#promo-date-from .DateInput_input {font-size: 16px; padding: 5px 11px 5px;}
+#promo-date-from .SingleDatePickerInput {padding: 0 6px; border-radius: 8px;}
+
+#promo-date-to .DateInput {width: 220px !important; font-size: small;}
+#promo-date-to .DateInput_input {font-size: 16px; padding: 5px 11px 5px;}
+#promo-date-to .SingleDatePickerInput {padding: 0 6px; border-radius: 8px;}
+
+#twp-date-from .DateInput {width: 220px !important; font-size: small;}
+#twp-date-from .DateInput_input {font-size: 16px; padding: 5px 11px 5px;}
+#twp-date-from .SingleDatePickerInput {padding: 0 6px; border-radius: 8px;}
+
+#twp-date-to .DateInput {width: 220px !important; font-size: small;}
+#twp-date-to .DateInput_input {font-size: 16px; padding: 5px 11px 5px;}
+#twp-date-to .SingleDatePickerInput {padding: 0 6px; border-radius: 8px;}
+
+#inp-loa-date .DateInput { width: 200px !important; font-size: small; }
+#inp-loa-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-loa-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#inp-back-date .DateInput { width: 200px !important; font-size: small; }
+#inp-back-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-back-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#inp-term-date .DateInput { width: 200px !important; font-size: small; }
+#inp-term-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-term-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+#inp-ftp-date .DateInput { width: 200px !important; font-size: small; }
+#inp-ftp-date .DateInput_input { font-size: 16px; padding: 5px 11px 5px; }
+#inp-ftp-date .SingleDatePickerInput{ padding: 0 6px; border-radius: 8px; }
+
+.form-label {
+  margin-right: 10px !important;
+}
+
+#tbl-fw .dash-spreadsheet-container .column-0, 
+#tbl-hc .dash-spreadsheet-container .column-0, 
+#tbl-attr .dash-spreadsheet-container .column-0,
+#tbl-shr .dash-spreadsheet-container .column-0,
+#tbl-train .dash-spreadsheet-container .column-0,
+#tbl-ratio .dash-spreadsheet-container .column-0,
+#tbl-seat .dash-spreadsheet-container .column-0,
+#tbl-bva .dash-spreadsheet-container .column-0,
+#tbl-nh .dash-spreadsheet-container .column-0 {
+  min-width: 280px;
+  position: sticky;
+  left: 0;
+}
+
+#tbl-upper .dash-spreadsheet-container .column-0{
+  position: sticky;
+  left: 0;
+}
+
+.ddd {
+  margin-left: -23px !important;
+  margin-right: -23px !important;
+}
+
+#tbl-nh {
+  margin-left: -11px !important;
+  margin-right: -11px !important;
+}
+
+.g-2.bhaiya, .ye{
+  display: flex;
+  justify-content: space-between;
+  gap: 10px;
+  max-width: 100%;
+  text-wrap: nowrap;
+  align-items: center;
+}
+
+.g-2.bhaiya {
+  margin-top: 10px !important;
+}
+
+#nh-form-class-ref, #nh-form-source-id, #nh-form-grads, #nh-form-billable, #nh-form-class-type, #nh-form-train-weeks, #nh-form-class-level, #nh-form-nest-weeks, #nh-form-date-induction, #nh-form-date-training, #nh-form-date-nesting, #nh-form-date-production {
+  width: 100% !important;
+}
+
+#nh-form-date-induction .DateInput, #nh-form-date-training .DateInput, #nh-form-date-nesting .DateInput, #nh-form-date-production .DateInput, #opt-view-from .DateInput, #opt-view-to .DateInput { width: 200px !important; font-size: small; }
+#nh-form-date-induction .DateInput_input, #nh-form-date-training .DateInput_input, #nh-form-date-nesting .DateInput_input, #nh-form-date-production .DateInput_input, #opt-view-from .DateInput_input, #opt-view-to .DateInput_input { font-size: 16px; padding: 5px 11px 5px;}
+#nh-form-date-induction .SingleDatePickerInput, #nh-form-date-training .SingleDatePickerInput, #nh-form-date-nesting .SingleDatePickerInput, #nh-form-date-production .SingleDatePickerInput, #opt-view-from .SingleDatePickerInput, #opt-view-to .SingleDatePickerInput { padding: 0 6px; border-radius: 8px;}
+
+#nh-modal {
+  min-width: max-content !important;
+  min-height: max-content !important;
+}
+
+.govin {
+  display: flex;
+  justify-content: space-between;
+}
+
+#tbl-nh-recent .dash-spreadsheet-inner th, #tbl-hire .dash-spreadsheet-inner th {
+  padding-right: 10px !important;
+  padding-left: 10px !important;
+}
+
+.yebhilo {
+  margin-left: 25px !important;
+}
+
+.offcanvas-header {
+  background: #2f3747 !important;
+  color: white !important;
+}
+
+
+.input-group-text {
+  width: 100% !important;
+  margin-bottom: 2px !important;
+  border-radius: 5px !important;
+}
+
+#whatif-aht-delta, #whatif-shr-delta, #whatif-attr-delta, #whatif-nh-shift {
+  border-radius: 5px;
+}
+
+#toggle-switch {
+  position: relative;
+  display: inline-block;
+  width: 45px;
+  height: 28px;
+  margin-top: 5px !important;
+}
+
+.gha {
+  background-color: #f8f9fa;
+  align-items: center;
+}
+
+.switch-checkbox input {
+  opacity: 0;
+  width: 0;
+  height: 0;
+}
+
+.slider {
+  position: absolute;
+  cursor: pointer;
+  top: 0; left: 0; right: 0; bottom: 0;
+  background-color: #ccc;
+  transition: 0.4s;
+  border-radius: 28px;
+}
+
+.slider:before {
+  position: absolute;
+  content: "";
+  height: 22px;
+  width: 22px;
+  left: 3px;
+  bottom: 3px;
+  background-color: white;
+  transition: 0.4s;
+  border-radius: 50%;
+}
+
+.switch-checkbox input:checked + .slider {
+  background-color: #4CAF50;
+}
+
+.switch-checkbox input:checked + .slider:before {
+  transform: translateX(22px);
+}
