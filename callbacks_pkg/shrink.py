@@ -55,18 +55,57 @@ def _shrink_hide_loader(*_):
     return False
 
 def _merge_shrink_weekly(*frames) -> pd.DataFrame:
+    """Merge any number of shrink weekly frames, preserving pct columns if present.
+    - Sums hours across sources for each (week, program)
+    - For pct columns, computes a weighted average by base_hours when possible,
+      otherwise keeps the first non-null value
+    - Runs percentage completion to fill any missing/derived values
+    """
     prepared = []
     for frame in frames:
         norm = normalize_shrink_weekly(frame)
-        if not norm.empty:
+        if isinstance(norm, pd.DataFrame) and not norm.empty:
             prepared.append(norm)
     if not prepared:
         return pd.DataFrame(columns=SHRINK_WEEKLY_FIELDS)
+
     combo = pd.concat(prepared, ignore_index=True)
-    combo = combo.groupby(["week", "program"], as_index=False)[["ooo_hours", "ino_hours", "base_hours"]].sum()
-    combo = _compute_shrink_weekly_percentages(combo)
-    combo = combo.sort_values(["week", "program"]).reset_index(drop=True)
-    return combo[SHRINK_WEEKLY_FIELDS]
+
+    def _agg_group(g: pd.DataFrame) -> pd.Series:
+        g2 = g.copy()
+        for c in ("ooo_hours", "ino_hours", "base_hours", "ooo_pct", "ino_pct", "overall_pct"):
+            if c not in g2.columns:
+                g2[c] = np.nan
+        ooo_h = pd.to_numeric(g2["ooo_hours"], errors="coerce").fillna(0.0).sum()
+        ino_h = pd.to_numeric(g2["ino_hours"], errors="coerce").fillna(0.0).sum()
+        base_h = pd.to_numeric(g2["base_hours"], errors="coerce").fillna(0.0).sum()
+
+        def _wavg(col: str) -> float:
+            v = pd.to_numeric(g2[col], errors="coerce")
+            w = pd.to_numeric(g2["base_hours"], errors="coerce").fillna(0.0)
+            mask = (~v.isna()) & (w > 0)
+            if mask.any():
+                return float((v[mask] * w[mask]).sum() / w[mask].sum())
+            v2 = v.dropna()
+            return float(v2.iloc[0]) if not v2.empty else np.nan
+
+        return pd.Series({
+            "ooo_hours": ooo_h,
+            "ino_hours": ino_h,
+            "base_hours": base_h,
+            "ooo_pct": _wavg("ooo_pct"),
+            "ino_pct": _wavg("ino_pct"),
+            "overall_pct": _wavg("overall_pct"),
+        })
+
+    agg = combo.groupby(["week", "program"], as_index=False).apply(_agg_group)
+    # groupby.apply with as_index=False returns an index we may need to reset
+    if isinstance(agg.index, pd.MultiIndex):
+        agg = agg.reset_index(level=0, drop=True).reset_index()
+
+    agg = _compute_shrink_weekly_percentages(agg)
+    agg = agg.sort_values(["week", "program"]).reset_index(drop=True)
+    return agg[SHRINK_WEEKLY_FIELDS]
 
 
 
@@ -474,4 +513,3 @@ def _arm_shrink_timer(m1, m2, m3):
 )
 def _clear_shrink_msgs(_n):
     return "", "", "", True
-
