@@ -415,10 +415,25 @@ def dl_shr_voice_tmpl(_n):
 )
 def up_shr_bo(contents, filename):
     df = parse_upload(contents, filename)
-    dff = normalize_shrinkage_bo(df)
+    # Detect schema: some BO business areas may provide data in Voice format
+    try:
+        is_voice = is_voice_shrinkage_like(df)
+    except Exception:
+        is_voice = False
+    if is_voice:
+        dff = normalize_shrinkage_voice(df)
+        if not dff.empty:
+            # Ensure channel reflects the BO context for this upload tab
+            if "Channel" in dff.columns:
+                dff["Channel"] = dff["Channel"].replace("", np.nan).fillna("Back Office")
+            else:
+                dff["Channel"] = "Back Office"
+        summ = summarize_shrinkage_voice(dff)
+    else:
+        dff = normalize_shrinkage_bo(df)
+        summ = summarize_shrinkage_bo(dff)
     if dff.empty:
         return [], [], [], [], None
-    summ = summarize_shrinkage_bo(dff)
     return (
         dff.to_dict("records"), lock_variance_cols(pretty_columns(dff)),
         summ.to_dict("records"), lock_variance_cols(pretty_columns(summ)),
@@ -437,8 +452,13 @@ def save_shr_bo(_n, store):
     if dff.empty:
         return "Nothing to save.", False
     _save_df_ds("shrinkage_raw_backoffice", dff)
-    daily = summarize_shrinkage_bo(dff)
-    weekly = weekly_shrinkage_from_bo_summary(daily)
+    # Decide summary path based on normalized store columns
+    if "superstate" in dff.columns or ("Hours" in dff.columns and "Superstate" in dff.columns):
+        daily = summarize_shrinkage_voice(dff)
+        weekly = weekly_shrinkage_from_voice_summary(daily)
+    else:
+        daily = summarize_shrinkage_bo(dff)
+        weekly = weekly_shrinkage_from_bo_summary(daily)
     combined = _merge_shrink_weekly(load_shrinkage(), weekly)
     save_shrinkage(combined)
     details = [f"raw rows: {len(dff)}"]
@@ -513,3 +533,4 @@ def _arm_shrink_timer(m1, m2, m3):
 )
 def _clear_shrink_msgs(_n):
     return "", "", "", True
+
