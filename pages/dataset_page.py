@@ -5,9 +5,8 @@ import pandas as pd
 import numpy as np
 import plotly.express as px
 from datetime import date, timedelta
-
 from app_instance import app
-from common import header_bar, pretty_columns, CHANNEL_LIST
+from common import header_bar, pretty_columns, CHANNEL_LIST, _all_locations, _sites_for_ba_location
 from cap_store import (
     load_timeseries_any,
     load_roster, load_hiring, resolve_settings
@@ -24,9 +23,15 @@ def _today_range(days: int = 56) -> tuple[date, date]:
 def _hc_dim_df() -> pd.DataFrame:
     df = _hcu_df()
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Business Area","Sub Business Area","Channel"])
+        return pd.DataFrame(columns=["Business Area","Sub Business Area","Channel","Location","Site"])
     C = _hcu_cols(df)
-    cols = {"Business Area": C.get("ba"), "Sub Business Area": C.get("sba"), "Channel": C.get("lob")}
+    cols = {
+        "Business Area": C.get("ba"),
+        "Sub Business Area": C.get("sba"),
+        "Channel": C.get("lob"),
+        "Location": C.get("loc"),
+        "Site": C.get("site"),
+    }
     out = pd.DataFrame()
     for k, c in cols.items():
         out[k] = df[c].astype(str) if c and c in df.columns else ""
@@ -125,7 +130,8 @@ def page_dataset():
     dims = _hc_dim_df()
     opts_ba = sorted([x for x in dims["Business Area"].unique().tolist() if x])
     opts_sba = sorted([x for x in dims["Sub Business Area"].unique().tolist() if x])
-    opts_loc = sorted([x for x in (dims["Location"].unique().tolist() if "Location" in dims.columns else []) if x])
+    # Location list should mimic the Settings page (Position Location Country)
+    opts_loc = _all_locations()
     opts_ch = sorted([x for x in (dims["Channel"].unique().tolist() if "Channel" in dims.columns else []) if x]) or list(CHANNEL_LIST)
     opts_site = sorted([x for x in (dims["Site"].unique().tolist() if "Site" in dims.columns else []) if x])
 
@@ -138,7 +144,8 @@ def page_dataset():
             dbc.Row([
                 dbc.Col(dcc.Dropdown(id="ds-ba", options=[{"label":x, "value":x} for x in opts_ba], multi=True, placeholder="Business Area"), md=3),
                 dbc.Col(dcc.Dropdown(id="ds-sba", options=[{"label":x, "value":x} for x in opts_sba], multi=True, placeholder="Sub Business Area"), md=3),
-                dbc.Col(dcc.Dropdown(id="ds-ch", options=[{"label":x, "value":x} for x in opts_ch], multi=True, placeholder="Channel"), md=3),
+                # Default select all channels to show defaults upfront
+                dbc.Col(dcc.Dropdown(id="ds-ch", options=[{"label":x, "value":x} for x in opts_ch], value=opts_ch, multi=True, placeholder="Channel"), md=3),
                 dbc.Col(dcc.RadioItems(id="ds-series", options=[{"label":" Auto","value":"auto"},{"label":" Actual","value":"actual"},{"label":" Forecast","value":"forecast"}], value="auto", inline=True), md=3),
             ], className="g-2"),
             dbc.Row([
@@ -181,6 +188,9 @@ def _ds_dep_channel(ba_vals, sba_vals, ch_curr):
     ch_list = sorted([x for x in df["Channel"].astype(str).dropna().unique().tolist() if x]) or list(CHANNEL_LIST)
     opts = [{"label":x, "value":x} for x in ch_list]
     curr = ch_curr if isinstance(ch_curr, list) else ([ch_curr] if ch_curr else [])
+    # If nothing picked yet, default to all available channels (mimic defaults)
+    if not curr:
+        return opts, ch_list
     return opts, [x for x in curr if x in ch_list]
 
 
@@ -190,18 +200,41 @@ def _ds_dep_channel(ba_vals, sba_vals, ch_curr):
     State("ds-site", "value"), prevent_initial_call=False
 )
 def _ds_dep_site(ba_vals, sba_vals, ch_vals, loc_vals, site_curr):
-    df = _hc_dim_df().copy()
-    def f(col, vals):
-        nonlocal df
-        if vals:
-            df = df[df[col].astype(str).str.strip().str.lower().isin({str(x).strip().lower() for x in (vals if isinstance(vals, list) else [vals])})]
-    f("Business Area", ba_vals); f("Sub Business Area", sba_vals); f("Channel", ch_vals); f("Location", loc_vals)
-    site_list = sorted([x for x in df.get("Site", pd.Series([], dtype=str)).astype(str).dropna().str.strip().unique().tolist() if x])
-    loc_set = set([str(x).strip().lower() for x in df.get("Location", pd.Series([], dtype=str)).astype(str).dropna().unique().tolist()])
+    # Mimic Settings: Sites depend on BA and Location. Handle multi-select by union.
+    # Normalize inputs to lists
+    bas = ba_vals if isinstance(ba_vals, list) else ([ba_vals] if ba_vals else [])
+    locs = loc_vals if isinstance(loc_vals, list) else ([loc_vals] if loc_vals else [])
+
+    sites = set()
+    if bas and locs:
+        for b in bas:
+            for l in locs:
+                for s in _sites_for_ba_location(b, l) or []:
+                    if s:
+                        sites.add(str(s).strip())
+    elif bas:
+        # If no location picked, collect sites across all locations for selected BAs
+        df = _hc_dim_df().copy()
+        df = df[df["Business Area"].astype(str).str.strip().str.lower().isin({str(x).strip().lower() for x in bas})]
+        sites.update([x for x in df.get("Site", pd.Series([], dtype=str)).astype(str).dropna().str.strip().unique().tolist() if x])
+    else:
+        # No BA selected: fall back to all sites (filtered by selected locations if any)
+        df = _hc_dim_df().copy()
+        if locs:
+            df = df[df["Location"].astype(str).str.strip().str.lower().isin({str(x).strip().lower() for x in locs})]
+        sites.update([x for x in df.get("Site", pd.Series([], dtype=str)).astype(str).dropna().str.strip().unique().tolist() if x])
+
+    site_list = sorted(sites)
+    # Filter out entries that are actually countries/locations
+    loc_set = {str(x).strip().lower() for x in (_hc_dim_df().get("Location", pd.Series([], dtype=str)).astype(str).dropna().unique().tolist())}
     country_block = {"india","uk","united kingdom","great britain","england","scotland","wales"}
-    site_list = [s for s in site_list if s and (sl := s.strip().lower()) not in loc_set and sl not in country_block]
+    site_list = [s for s in site_list if s and (s.strip().lower() not in loc_set) and (s.strip().lower() not in country_block)]
+
     opts = [{"label":x, "value":x} for x in site_list]
     curr = site_curr if isinstance(site_curr, list) else ([site_curr] if site_curr else [])
+    # Default to first site if none currently selected and BA or Location chosen
+    if not curr and site_list and (bas or locs):
+        return opts, [site_list[0]]
     return opts, [x for x in curr if x in site_list]
 
 
@@ -227,9 +260,22 @@ def _ds_refresh(s, e, pref, ba, sba, ch, loc, site):
     if dims.empty:
         return [], pretty_columns(["date","program","total_req_fte","supply_fte","staffing_pct"]), px.line(title="No data")
 
-    d = dims[["Business Area","Sub Business Area","Channel"]].copy()
-    d["Channel"] = d["Channel"].replace("", "Voice")
-    d["sk"] = (d["Business Area"].str.strip() + "|" + d["Sub Business Area"].str.strip() + "|" + d["Channel"].str.strip()).str.lower()
+    # Build scope keys; include Site when a site filter is applied so data flows from the specific plan
+    has_site_filter = bool(site) and (len(site) > 0 if isinstance(site, list) else True)
+    if has_site_filter and "Site" in dims.columns:
+        d = dims[["Business Area","Sub Business Area","Channel","Site"]].copy()
+        d["Channel"] = d["Channel"].replace("", "Voice")
+        d = d[d["Site"].astype(str).str.strip() != ""]
+        d["sk"] = (
+            d["Business Area"].str.strip() + "|" +
+            d["Sub Business Area"].str.strip() + "|" +
+            d["Channel"].str.strip() + "|" +
+            d["Site"].str.strip()
+        ).str.lower()
+    else:
+        d = dims[["Business Area","Sub Business Area","Channel"]].copy()
+        d["Channel"] = d["Channel"].replace("", "Voice")
+        d["sk"] = (d["Business Area"].str.strip() + "|" + d["Sub Business Area"].str.strip() + "|" + d["Channel"].str.strip()).str.lower()
     scopes = sorted(d["sk"].dropna().unique().tolist())
 
     voice = _load_voice(scopes, pref=pref)
@@ -266,6 +312,3 @@ def _ds_refresh(s, e, pref, ba, sba, ch, loc, site):
     fig = px.line(daily, x="date", y=["total_req_fte","supply_fte"], markers=True, title=f"Requirements vs Supply ({pref.title() if pref!='auto' else 'Auto'})") if not daily.empty else px.line(title="No data")
 
     return df.to_dict("records"), pretty_columns(df), fig
-
-
-
