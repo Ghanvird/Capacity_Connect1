@@ -1427,10 +1427,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 
 
     def _week_key(s):
-        ds = pd.to_datetime(s, errors="coerce")        # works for Series, list, array, Index
-        idx = pd.DatetimeIndex(ds)                     # unify into DatetimeIndex
-        monday = idx.normalize() - pd.to_timedelta(idx.weekday, unit="D")
-        return monday.date.astype(str)                 # returns Index of strings
+        ds = pd.to_datetime(s, errors="coerce")
+        idx = pd.DatetimeIndex(ds)
+        # Collapse to Monday of each week
+        monday = idx.to_period("W-MON").start_time
+        return monday.strftime("%Y-%m-%d")  # string keys like "2025-06-30"
 
     def _agg_weekly(date_idx, ooo_series, ino_series, base_series):
         wk = _week_key(date_idx)
