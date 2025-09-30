@@ -528,7 +528,16 @@ def normalize_shrinkage_bo(df: pd.DataFrame) -> pd.DataFrame:
     return dff
 
 def _bo_bucket(activity: str) -> str:
-    s = (activity or "").strip().lower()
+    try:
+        if isinstance(activity, str):
+            s = activity
+        elif pd.isna(activity):
+            s = ""
+        else:
+            s = str(activity)
+    except Exception:
+        s = ""
+    s = s.strip().lower()
     # flexible matching
     if "divert" in s: return "diverted"
     if "down" in s or s == "downtime": return "downtime"
