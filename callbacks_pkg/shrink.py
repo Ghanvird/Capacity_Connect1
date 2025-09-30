@@ -71,43 +71,55 @@ def _merge_shrink_weekly(*frames) -> pd.DataFrame:
 
     combo = pd.concat(prepared, ignore_index=True)
 
-    def _agg_group(g: pd.DataFrame) -> pd.Series:
-        g2 = g.copy()
-        for c in ("ooo_hours", "ino_hours", "base_hours", "ooo_pct", "ino_pct", "overall_pct"):
-            if c not in g2.columns:
-                g2[c] = np.nan
-        ooo_h = pd.to_numeric(g2["ooo_hours"], errors="coerce").fillna(0.0).sum()
-        ino_h = pd.to_numeric(g2["ino_hours"], errors="coerce").fillna(0.0).sum()
-        base_h = pd.to_numeric(g2["base_hours"], errors="coerce").fillna(0.0).sum()
+    # Ensure expected columns
+    for c in ("ooo_hours", "ino_hours", "base_hours", "ooo_pct", "ino_pct", "overall_pct"):
+        if c not in combo.columns:
+            combo[c] = np.nan
 
-        def _wavg(col: str) -> float:
-            v = pd.to_numeric(g2[col], errors="coerce")
-            w = pd.to_numeric(g2["base_hours"], errors="coerce").fillna(0.0)
-            mask = (~v.isna()) & (w > 0)
-            if mask.any():
-                return float((v[mask] * w[mask]).sum() / w[mask].sum())
-            v2 = v.dropna()
-            return float(v2.iloc[0]) if not v2.empty else np.nan
+    # Prepare weighted-average numerators/denominators for pct columns
+    w = pd.to_numeric(combo["base_hours"], errors="coerce").fillna(0.0)
+    def _num(col):
+        v = pd.to_numeric(combo[col], errors="coerce")
+        mask = (~v.isna()) & (w > 0)
+        return (v.where(mask, 0.0) * w.where(mask, 0.0))
+    def _den(col):
+        v = pd.to_numeric(combo[col], errors="coerce")
+        mask = (~v.isna()) & (w > 0)
+        return w.where(mask, 0.0)
 
-        return pd.Series({
-            "ooo_hours": ooo_h,
-            "ino_hours": ino_h,
-            "base_hours": base_h,
-            "ooo_pct": _wavg("ooo_pct"),
-            "ino_pct": _wavg("ino_pct"),
-            "overall_pct": _wavg("overall_pct"),
-        })
+    combo["_num_ooo"] = _num("ooo_pct")
+    combo["_den_ooo"] = _den("ooo_pct")
+    combo["_num_ino"] = _num("ino_pct")
+    combo["_den_ino"] = _den("ino_pct")
+    combo["_num_all"] = _num("overall_pct")
+    combo["_den_all"] = _den("overall_pct")
 
-    agg = combo.groupby(["week", "program"], as_index=False).apply(_agg_group)
-    # groupby.apply with as_index=False returns an index we may need to reset
-    if isinstance(agg.index, pd.MultiIndex):
-        agg = agg.reset_index(level=0, drop=True).reset_index()
+    agg = combo.groupby(["week", "program"], as_index=False).agg({
+        "ooo_hours": "sum",
+        "ino_hours": "sum",
+        "base_hours": "sum",
+        "_num_ooo": "sum",
+        "_den_ooo": "sum",
+        "_num_ino": "sum",
+        "_den_ino": "sum",
+        "_num_all": "sum",
+        "_den_all": "sum",
+    })
+
+    # Compute weighted averages, fallback to NaN if denom=0
+    def _safe_div(num, den):
+        den = den.replace({0.0: np.nan})
+        return num / den
+    agg["ooo_pct"] = _safe_div(agg["_num_ooo"], agg["_den_ooo"]) \
+        .astype(float)
+    agg["ino_pct"] = _safe_div(agg["_num_ino"], agg["_den_ino"]).astype(float)
+    agg["overall_pct"] = _safe_div(agg["_num_all"], agg["_den_all"]).astype(float)
+
+    agg = agg.drop(columns=["_num_ooo","_den_ooo","_num_ino","_den_ino","_num_all","_den_all"]) 
 
     agg = _compute_shrink_weekly_percentages(agg)
     agg = agg.sort_values(["week", "program"]).reset_index(drop=True)
     return agg[SHRINK_WEEKLY_FIELDS]
-
-
 
 def _week_floor(d: pd.Timestamp | str | dt.date, week_start: str = "Monday") -> dt.date:
     d = pd.to_datetime(d).date()
