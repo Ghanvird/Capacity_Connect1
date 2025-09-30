@@ -1,5 +1,4 @@
 import ast
-import ast
 import calendar
 import json
 import math
@@ -162,6 +161,23 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     sl_seconds   = int(settings.get("sl_seconds", 20) or 20)
     planned_aht_df = _load_ts_with_fallback("voice_planned_aht", sk)
     planned_sut_df = _load_ts_with_fallback("bo_planned_sut",   sk)
+    # Fallbacks: if channel-specific planned series missing, try budget tables like weekly view
+    if (not isinstance(planned_aht_df, pd.DataFrame)) or planned_aht_df.empty:
+        tmp = _load_ts_with_fallback("voice_budget", sk)
+        if isinstance(tmp, pd.DataFrame) and not tmp.empty:
+            x = tmp.copy()
+            if "week" in x.columns or "date" in x.columns or "month" in x.columns:
+                if "budget_aht_sec" in x.columns and "aht_sec" not in x.columns:
+                    x = x.rename(columns={"budget_aht_sec": "aht_sec"})
+                planned_aht_df = x[[c for c in x.columns if c in ("date","week","month","aht_sec")]]
+    if (not isinstance(planned_sut_df, pd.DataFrame)) or planned_sut_df.empty:
+        tmp = _load_ts_with_fallback("bo_budget", sk)
+        if isinstance(tmp, pd.DataFrame) and not tmp.empty:
+            x = tmp.copy()
+            if "week" in x.columns or "date" in x.columns or "month" in x.columns:
+                if "budget_sut_sec" in x.columns and "sut_sec" not in x.columns:
+                    x = x.rename(columns={"budget_sut_sec": "sut_sec"})
+                planned_sut_df = x[[c for c in x.columns if c in ("date","week","month","sut_sec")]]
 
     # util for month id
     def _mid(s):
@@ -476,19 +492,22 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             a_total = float(bA_itm.get(m, 0.0))
             t_total = float(bT_itm.get(m, 0.0))
             aht_actual_numden = [(bA_sut.get(m), bA_itm.get(m))]
-            aht_fore_numden   = [(planned_sut_m.get(m, bF_sut.get(m, s_target_sut)), bF_itm.get(m, 0.0))]
+            # Forecast AHT/SUT should come from forecast SUT when present (fallback to target)
+            aht_fore_numden   = [(bF_sut.get(m, s_target_sut), bF_itm.get(m, 0.0))]
         elif chk in ("outbound", "ob", "out bound"):
             f_total = float(oF_vol.get(m, 0.0))
             a_total = float(oA_vol.get(m, 0.0))
             t_total = float(oT_vol.get(m, 0.0))
             aht_actual_numden = [(oA_aht.get(m), oA_vol.get(m))]
-            aht_fore_numden   = [(planned_aht_m_ob.get(m, oF_aht.get(m, s_target_aht)), oF_vol.get(m, 0.0))]
+            # Forecast from outbound forecast AHT (fallback to target)
+            aht_fore_numden   = [(oF_aht.get(m, s_target_aht), oF_vol.get(m, 0.0))]
         elif chk in ("chat",):
             f_total = float(cF_vol.get(m, 0.0))
             a_total = float(cA_vol.get(m, 0.0))
             t_total = float(cT_vol.get(m, 0.0))
             aht_actual_numden = [(cA_aht.get(m), cA_vol.get(m))]
-            aht_fore_numden   = [(planned_aht_m_chat.get(m, cF_aht.get(m, s_target_aht)), cF_vol.get(m, 0.0))]
+            # Forecast from chat forecast AHT (fallback to target)
+            aht_fore_numden   = [(cF_aht.get(m, s_target_aht), cF_vol.get(m, 0.0))]
         else:
             # default to voice + bo
             f_total = float(vF_vol.get(m, 0.0)) + float(bF_itm.get(m, 0.0))
@@ -499,8 +518,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 (bA_sut.get(m), bA_itm.get(m)),
             ]
             aht_fore_numden = [
-                (planned_aht_m_voice.get(m, vF_aht.get(m, s_target_aht)), vF_vol.get(m, 0.0)),
-                (planned_sut_m.get(m, bF_sut.get(m, s_target_sut)), bF_itm.get(m, 0.0)),
+                (vF_aht.get(m, s_target_aht), vF_vol.get(m, 0.0)),
+                (bF_sut.get(m, s_target_sut), bF_itm.get(m, 0.0)),
             ]
 
         if _wf_active_month(m) and vol_delta:
@@ -541,20 +560,40 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         if "Forecast AHT/SUT" in fw_rows:
             fw.loc[fw["metric"] == "Forecast AHT/SUT", m] = forecast_aht_sut
 
-        # Budgeted AHT/SUT
+        # Budgeted AHT/SUT (use planned AHT/SUT where provided, else fallback to budget defaults)
         if "Budgeted AHT/SUT" in fw_rows:
             b_num = b_den = 0.0
-            # Use monthly planned overrides per channel where applicable
-            for aht_v, vol_v in aht_fore_numden:
-                try:
-                    vv = float(vol_v or 0.0)
-                    if vv > 0:
-                        aa = float(aht_v if aht_v not in (None, np.nan) else 0.0)
-                        if aa <= 0: continue
-                        b_num += aa * vv; b_den += vv
-                except Exception:
-                    pass
-            budget_aht_sut = (b_num / b_den) if b_den > 0 else s_budget_aht
+            if chk in ("voice",):
+                vv = float(vF_vol.get(m, 0.0))
+                if vv > 0:
+                    aa = float(planned_aht_m_voice.get(m, s_budget_aht))
+                    b_num += aa * vv; b_den += vv
+            elif chk in ("back office", "bo"):
+                vv = float(bF_itm.get(m, 0.0))
+                if vv > 0:
+                    aa = float(planned_sut_m.get(m, s_budget_sut))
+                    b_num += aa * vv; b_den += vv
+            elif chk in ("outbound", "ob", "out bound"):
+                vv = float(oF_vol.get(m, 0.0))
+                if vv > 0:
+                    aa = float(planned_aht_m_ob.get(m, s_budget_aht))
+                    b_num += aa * vv; b_den += vv
+            elif chk in ("chat",):
+                vv = float(cF_vol.get(m, 0.0))
+                if vv > 0:
+                    aa = float(planned_aht_m_chat.get(m, s_budget_aht))
+                    b_num += aa * vv; b_den += vv
+            else:
+                # default combined (Voice + BO)
+                vv = float(vF_vol.get(m, 0.0))
+                if vv > 0:
+                    aa = float(planned_aht_m_voice.get(m, s_budget_aht))
+                    b_num += aa * vv; b_den += vv
+                vb = float(bF_itm.get(m, 0.0))
+                if vb > 0:
+                    aa = float(planned_sut_m.get(m, s_budget_sut))
+                    b_num += aa * vb; b_den += vb
+            budget_aht_sut = (b_num / b_den) if b_den > 0 else float(s_budget_aht)
             fw.loc[fw["metric"] == "Budgeted AHT/SUT", m] = budget_aht_sut
 
     # Compute Backlog/Queue based on current FW values (honor selection)
@@ -1298,6 +1337,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     elif ch_key in ('outbound', 'out bound', 'ob'):
         planned_shrink_fraction = _planned_shr(settings.get('ob_shrinkage_pct'), planned_shrink_fraction)
     ooo_hours_m, io_hours_m, base_hours_m = {}, {}, {}
+    # Extra denominators for BO-style shrinkage
+    sc_hours_m, tt_worked_hours_m = {}, {}
     bo_shrink_frac_daily_m = {}
 
     # overtime_hours_m already initialized above before use
@@ -1351,6 +1392,14 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
+            # Also accumulate monthly SC denominator
+            try:
+                mk = _month_key(idx_dates)
+                gsc = pd.DataFrame({"month": mk, "sc": base.astype(float)}).groupby("month", as_index=False).sum()
+                for _, r in gsc.iterrows():
+                    k = str(r["month"]) ; sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(r["sc"])
+            except Exception:
+                pass
             # Daily overall frac for voice-like: (OOO+INO)/Base
             try:
                 base_s = base.astype(float)
@@ -1398,14 +1447,22 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             d[c_act] = d[c_act].astype(str).str.strip().str.lower()
             d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
             d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
-            def has(s): return d[c_act].str.contains(s, na=False)
-            sec_div = d.loc[has("divert"), c_sec].groupby(d[c_date]).sum()
-            sec_dow = d.loc[has("down"),   c_sec].groupby(d[c_date]).sum()
-            sec_sc  = d.loc[has("staff complement"), c_sec].groupby(d[c_date]).sum()
-            sec_fx  = d.loc[has("flex"),            c_sec].groupby(d[c_date]).sum()
-            sec_ot  = d.loc[has("overtime") | d[c_act].eq("ot"), c_sec].groupby(d[c_date]).sum()
-            sec_lend= d.loc[has("lend"),            c_sec].groupby(d[c_date]).sum()
-            sec_borr= d.loc[has("borrow"),          c_sec].groupby(d[c_date]).sum()
+            act = d[c_act]
+            # Broaden classifiers similar to weekly
+            m_div  = act.str.contains(r"\bdivert(?:ed)?\b", regex=True, na=False) | act.eq("diverted")
+            m_dow  = act.str.contains(r"\bdowntime\b|\bdown\b", regex=True, na=False) | act.eq("downtime")
+            m_sc   = act.str.contains(r"\bstaff\s*complement\b|\bsc[_\s-]*included[_\s-]*time\b|\bincluded\s*time\b|\bstaffed\s*hours\b", regex=True, na=False) | act.eq("staff complement")
+            m_fx   = act.str.contains(r"\bflexi?time\b|\bflex\b", regex=True, na=False) | act.eq("flexitime")
+            m_ot   = act.str.contains(r"\bover\s*time\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
+            m_lend = act.str.contains(r"\blend(?:ed)?\b|\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
+            m_borr = act.str.contains(r"\bborrow(?:ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
+            sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
+            sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
+            sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
+            sec_fx   = d.loc[m_fx,   c_sec].groupby(d[c_date]).sum()
+            sec_ot   = d.loc[m_ot,   c_sec].groupby(d[c_date]).sum()
+            sec_lend = d.loc[m_lend, c_sec].groupby(d[c_date]).sum()
+            sec_borr = d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
             idx = pd.to_datetime(pd.Index(
                 set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) | set(sec_fx.index) |
                 set(sec_ot.index)  | set(sec_lend.index)| set(sec_borr.index)
@@ -1436,12 +1493,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 pass
             # Track denominators for BO shrink formulas (month key)
             mk = _month_key(idx)
-            for t, ttwh in zip(mk, total_time_worked_h):
+            for t, scv, ttwh in zip(mk, h_sc, total_time_worked_h):
                 k = str(pd.to_datetime(t).to_period('M').to_timestamp().date())
-                io_hours_m[k] = io_hours_m.get(k, 0.0)  # ensure exists
-                ooo_hours_m[k] = ooo_hours_m.get(k, 0.0)
-                # store in base_hours_m as non-dow base already via _agg_monthly; so keep explicit denominators separately via dicts below
-                # We'll reuse base_hours_m for overall denominator; for specialized denominators, we compute in percent loop below using aggregates
+                sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(scv)
+                tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
             # Capture overtime hours (monthly) from shrinkage raw (Back Office)
             try:
                 mk = _month_key(sec_ot.index)
@@ -1495,6 +1550,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             io_hours_m[m] = float(val)
 
     # Build shrink table (+ What-If ? onto Overall % display)
+    import os as _os
+    _debug_shr_m = bool(_os.environ.get("CAP_DEBUG_SHRINK_M"))
     for m in month_ids:
         if m not in shr.columns:
             shr[m] = np.nan
@@ -1502,6 +1559,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         base = float(base_hours_m.get(m, 0.0))
         ooo = float(ooo_hours_m.get(m, 0.0))
         ino = float(io_hours_m.get(m, 0.0))
+        scm  = float(sc_hours_m.get(m, 0.0))
+        ttwm = float(tt_worked_hours_m.get(m, 0.0))
         saved_overall_pct = saved_ov_pct.get(m) if isinstance(saved_ov_pct, dict) else None
         saved_ooo_pct_val = saved_ooo_pct.get(m) if isinstance(saved_ooo_pct, dict) else None
         saved_ino_pct_val = saved_ino_pct.get(m) if isinstance(saved_ino_pct, dict) else None
@@ -1513,14 +1572,17 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             else:
                 base = ooo + ino
             base_hours_m[m] = base
-        if base > 0:
-            ooo_pct = (100.0 * ooo / base)
-            ino_pct = (100.0 * ino / base)
+        # Prefer BO denominators automatically when present
+        use_bo_denoms = (scm > 0.0 or ttwm > 0.0) or (str(ch_first).strip().lower() in ("back office","bo") or ("back office" in str(ch_first).strip().lower()))
+        if use_bo_denoms:
+            ooo_pct = (100.0 * ooo / scm) if scm > 0 else 0.0
+            ino_pct = (100.0 * ino / ttwm) if ttwm > 0 else 0.0
             ov_pct  = (ooo_pct + ino_pct)
         else:
-            ooo_pct = saved_ooo_pct_val if saved_ooo_pct_val is not None else 0.0
-            ino_pct = saved_ino_pct_val if saved_ino_pct_val is not None else 0.0
-            ov_pct = saved_overall_pct if saved_overall_pct is not None else (ooo_pct + ino_pct)
+            # If SC/TTW denominators are missing, do not fall back to base or saved values; use 0%.
+            ooo_pct = 0.0
+            ino_pct = 0.0
+            ov_pct  = 0.0
         if _wf_active_month(m) and shrink_delta:
             ov_pct = min(100.0, max(0.0, ov_pct + shrink_delta))
         planned_pct = float(saved_plan_pct.get(m, 100.0 * planned_shrink_fraction))
@@ -1532,6 +1594,11 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         shr.loc[shr["metric"] == "Overall Shrinkage %",       m] = ov_pct
         shr.loc[shr["metric"] == "Planned Shrinkage %",       m] = planned_pct
         shr.loc[shr["metric"] == "Variance vs Planned",  m] = variance_pp
+        if _debug_shr_m:
+            try:
+                print(f"[SHR-M][month={m}] ch={str(ch_first).strip().lower()} OOO={ooo:.2f} SC={scm:.2f} TTW={ttwm:.2f} base={base:.2f} branch={'bo' if use_bo_denoms else 'non-bo'} OOO%={ooo_pct:.2f} INO%={ino_pct:.2f} OV%={ov_pct:.2f}")
+            except Exception:
+                pass
 
     # ---- BvA ----
     for m in month_ids:
@@ -2175,3 +2242,4 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         bulk_df.to_dict("records")  if isinstance(bulk_df,  pd.DataFrame) else [],
         notes_df.to_dict("records") if isinstance(notes_df, pd.DataFrame) else [],
     )
+
