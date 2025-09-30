@@ -484,6 +484,16 @@ def shrinkage_voice_raw_template_df(rows: int = 18) -> pd.DataFrame:
     return pd.DataFrame(demo)
 
 # ---- Back Office RAW normalize + summary ----
+def _parse_date_series(series: pd.Series) -> pd.Series:
+    """Parse dates robustly: try default, then dayfirst if mostly NaT.
+    Returns a series of python date objects (or NaT where unparseable).
+    """
+    s = pd.to_datetime(series, errors="coerce")
+    if s.notna().sum() == 0 or (s.isna().mean() > 0.8):
+        s = pd.to_datetime(series, errors="coerce", dayfirst=True)
+    return s.dt.date
+
+
 def normalize_shrinkage_bo(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
     L = {c.lower(): c for c in df.columns}
@@ -510,7 +520,7 @@ def normalize_shrinkage_bo(df: pd.DataFrame) -> pd.DataFrame:
         col_fname or "": "first_name", col_lname or "": "last_name"
     }, inplace=True, errors="ignore")
 
-    dff["date"] = pd.to_datetime(dff["date"], errors="coerce").dt.date
+    dff["date"] = _parse_date_series(dff["date"])  # robust date parsing
     dff["duration_seconds"] = pd.to_numeric(dff["duration_seconds"], errors="coerce").fillna(0).astype(float)
     if "units" in dff.columns:
         dff["units"] = pd.to_numeric(dff["units"], errors="coerce").fillna(0).astype(float)
@@ -682,7 +692,7 @@ def normalize_shrinkage_voice(df: pd.DataFrame) -> pd.DataFrame:
 
     dff = df.copy()
     dff.rename(columns={col_date:"date", col_state:"superstate", col_hours:"hours_raw", col_brid:"brid"}, inplace=True)
-    dff["date"] = pd.to_datetime(dff["date"], errors="coerce").dt.date
+    dff["date"] = _parse_date_series(dff["date"])  # robust date parsing
     dff["brid"] = dff["brid"].astype(str).str.strip()
     # convert HH:MM -> minutes, then to hours (as per spec they divide by 60)
     mins = dff["hours_raw"].map(_hhmm_to_minutes).fillna(0.0)
