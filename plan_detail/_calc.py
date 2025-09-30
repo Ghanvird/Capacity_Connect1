@@ -1,6 +1,7 @@
 # file: plan_detail/_calc.py
 from __future__ import annotations
 import math
+import os
 import datetime as dt
 import pandas as pd
 import numpy as np
@@ -346,7 +347,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             return None
 
     # ---- scope, plan, settings ----
-    ch_first = (p.get("channel") or "").split(",")[0].strip()
+    ch_first = (p.get("channel") or "" or p.get("lob")).split(",")[0].strip()
     sk = _canon_scope(
         p.get("vertical"),
         p.get("sub_ba"),
@@ -1457,18 +1458,26 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             c_ba   = L.get("business area") or L.get("ba")
             c_sba  = L.get("sub business area") or L.get("sub_ba")
             c_ch   = L.get("channel")
-            c_loc  = L.get("country") or L.get("location") or L.get("site") or L.get("city")
+            # Prefer matching the plan's specificity: site > location > country > city
+            c_site = L.get("site")
+            c_location = L.get("location")
+            c_country = L.get("country")
+            c_city = L.get("city")
 
             mask = pd.Series(True, index=v.index)
             if c_ba and p.get("vertical"): mask &= v[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
             if c_sba and p.get("sub_ba"): mask &= v[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
             if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().eq("voice")
-            if c_loc and loc_first:
-                loc_series = v[c_loc].astype(str).str.strip()
-                loc_l = loc_series.str.lower()
+            if loc_first:
                 target = loc_first.strip().lower()
-                if loc_l.ne("").any() and loc_l.ne("all").any() and loc_l.eq(target).any():
-                    mask &= loc_l.eq(target)
+                matched = False
+                for col in [c_site, c_location, c_country, c_city]:
+                    if col and col in v.columns:
+                        loc_l = v[col].astype(str).str.strip().str.lower()
+                        if loc_l.eq(target).any():
+                            mask &= loc_l.eq(target)
+                            matched = True
+                            break
 
             v = v.loc[mask]
             if c_date and c_state and c_hours and not v.empty:
@@ -1490,12 +1499,17 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         else:
             b = pd.DataFrame()
         L = {str(c).strip().lower(): c for c in b.columns}
-        c_date = L.get("date"); c_act = L.get("activity")
+        c_date = L.get("date")
+        c_act = L.get("activity")
         c_sec  = L.get("duration_seconds") or L.get("seconds") or L.get("duration")
         c_ba   = L.get("journey") or L.get("business area") or L.get("ba") or L.get("vertical")
-        c_sba  = L.get("sub_business_area") or L.get("sub business area") or L.get("sub_ba")
+        c_sba  = L.get("sub_business_area") or L.get("sub business area") or L.get("sub_ba") or L.get("sub ba")
         c_ch   = L.get("channel")
-        c_loc  = L.get("country") or L.get("location") or L.get("site") or L.get("city")
+        # Prefer matching the plan's specificity: site > location > country > city
+        c_site = L.get("site")
+        c_location = L.get("location")
+        c_country = L.get("country")
+        c_city = L.get("city")
 
         mask = pd.Series(True, index=b.index)
         if c_ba and p.get("vertical"): mask &= b[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
@@ -1503,12 +1517,16 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 
         if c_ch:
             mask &= b[c_ch].astype(str).str.strip().str.lower().isin(["back office","bo","backoffice"]) 
-        if c_loc and loc_first:
-            loc_series = b[c_loc].astype(str).str.strip()
-            loc_l = loc_series.str.lower()
+        if loc_first:
             target = loc_first.strip().lower()
-            if loc_l.ne("").any() and loc_l.ne("all").any() and loc_l.eq(target).any():
-                mask &= loc_l.eq(target)
+            matched = False
+            for col in [c_site, c_location, c_country, c_city]:
+                if col and col in b.columns:
+                    loc_l = b[col].astype(str).str.strip().str.lower()
+                    if loc_l.eq(target).any():
+                        mask &= loc_l.eq(target)
+                        matched = True
+                        break
 
         # Apply filters (BA/SubBA/Channel/Location) before aggregations
         b = b.loc[mask]
@@ -1527,17 +1545,26 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             _agg_weekly(idx, ooo, ino, base)
         elif c_date and c_act and c_sec and not b.empty:
             d = b[[c_date, c_act, c_sec]].copy()
+            # Normalize activity and numerics
             d[c_act] = d[c_act].astype(str).str.strip().str.lower()
             d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
             d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
-            def has(s): return d[c_act].str.contains(s, na=False)
-            sec_div = d.loc[has("divert"), c_sec].groupby(d[c_date]).sum()
-            sec_dow = d.loc[has("down"),   c_sec].groupby(d[c_date]).sum()
-            sec_sc  = d.loc[has("staff complement"), c_sec].groupby(d[c_date]).sum()
-            sec_fx  = d.loc[has("flex"),            c_sec].groupby(d[c_date]).sum()
-            sec_ot  = d.loc[has("overtime") | d[c_act].eq("ot"), c_sec].groupby(d[c_date]).sum()
-            sec_lend= d.loc[has("lend"),            c_sec].groupby(d[c_date]).sum()
-            sec_borr= d.loc[has("borrow"),          c_sec].groupby(d[c_date]).sum()
+            act = d[c_act]
+            # Broaden classifiers to align with typical labels
+            m_div  = act.str.contains(r"\bdivert(ed)?\b", regex=True, na=False) | act.eq("diverted")
+            m_dow  = act.str.contains(r"\bdowntime\b|\bdown\b", regex=True, na=False) | act.eq("downtime")
+            m_sc   = act.str.contains(r"\bstaff\s*complement\b|\bsc[_\s-]*included[_\s-]*time\b|\bincluded\s*time\b|\bstaffed\s*hours\b", regex=True, na=False) | act.eq("staff complement")
+            m_fx   = act.str.contains(r"\bflexi?time\b|\bflex\b", regex=True, na=False) | act.eq("flexitime")
+            m_ot   = act.str.contains(r"\bover\s*time\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
+            m_lend = act.str.contains(r"\blend(ed)?\b|\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
+            m_borr = act.str.contains(r"\bborrow(ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
+            sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
+            sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
+            sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
+            sec_fx   = d.loc[m_fx,   c_sec].groupby(d[c_date]).sum()
+            sec_ot   = d.loc[m_ot,   c_sec].groupby(d[c_date]).sum()
+            sec_lend = d.loc[m_lend, c_sec].groupby(d[c_date]).sum()
+            sec_borr = d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
 
             idx = pd.to_datetime(pd.Index(
                 set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) | set(sec_fx.index) |
@@ -1598,6 +1625,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 pass
 
     # Build shrink table (+ What-If ? onto Overall % display)
+    _debug_shr = bool(os.environ.get("CAP_DEBUG_SHRINK"))
     for w in week_ids:
         if w not in shr.columns:
             shr[w] = np.nan
@@ -1606,10 +1634,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         ooo  = float(ooo_hours_w.get(w, 0.0))
         ino  = float(io_hours_w.get(w, 0.0))
         ch_key_local = str(ch_first or '').strip().lower()
-        if ch_key_local in ("back office", "bo"):
-            sc_base = float(sc_hours_w.get(w, 0.0)) if 'sc_hours_w' in locals() else 0.0
-            ttwh    = float(tt_worked_hours_w.get(w, 0.0)) if 'tt_worked_hours_w' in locals() else 0.0
-            nb_base = float(nodow_base_hours_w.get(w, 0.0)) if 'nodow_base_hours_w' in locals() else base
+        sc_base = float(sc_hours_w.get(w, 0.0)) if 'sc_hours_w' in locals() else 0.0
+        ttwh    = float(tt_worked_hours_w.get(w, 0.0)) if 'tt_worked_hours_w' in locals() else 0.0
+        nb_base = float(nodow_base_hours_w.get(w, 0.0)) if 'nodow_base_hours_w' in locals() else base
+        # Prefer BO denominators automatically when present; also allow fuzzy channel
+        use_bo_denoms = (sc_base > 0.0 or ttwh > 0.0) or (ch_key_local in ("back office", "bo") or ("back office" in ch_key_local))
+        if use_bo_denoms:
             ooo_pct = (100.0 * ooo / sc_base) if sc_base > 0 else 0.0
             ino_pct = (100.0 * ino / ttwh)    if ttwh    > 0 else 0.0
             ov_pct  = (ooo_pct + ino_pct)
@@ -1632,6 +1662,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         shr.loc[shr["metric"] == "Overall Shrinkage %",       w] = ov_pct
         shr.loc[shr["metric"] == "Planned Shrinkage %",       w] = planned_pct
         shr.loc[shr["metric"] == "Variance vs Planned",  w] = variance_pp
+        if _debug_shr:
+            try:
+                print(f"[SHR][week={w}] ch={ch_key_local} OOO={ooo:.2f} SC={sc_base:.2f} TTW={ttwh:.2f} base={base:.2f} branch={'bo' if use_bo_denoms else 'non-bo'} OOO%={ooo_pct:.2f} INO%={ino_pct:.2f} OV%={ov_pct:.2f}")
+            except Exception:
+                pass
 
     # --- Adjust BO daily FTE using actual shrink when available; else planned ---
     def _adjust_bo_fte_daily(df: pd.DataFrame, use_actual: bool) -> pd.DataFrame:
