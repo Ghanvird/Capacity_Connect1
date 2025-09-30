@@ -1487,12 +1487,15 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             braw = None
         if isinstance(braw, pd.DataFrame) and not braw.empty:
             b = braw.copy()
+        else:
+            b = pd.DataFrame()
         L = {str(c).strip().lower(): c for c in b.columns}
         c_date = L.get("date"); c_act = L.get("activity")
         c_sec  = L.get("duration_seconds") or L.get("seconds") or L.get("duration")
-        c_ba   = L.get("journey") or L.get("business area") or L.get("ba")
+        c_ba   = L.get("journey") or L.get("business area") or L.get("ba") or L.get("vertical")
         c_sba  = L.get("sub_business_area") or L.get("sub business area") or L.get("sub_ba")
         c_ch   = L.get("channel")
+        c_loc  = L.get("country") or L.get("location") or L.get("site") or L.get("city")
 
         mask = pd.Series(True, index=b.index)
         if c_ba and p.get("vertical"): mask &= b[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
@@ -1500,6 +1503,15 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 
         if c_ch:
             mask &= b[c_ch].astype(str).str.strip().str.lower().isin(["back office","bo","backoffice"]) 
+        if c_loc and loc_first:
+            loc_series = b[c_loc].astype(str).str.strip()
+            loc_l = loc_series.str.lower()
+            target = loc_first.strip().lower()
+            if loc_l.ne("").any() and loc_l.ne("all").any() and loc_l.eq(target).any():
+                mask &= loc_l.eq(target)
+
+        # Apply filters (BA/SubBA/Channel/Location) before aggregations
+        b = b.loc[mask]
         # Voice-like back office feed (Superstate/Hours)
         c_state = L.get("superstate") or L.get("state")
         c_hours = L.get("hours") or L.get("duration_hours")
