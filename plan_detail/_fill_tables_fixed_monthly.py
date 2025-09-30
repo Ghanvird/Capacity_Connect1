@@ -752,6 +752,45 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             req_m[mid] = float(r["total_req_fte"]) / max(1, wd)  # average daily FTE for month
         return req_m
     is_bo_ch = str(ch_first).strip().lower() in ("back office", "bo")
+    # Adjust BO daily FTE by actual vs planned shrink before rolling up
+    def _adjust_bo_fte_daily(df: pd.DataFrame, use_actual: bool) -> pd.DataFrame:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        if "bo_fte" not in df.columns or "date" not in df.columns:
+            return df
+        s_plan = planned_shrink_fraction
+        try:
+            s_plan = float(s_plan); s_plan = s_plan/100.0 if s_plan > 1.0 else s_plan
+        except Exception:
+            s_plan = 0.0
+        d = df.copy()
+        d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.date.astype(str)
+        old_bo = pd.to_numeric(d["bo_fte"], errors="coerce").fillna(0.0)
+        s_target = d["date"].map(lambda x: bo_shrink_frac_daily_m.get(x, s_plan) if use_actual else s_plan)
+        try:
+            s_target = pd.to_numeric(s_target, errors="coerce").fillna(s_plan)
+        except Exception:
+            s_target = pd.Series([s_plan]*len(d))
+        denom_old = max(0.01, 1.0 - float(s_plan))
+        denom_new = np.maximum(0.01, 1.0 - s_target.astype(float))
+        factor = denom_old / denom_new
+        new_bo = old_bo * factor
+        d["bo_fte"] = new_bo
+        if "total_req_fte" in d.columns:
+            tot = pd.to_numeric(d["total_req_fte"], errors="coerce").fillna(0.0)
+            d["total_req_fte"] = tot + (new_bo - old_bo)
+        return d
+
+    try:
+        req_daily_actual   = _adjust_bo_fte_daily(req_daily_actual,   use_actual=True)
+        req_daily_forecast = _adjust_bo_fte_daily(req_daily_forecast, use_actual=False)
+        if isinstance(req_daily_tactical, pd.DataFrame) and not req_daily_tactical.empty:
+            req_daily_tactical = _adjust_bo_fte_daily(req_daily_tactical, use_actual=False)
+        if isinstance(req_daily_budgeted, pd.DataFrame) and not req_daily_budgeted.empty:
+            req_daily_budgeted = _adjust_bo_fte_daily(req_daily_budgeted, use_actual=False)
+    except Exception:
+        pass
+
     req_m_actual   = _daily_to_monthly(req_daily_actual,   is_bo=is_bo_ch)
     req_m_forecast = _daily_to_monthly(req_daily_forecast, is_bo=is_bo_ch)
     req_m_tactical = _daily_to_monthly(req_daily_tactical, is_bo=is_bo_ch)
@@ -1259,6 +1298,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     elif ch_key in ('outbound', 'out bound', 'ob'):
         planned_shrink_fraction = _planned_shr(settings.get('ob_shrinkage_pct'), planned_shrink_fraction)
     ooo_hours_m, io_hours_m, base_hours_m = {}, {}, {}
+    bo_shrink_frac_daily_m = {}
 
     # overtime_hours_m already initialized above before use
 
@@ -1295,7 +1335,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         mask = pd.Series(True, index=v.index)
         if c_ba and p.get("vertical"): mask &= v[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
         if c_sba and p.get("sub_ba"): mask &= v[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
-        if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().isin(["voice","all",""])
+        if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().isin(["voice","all","","back office","bo","backoffice"])  # allow voice-like BO
         if c_loc and loc_first:
             loc_series = v[c_loc].astype(str).str.strip()
             loc_l = loc_series.str.lower()
@@ -1311,6 +1351,17 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
+            # Daily overall frac for voice-like: (OOO+INO)/Base
+            try:
+                base_s = base.astype(float)
+                ov = (ooo.astype(float) + ino.astype(float))
+                frac = ov / base_s.replace({0.0: np.nan})
+                for t, f in zip(idx_dates, frac):
+                    k = str(pd.to_datetime(t).date())
+                    if pd.notna(f):
+                        bo_shrink_frac_daily_m[k] = float(max(0.0, min(0.99, f)))
+            except Exception:
+                pass
 
     try:
         braw = load_df("shrinkage_raw_backoffice")
@@ -1323,10 +1374,26 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         c_sec  = L.get("duration_seconds") or L.get("seconds") or L.get("duration")
         c_ba   = L.get("journey") or L.get("business area") or L.get("ba")
         c_sba  = L.get("sub_business_area") or L.get("sub business area") or L.get("sub_ba")
+        c_ch   = L.get("channel")
         mask = pd.Series(True, index=b.index)
         if c_ba and p.get("vertical"): mask &= b[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
         if c_sba and p.get("sub_ba"): mask &= b[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
-        if c_date and c_act and c_sec and not b.empty:
+        if c_ch:
+            mask &= b[c_ch].astype(str).str.strip().str.lower().isin(["back office","bo","backoffice"]) 
+        # Voice-like BO payload (Superstate/Hours) saved in backoffice store
+        c_state = L.get("superstate") or L.get("state")
+        c_hours = L.get("hours") or L.get("duration_hours")
+        if c_date and c_state and c_hours and not b.empty and (not c_act or b[c_act].isna().all()):
+            d2 = b[[c_date, c_state, c_hours]].copy()
+            d2[c_hours] = pd.to_numeric(d2[c_hours], errors="coerce").fillna(0.0)
+            d2[c_date]  = pd.to_datetime(d2[c_date], errors="coerce").dt.date
+            pv = d2.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
+            def col(name): return pv[name] if name in pv.columns else 0.0
+            base = col("SC_INCLUDED_TIME"); ooo = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
+            ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
+            idx_dates = pd.to_datetime(pv.index, errors="coerce")
+            _agg_monthly(idx_dates, ooo, ino, base)
+        elif c_date and c_act and c_sec and not b.empty:
             d = b[[c_date, c_act, c_sec]].copy()
             d[c_act] = d[c_act].astype(str).str.strip().str.lower()
             d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
@@ -1358,6 +1425,15 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             non_dow_base_h      = (h_sc + h_fx + h_ot + h_bor - h_len).clip(lower=0)
             # Aggregate OOO (Downtime) and In-Office (Divert) hours; base as non-dow base
             _agg_monthly(idx, h_dow, h_div, non_dow_base_h)
+            # Daily overall fraction (activity): (Downtime/SC) + (Diverted/TTW)
+            try:
+                for t, dhrs, scv, ttwv in zip(idx, h_div, h_sc, total_time_worked_h):
+                    k = str(pd.to_datetime(t).date())
+                    ooo_f = (float(h_dow.loc[t]) / float(scv)) if (t in h_dow.index and scv > 0) else 0.0
+                    ino_f = (float(dhrs) / float(ttwv)) if ttwv > 0 else 0.0
+                    bo_shrink_frac_daily_m[k] = max(0.0, min(0.99, ooo_f + ino_f))
+            except Exception:
+                pass
             # Track denominators for BO shrink formulas (month key)
             mk = _month_key(idx)
             for t, ttwh in zip(mk, total_time_worked_h):
@@ -1440,7 +1516,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         if base > 0:
             ooo_pct = (100.0 * ooo / base)
             ino_pct = (100.0 * ino / base)
-            ov_pct = (100.0 * (ooo + ino) / base)
+            ov_pct  = (ooo_pct + ino_pct)
         else:
             ooo_pct = saved_ooo_pct_val if saved_ooo_pct_val is not None else 0.0
             ino_pct = saved_ino_pct_val if saved_ino_pct_val is not None else 0.0
@@ -2099,4 +2175,3 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         bulk_df.to_dict("records")  if isinstance(bulk_df,  pd.DataFrame) else [],
         notes_df.to_dict("records") if isinstance(notes_df, pd.DataFrame) else [],
     )
-
