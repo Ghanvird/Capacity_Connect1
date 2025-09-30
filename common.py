@@ -824,6 +824,14 @@ def normalize_shrink_weekly(data) -> pd.DataFrame:
 
 def _compute_shrink_weekly_percentages(df: pd.DataFrame) -> pd.DataFrame:
     out = df.copy()
+    # Ensure required columns exist
+    for c in ("ooo_hours", "ino_hours", "base_hours"):
+        if c not in out.columns:
+            out[c] = 0.0
+    for c in ("ooo_pct", "ino_pct", "overall_pct"):
+        if c not in out.columns:
+            out[c] = np.nan
+
     base = out["base_hours"].replace({0.0: np.nan})
     # Compute hours from pct if needed
     mask_base_missing = base.isna() & out["overall_pct"].notna()
@@ -1229,7 +1237,8 @@ def parse_upload(contents, filename) -> pd.DataFrame:
         _, content_string = contents.split(',', 1)
         data = base64.b64decode(content_string)
         if filename and filename.lower().endswith(".csv"):
-            return pd.read_csv(io.StringIO(data.decode("utf-8")))
+            # Avoid DtypeWarning by scanning full columns
+            return pd.read_csv(io.StringIO(data.decode("utf-8")), low_memory=False)
         if filename and filename.lower().endswith((".xls", ".xlsx", ".xlsm")):
             return pd.read_excel(io.BytesIO(data))
     except Exception:
@@ -1753,5 +1762,3 @@ def sidebar_component(collapsed: bool) -> html.Div:
         html.Div(nav, className="nav"),
         *tooltips
     ], id="sidebar")
-
-
