@@ -1551,13 +1551,13 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
             act = d[c_act]
             # Broaden classifiers to align with typical labels
-            m_div  = act.str.contains(r"\bdivert(ed)?\b", regex=True, na=False) | act.eq("diverted")
+            m_div  = act.str.contains(r"\bdivert(?:ed)?\b", regex=True, na=False) | act.eq("diverted")
             m_dow  = act.str.contains(r"\bdowntime\b|\bdown\b", regex=True, na=False) | act.eq("downtime")
             m_sc   = act.str.contains(r"\bstaff\s*complement\b|\bsc[_\s-]*included[_\s-]*time\b|\bincluded\s*time\b|\bstaffed\s*hours\b", regex=True, na=False) | act.eq("staff complement")
             m_fx   = act.str.contains(r"\bflexi?time\b|\bflex\b", regex=True, na=False) | act.eq("flexitime")
             m_ot   = act.str.contains(r"\bover\s*time\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
-            m_lend = act.str.contains(r"\blend(ed)?\b|\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
-            m_borr = act.str.contains(r"\bborrow(ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
+            m_lend = act.str.contains(r"\blend(?:ed)?\b|\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
+            m_borr = act.str.contains(r"\bborrow(?:ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
             sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
             sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
             sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
