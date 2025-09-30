@@ -531,12 +531,12 @@ def _bo_bucket(activity: str) -> str:
     s = (activity or "").strip().lower()
     # flexible matching
     if "divert" in s: return "diverted"
-    if "down" in s: return "downtime"
+    if "down" in s or s == "downtime": return "downtime"
     if "staff complement" in s or s == "staff complement": return "staff_complement"
-    if "flex" in s: return "flextime"
-    if "lend" in s: return "lend_staff"
-    if "borrow" in s: return "borrowed_staff"
-    if "overtime" in s or s=="ot": return "overtime"
+    if "flex" in s or s == "flexitime": return "flextime"
+    if "lend" in s or s == "lend staff": return "lend_staff"
+    if "borrow" in s or s == "borrowed staff": return "borrowed_staff"
+    if "overtime" in s or s=="ot" or s == "overtime": return "overtime"
     if "core time" in s or s=="core": return "core_time"
     if "time worked" in s: return "time_worked"
     if "work out" in s or "workout" in s: return "work_out"
@@ -544,46 +544,63 @@ def _bo_bucket(activity: str) -> str:
 
 
 def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
+    """Daily BO summary in hours with buckets needed for new shrinkage formula.
+    Buckets come from `_bo_bucket` applied to the free-text `activity` field.
+    Returns per-day rows including:
+      - "OOO Hours"      := Downtime
+      - "In Office Hours": Diverted Time
+      - "Base Hours"     := Staff Complement
+      - "TTW Hours"      := Staff Complement - Downtime + Flexi + Overtime + Borrowed - Lend
+    """
     if dff is None or dff.empty:
         return pd.DataFrame()
     d = dff.copy()
     d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
 
-    def _category(activity: str) -> str:
-        s = str(activity or "").strip().lower()
-        if not s:
-            return "base"
-        ooo_words = ("absenc", "sick", "pto", "holiday", "vacat", "leave", "bereave", "off work", "unpaid", "ill")
-        ino_words = ("train", "coach", "induct", "nest", "huddle", "meeting", "1:1", "one to one", "system", "downtime",
-                     "break", "bio", "lunch", "admin", "project", "shadow", "support", "qa", "calibration", "brief")
-        if any(word in s for word in ooo_words):
-            return "ooo"
-        if any(word in s for word in ino_words):
-            return "ino"
-        if "divert" in s or "down" in s:
-            return "ino"
-        return "base"
+    # Derive explicit buckets
+    d["bucket"] = d.get("activity", "").map(_bo_bucket)
 
-    d["category"] = d.get("activity", "").map(_category)
     keys = ["date", "journey", "sub_business_area", "channel"]
     if "country" in d.columns:
         keys.append("country")
     if "site" in d.columns:
         keys.append("site")
 
+    # Use hour granularity directly if present
+    if "time_hours" in d.columns:
+        val_col = "time_hours"
+        factor = 1.0
+    else:
+        val_col = "duration_seconds"
+        factor = 1.0 / 3600.0
+
     agg = (
-        d.groupby(keys + ["category"], dropna=False)["duration_seconds"]
-        .sum()
-        .reset_index()
+        d.groupby(keys + ["bucket"], dropna=False)[val_col]
+         .sum()
+         .reset_index()
     )
-    pivot = agg.pivot_table(index=keys, columns="category", values="duration_seconds", fill_value=0.0).reset_index()
+    pivot = agg.pivot_table(index=keys, columns="bucket", values=val_col, fill_value=0.0).reset_index()
 
-    def _col(frame: pd.DataFrame, name: str) -> pd.Series:
-        return frame[name] if name in frame.columns else pd.Series(0.0, index=frame.index)
+    def _col(frame: pd.DataFrame, names: list[str]) -> pd.Series:
+        for nm in names:
+            if nm in frame.columns:
+                return frame[nm]
+        return pd.Series(0.0, index=frame.index)
 
-    pivot["OOO Hours"] = _col(pivot, "ooo") / 3600.0
-    pivot["In Office Hours"] = _col(pivot, "ino") / 3600.0
-    pivot["Base Hours"] = _col(pivot, "base") / 3600.0
+    sc  = _col(pivot, ["staff_complement"]) * factor
+    dwn = _col(pivot, ["downtime"]) * factor
+    flx = _col(pivot, ["flextime"]) * factor
+    ot  = _col(pivot, ["overtime"]) * factor
+    bor = _col(pivot, ["borrowed_staff", "borrowed"]) * factor
+    lnd = _col(pivot, ["lend_staff", "lend"]) * factor
+    div = _col(pivot, ["diverted"]) * factor
+
+    ttw = sc - dwn + flx + ot + bor - lnd
+
+    pivot["OOO Hours"] = dwn
+    pivot["In Office Hours"] = div
+    pivot["Base Hours"] = sc
+    pivot["TTW Hours"] = ttw
 
     pivot = pivot.rename(columns={
         "journey": "Business Area",
@@ -594,24 +611,44 @@ def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
     })
 
     keep_keys = [c for c in ["date", "Business Area", "Sub Business Area", "Channel", "Country", "Site"] if c in pivot.columns]
-    keep = keep_keys + ["OOO Hours", "In Office Hours", "Base Hours"]
+    keep = keep_keys + ["OOO Hours", "In Office Hours", "Base Hours", "TTW Hours"]
     return pivot[keep].sort_values(keep_keys)
 
 
 def weekly_shrinkage_from_bo_summary(daily: pd.DataFrame) -> pd.DataFrame:
+    """Weekly BO shrinkage using requested formula:
+      - Total Time Worked (TTW) = Staff Complement - Downtime + Flexi + Overtime + Borrowed - Lend
+      - In-Office Shrink % = Diverted Time / TTW
+      - Out-of-Office Shrink % = Downtime / Staff Complement
+    Output keeps standard field names but uses BO semantics:
+      - ooo_hours = Downtime
+      - ino_hours = Diverted
+      - base_hours = Staff Complement
+    """
     if daily is None or daily.empty:
         return pd.DataFrame(columns=["week","program","ooo_hours","ino_hours","base_hours","ooo_pct","ino_pct","overall_pct"])
     df = daily.copy()
     df["week"] = pd.to_datetime(df["date"], errors="coerce").dt.date.apply(lambda x: _week_floor(x, "Monday"))
     df["program"] = df.get("Business Area", "All").fillna("All").astype(str)
+
+    # Ensure TTW exists; if not, recompute defensively
+    if "TTW Hours" not in df.columns:
+        # Fall back to classic behavior to avoid crash; results may differ
+        df["TTW Hours"] = np.nan
+
     grp = (
-        df.groupby(["week", "program"], as_index=False)[["OOO Hours", "In Office Hours", "Base Hours"]]
+        df.groupby(["week", "program"], as_index=False)[["OOO Hours", "In Office Hours", "Base Hours", "TTW Hours"]]
           .sum()
     )
+
     base = grp["Base Hours"].replace({0.0: np.nan})
+    ttw = grp["TTW Hours"].replace({0.0: np.nan})
+
     grp["ooo_pct"] = np.where(base.gt(0), (grp["OOO Hours"] / base) * 100.0, np.nan)
-    grp["ino_pct"] = np.where(base.gt(0), (grp["In Office Hours"] / base) * 100.0, np.nan)
+    grp["ino_pct"] = np.where(ttw.gt(0), (grp["In Office Hours"] / ttw) * 100.0, np.nan)
+    # overall: keep classic interpretation relative to staff complement to remain comparable across views
     grp["overall_pct"] = np.where(base.gt(0), ((grp["OOO Hours"] + grp["In Office Hours"]) / base) * 100.0, np.nan)
+
     grp = grp.rename(columns={
         "OOO Hours": "ooo_hours",
         "In Office Hours": "ino_hours",
@@ -619,7 +656,6 @@ def weekly_shrinkage_from_bo_summary(daily: pd.DataFrame) -> pd.DataFrame:
     })
     return grp[["week","program","ooo_hours","ino_hours","base_hours","ooo_pct","ino_pct","overall_pct"]]
 
-# ---- Voice RAW normalize + summary ----
 # ---- Voice RAW normalize + summary ----
 def normalize_shrinkage_voice(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
@@ -662,8 +698,6 @@ def normalize_shrinkage_voice(df: pd.DataFrame) -> pd.DataFrame:
             dff[col] = dff[col].replace("", np.nan).fillna(default)
     dff["Channel"] = dff["Channel"].replace("", np.nan).fillna("Voice")
     return dff
-
-
 
 def summarize_shrinkage_voice(dff: pd.DataFrame) -> pd.DataFrame:
     if dff is None or dff.empty:
@@ -1762,3 +1796,23 @@ def sidebar_component(collapsed: bool) -> html.Div:
         html.Div(nav, className="nav"),
         *tooltips
     ], id="sidebar")
+
+
+# ---- Schema detectors for shrinkage uploads ----
+def is_voice_shrinkage_like(df: pd.DataFrame) -> bool:
+    """Heuristic: looks like Voice shrinkage raw if it has Superstate + Hours columns."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+    L = {str(c).strip().lower(): c for c in df.columns}
+    has_super = any(k in L for k in ("superstate",))
+    has_hours = any(k in L for k in ("hours",))
+    return bool(has_super and has_hours)
+
+def is_bo_shrinkage_like(df: pd.DataFrame) -> bool:
+    """Heuristic: looks like Back Office raw if it has Activity + DurationSeconds (or variants)."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+    L = {str(c).strip().lower(): c for c in df.columns}
+    has_act = "activity" in L
+    has_dur = any(k in L for k in ("durationseconds", "duration (sec)", "duration_seconds", "duration sec", "duration"))
+    return bool(has_act and has_dur)
