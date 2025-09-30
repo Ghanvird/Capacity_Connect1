@@ -443,12 +443,12 @@ def up_shr_bo(contents, filename):
         summ = summarize_shrinkage_voice(dff)
     else:
         dff = normalize_shrinkage_bo(df)
-        summ = summarize_shrinkage_bo(dff)
+    summ = summarize_shrinkage_bo(dff)
     if dff.empty:
         return [], [], [], [], None
     return (
-        dff.to_dict("records"), lock_variance_cols(pretty_columns(dff)),
-        summ.to_dict("records"), lock_variance_cols(pretty_columns(summ)),
+        dff.to_dict("records"), lock_variance_cols(shrink_daily_columns(dff)),
+        summ.to_dict("records"), lock_variance_cols(shrink_daily_columns(summ)),
         dff.to_dict("records")
     )
 
@@ -518,8 +518,8 @@ def up_shr_voice(contents, filename):
         return [], [], [], [], None
     summ = summarize_shrinkage_voice(dff)
     return (
-        dff.to_dict("records"), lock_variance_cols(pretty_columns(dff)),
-        summ.to_dict("records"), lock_variance_cols(pretty_columns(summ)),
+        dff.to_dict("records"), lock_variance_cols(shrink_daily_columns(dff)),
+        summ.to_dict("records"), lock_variance_cols(shrink_daily_columns(summ)),
         dff.to_dict("records")
     )
 
