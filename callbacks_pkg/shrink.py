@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 from dash import html, dcc, dash_table, Output, Input, State, callback
 import dash_bootstrap_components as dbc
 import pandas as pd
@@ -206,15 +206,6 @@ def attr_upload(contents, filename):
         return wk.to_dict("records"), pretty_columns(wk), df.to_dict("records")
     return df.to_dict("records"), pretty_columns(df), None
 
-@app.callback(
-    Output("attr-save-msg","children", allow_duplicate=True),
-    Output("fig-attr","figure"),
-    Output("shr-msg-timer","disabled", allow_duplicate=True),
-    Input("btn-save-attr","n_clicks"),
-    State("tbl-attr-shrink", "data"),
-    State("attr_raw_store","data"),
-    prevent_initial_call=True
-)
 def _apply_attrition_raw_to_plan_rosters(raw_df: pd.DataFrame) -> int:
     """Propagate leavers into each plan's roster (terminate_date/current_status).
     Returns number of plans updated.
@@ -274,6 +265,15 @@ def _apply_attrition_raw_to_plan_rosters(raw_df: pd.DataFrame) -> int:
     return updated
 
 
+@app.callback(
+    Output("attr-save-msg","children", allow_duplicate=True),
+    Output("fig-attr","figure"),
+    Output("shr-msg-timer","disabled", allow_duplicate=True),
+    Input("btn-save-attr","n_clicks"),
+    State("tbl-attr-shrink", "data"),
+    State("attr_raw_store","data"),
+    prevent_initial_call=True
+)
 def attr_save(n, rows, raw_store):
     df = pd.DataFrame(rows or [])
     if df.empty: 
@@ -397,7 +397,7 @@ def save_shr_bo(_n, store):
     dff = pd.DataFrame(store or [])
     if dff.empty:
         return "Nothing to save.", False
-    save_df("shrinkage_raw_backoffice", dff)
+    _save_df_ds("shrinkage_raw_backoffice", dff)
     daily = summarize_shrinkage_bo(dff)
     weekly = weekly_shrinkage_from_bo_summary(daily)
     combined = _merge_shrink_weekly(load_shrinkage(), weekly)
@@ -408,11 +408,18 @@ def save_shr_bo(_n, store):
     return f"Saved Back Office shrinkage ({', '.join(details)})", False
 
 
+@app.callback(
+    Output("voice-shr-save-msg","children", allow_duplicate=True),
+    Output("shr-msg-timer","disabled", allow_duplicate=True),
+    Input("btn-save-shr-voice-raw","n_clicks"),
+    State("voice-shr-raw-store","data"),
+    prevent_initial_call=True
+)
 def save_shr_voice(_n, store):
     dff = pd.DataFrame(store or [])
     if dff.empty:
         return "Nothing to save.", False
-    save_df("shrinkage_raw_voice", dff)
+    _save_df_ds("shrinkage_raw_voice", dff)
     daily = summarize_shrinkage_voice(dff)
     weekly = weekly_shrinkage_from_voice_summary(daily)
     combined = _merge_shrink_weekly(load_shrinkage(), weekly)
@@ -421,6 +428,29 @@ def save_shr_voice(_n, store):
     if isinstance(weekly, pd.DataFrame) and not weekly.empty:
         details.append(f"weekly points: {len(weekly)}")
     return f"Saved Voice shrinkage ({', '.join(details)})", False
+
+# === Shrinkage RAW: Upload/preview/summary (Voice) ===
+@app.callback(
+    Output("tbl-shr-voice-raw","data"),
+    Output("tbl-shr-voice-raw","columns"),
+    Output("tbl-shr-voice-sum","data"),
+    Output("tbl-shr-voice-sum","columns"),
+    Output("voice-shr-raw-store","data"),
+    Input("up-shr-voice-raw","contents"),
+    State("up-shr-voice-raw","filename"),
+    prevent_initial_call=True
+)
+def up_shr_voice(contents, filename):
+    df = parse_upload(contents, filename)
+    dff = normalize_shrinkage_voice(df)
+    if dff.empty:
+        return [], [], [], [], None
+    summ = summarize_shrinkage_voice(dff)
+    return (
+        dff.to_dict("records"), lock_variance_cols(pretty_columns(dff)),
+        summ.to_dict("records"), lock_variance_cols(pretty_columns(summ)),
+        dff.to_dict("records")
+    )
 
 # --- Auto-dismiss shrink page messages ---
 @app.callback(
