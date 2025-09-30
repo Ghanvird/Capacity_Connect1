@@ -6,6 +6,13 @@ import numpy as np
 from typing import List
 from planning_workspace import planning_layout, register_planning_ws
 from dash import Dash, html, dcc, dash_table, Output, Input, State, callback
+try:
+    from dash.dash_table import Format, Scheme, Symbol
+except Exception:
+    # Fallback if import path differs; access via dash_table.Format at runtime
+    Format = getattr(dash_table, "Format", None)
+    Scheme = getattr(getattr(dash_table, "Format", object), "Scheme", None)
+    Symbol = getattr(getattr(dash_table, "Format", object), "Symbol", None)
 import dash_bootstrap_components as dbc
 from dash.exceptions import PreventUpdate
 import plotly.express as px
@@ -485,14 +492,54 @@ def shrinkage_voice_raw_template_df(rows: int = 18) -> pd.DataFrame:
 
 # ---- Back Office RAW normalize + summary ----
 def _parse_date_series(series: pd.Series) -> pd.Series:
-    """Parse dates robustly: try default, then dayfirst if mostly NaT.
-    Returns a series of python date objects (or NaT where unparseable).
+    """Parse dates robustly without warnings.
+    Heuristic:
+      - If ISO (YYYY-MM-DD) → explicit format
+      - If slash form → decide mm/dd vs dd/mm by values, then explicit format
+      - If dash form with 2-digit first part → decide similarly
+      - Else → default parser (no dayfirst) to avoid mm/dd + dayfirst warnings
     """
-    s = pd.to_datetime(series, errors="coerce")
-    if s.notna().sum() == 0 or (s.isna().mean() > 0.8):
-        s = pd.to_datetime(series, errors="coerce", dayfirst=True)
-    return s.dt.date
+    s = pd.Series(series)
+    # Already datetime-like
+    try:
+        if np.issubdtype(s.dtype, np.datetime64):
+            return pd.to_datetime(s, errors="coerce").dt.date
+    except Exception:
+        pass
 
+    sample = s.dropna().astype(str).str.strip()
+    if sample.empty:
+        return pd.to_datetime(s, errors="coerce").dt.date
+
+    # ISO 8601: 2025-09-30
+    iso_mask = sample.str.match(r"^\d{4}-\d{1,2}-\d{1,2}$")
+    if iso_mask.any() and iso_mask.mean() > 0.5:
+        return pd.to_datetime(s, errors="coerce", format="%Y-%m-%d").dt.date
+
+    # Slash separated: 09/30/2025 or 30/09/2025
+    slash_mask = sample.str.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
+    if slash_mask.any() and slash_mask.mean() > 0.5:
+        parts = sample[slash_mask].str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})$")
+        first = pd.to_numeric(parts[0], errors="coerce")
+        if (first > 12).any():
+            fmt = "%d/%m/%Y"
+        else:
+            fmt = "%m/%d/%Y"
+        return pd.to_datetime(s, errors="coerce", format=fmt).dt.date
+
+    # Dash separated ambiguous: 01-02-2025 or 30-09-2025
+    dash_mask = sample.str.match(r"^\d{1,2}-\d{1,2}-\d{2,4}$")
+    if dash_mask.any() and dash_mask.mean() > 0.5:
+        parts = sample[dash_mask].str.extract(r"^(\d{1,2})-(\d{1,2})-(\d{2,4})$")
+        first = pd.to_numeric(parts[0], errors="coerce")
+        if (first > 12).any():
+            fmt = "%d-%m-%Y"
+        else:
+            fmt = "%m-%d-%Y"
+        return pd.to_datetime(s, errors="coerce", format=fmt).dt.date
+
+    # Fallback: default parser
+    return pd.to_datetime(s, errors="coerce").dt.date
 
 def normalize_shrinkage_bo(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty: return pd.DataFrame()
@@ -665,8 +712,8 @@ def weekly_shrinkage_from_bo_summary(daily: pd.DataFrame) -> pd.DataFrame:
 
     grp["ooo_pct"] = np.where(base.gt(0), (grp["OOO Hours"] / base) * 100.0, np.nan)
     grp["ino_pct"] = np.where(ttw.gt(0), (grp["In Office Hours"] / ttw) * 100.0, np.nan)
-    # overall: keep classic interpretation relative to staff complement to remain comparable across views
-    grp["overall_pct"] = np.where(base.gt(0), ((grp["OOO Hours"] + grp["In Office Hours"]) / base) * 100.0, np.nan)
+    # Overall Shrinkage % = OOO % + In-Office % (per business rule)
+    grp["overall_pct"] = grp["ooo_pct"].fillna(0.0) + grp["ino_pct"].fillna(0.0)
 
     grp = grp.rename(columns={
         "OOO Hours": "ooo_hours",
@@ -812,19 +859,64 @@ _SHRINK_COLUMN_ALIASES = {
     "overallpct": "overall_pct",
 }
 
-SHRINK_WEEKLY_COLUMN_DEFS = [
-    {"id": "week", "name": "Week"},
-    {"id": "program", "name": "Program"},
-    {"id": "ooo_hours", "name": "Out of Office Hours (#)"},
-    {"id": "ino_hours", "name": "In-Office Hours (#)"},
-    {"id": "base_hours", "name": "Base Hours (#)"},
-    {"id": "ooo_pct", "name": "Out of Office %"},
-    {"id": "ino_pct", "name": "In-Office %"},
-    {"id": "overall_pct", "name": "Overall Shrink %"},
-]
+def _fmt_numeric(precision: int = 1):
+    if Format and Scheme:
+        try:
+            return Format(precision=precision, scheme=Scheme.fixed)
+        except Exception:
+            pass
+    return None
+
+def _fmt_percent(precision: int = 1):
+    if Format and Scheme and Symbol:
+        try:
+            return Format(precision=precision, scheme=Scheme.fixed, symbol=Symbol.yes, symbol_suffix="%")
+        except Exception:
+            try:
+                # Older versions use chaining API
+                return dash_table.Format(precision=precision, scheme=dash_table.Format.Scheme.fixed)
+            except Exception:
+                return None
+    return None
 
 def shrink_weekly_columns() -> list[dict]:
-    return [dict(col) for col in SHRINK_WEEKLY_COLUMN_DEFS]
+    cols = [
+        {"id": "week", "name": "Week"},
+        {"id": "program", "name": "Program"},
+        {"id": "ooo_hours", "name": "Out of Office Hours (#)", "type": "numeric"},
+        {"id": "ino_hours", "name": "In-Office Hours (#)", "type": "numeric"},
+        {"id": "base_hours", "name": "Base Hours (#)", "type": "numeric"},
+        {"id": "ooo_pct", "name": "Out of Office %", "type": "numeric"},
+        {"id": "ino_pct", "name": "In-Office %", "type": "numeric"},
+        {"id": "overall_pct", "name": "Overall Shrink %", "type": "numeric"},
+    ]
+    # Apply formatting: 1 decimal everywhere; percent columns with trailing %
+    fmt_num = _fmt_numeric(1)
+    fmt_pct = _fmt_percent(1)
+    for c in cols:
+        if c.get("type") == "numeric":
+            if c["id"].endswith("_pct") and fmt_pct is not None:
+                c["format"] = fmt_pct
+            elif fmt_num is not None:
+                c["format"] = fmt_num
+    return cols
+
+def shrink_daily_columns(df_or_cols) -> list[dict]:
+    """Columns for Daily Summary tables (BO/Voice) with 1-decimal hours formatting.
+    Accepts a DataFrame or an ordered list of column names.
+    """
+    cols = list(df_or_cols.columns) if hasattr(df_or_cols, "columns") else list(df_or_cols)
+    defs = []
+    fmt_num = _fmt_numeric(1)
+    for c in cols:
+        col_def = {"id": c, "name": c}
+        # Mark hour columns as numeric and format with 1 decimal
+        if isinstance(c, str) and ("hours" in c.lower()):
+            col_def["type"] = "numeric"
+            if fmt_num is not None:
+                col_def["format"] = fmt_num
+        defs.append(col_def)
+    return defs
 
 
 def _shrink_slug(name: str) -> str:
@@ -907,8 +999,6 @@ def _compute_shrink_weekly_percentages(df: pd.DataFrame) -> pd.DataFrame:
     out["overall_pct"] = out["overall_pct"].fillna(0.0)
     return out
 
-
-# ---------- BRID enrichment using headcount ----------
 # ---------- BRID enrichment using headcount ----------
 def enrich_with_manager(df: pd.DataFrame) -> pd.DataFrame:
     """Add Team Manager/Manager BRID to a wide or long roster using BRID mapping."""
