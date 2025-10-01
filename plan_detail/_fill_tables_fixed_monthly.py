@@ -1,4 +1,5 @@
 import ast
+import ast
 import calendar
 import json
 import math
@@ -1409,15 +1410,9 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
             def col(name): return pv[name] if name in pv.columns else 0.0
             base = col("SC_INCLUDED_TIME")
-            # Match weekly buckets: broaden OOO/INO codes
-            ooo  = (
-                col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term") +
-                col("SC_VACATION") + col("SC_LEAVE") + col("SC_UNPAID")
-            )
-            ino  = (
-                col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION") +
-                col("SC_MEETING") + col("SC_COACHING")
-            )
+            # Match weekly buckets exactly
+            ooo  = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
+            ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
             # Also accumulate monthly SC denominator
@@ -1468,14 +1463,9 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             pv = d2.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
             def col(name): return pv[name] if name in pv.columns else 0.0
             base = col("SC_INCLUDED_TIME")
-            ooo = (
-                col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term") +
-                col("SC_VACATION") + col("SC_LEAVE") + col("SC_UNPAID")
-            )
-            ino  = (
-                col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION") +
-                col("SC_MEETING") + col("SC_COACHING")
-            )
+            # Match weekly buckets exactly
+            ooo  = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
+            ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
         elif c_date and c_act and c_sec and not b.empty:
@@ -1612,20 +1602,17 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             else:
                 base = ooo + ino
             base_hours_m[m] = base
-        # Pick formula by channel/available denominators, mirroring weekly behavior
+        # Pick formula by channel/denominators EXACTLY like weekly
         ch_lower = str(ch_first or "").strip().lower()
         is_bo_ch = (ch_lower in ("back office","bo")) or ("back office" in ch_lower)
-        if is_bo_ch or (scm > 0.0 and ttwm > 0.0):
+        use_bo_denoms = (scm > 0.0 or ttwm > 0.0) or is_bo_ch
+        if use_bo_denoms:
             # Back Office rule: OOO% = Downtime/SC, In-Office% = Divert/TTW
             ooo_pct = (100.0 * ooo / scm) if scm > 0 else 0.0
             ino_pct = (100.0 * ino / ttwm) if ttwm > 0 else 0.0
             ov_pct  = (ooo_pct + ino_pct)
-        elif base > 0.0:
-            # Voice-like rule: both OOO% and In-Office% over Base hours
-            ooo_pct = (100.0 * ooo / base)
-            ino_pct = (100.0 * ino / base)
-            ov_pct  = (100.0 * (ooo + ino) / base)
         else:
+            # If SC/TTW denominators are missing, do not fall back to base; use 0%.
             ooo_pct = 0.0
             ino_pct = 0.0
             ov_pct  = 0.0
@@ -1642,7 +1629,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         shr.loc[shr["metric"] == "Variance vs Planned",  m] = variance_pp
         if _debug_shr_m:
             try:
-                branch = 'bo' if (is_bo_ch or (scm>0 and ttwm>0)) else 'non-bo'
+                branch = 'bo' if ((scm>0 or ttwm>0) or (str(ch_first or '').strip().lower() in ('back office','bo') or ('back office' in str(ch_first or '').strip().lower()))) else 'non-bo'
                 print(f"[SHR-M][month={m}] ch={str(ch_first).strip().lower()} OOO={ooo:.2f} SC={scm:.2f} TTW={ttwm:.2f} base={base:.2f} branch={branch} OOO%={ooo_pct:.2f} INO%={ino_pct:.2f} OV%={ov_pct:.2f}")
             except Exception:
                 pass
@@ -2295,4 +2282,3 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         bulk_df.to_dict("records")  if isinstance(bulk_df,  pd.DataFrame) else [],
         notes_df.to_dict("records") if isinstance(notes_df, pd.DataFrame) else [],
     )
-
