@@ -2073,12 +2073,9 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 eff_shr = min(0.99, max(0.0, bo_shr_base + shr_add))
                 base_prod_hours = wd * bo_hpd * (1.0 - eff_shr) * util_bo
                 try:
-                    # Prefer shrinkage-derived monthly overtime hours when available
-                    ot = float((overtime_hours_m.get(m, None) if 'overtime_hours_m' in locals() else None))
-                    if pd.isna(ot) or ot is None:
-                        ot = float(overtime_m.get(m, 0.0) or 0.0)
-                except Exception:
                     ot = float(overtime_m.get(m, 0.0) or 0.0)
+                except Exception:
+                    ot = 0.0
                 if sut <= 0.0 or agents_eff <= 0.0:
                     handling_capacity[m] = 0.0
                 else:
