@@ -1194,16 +1194,25 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         g = d.groupby("month", as_index=True)[vcol].agg(how)
         return g.astype(float).to_dict()
     budget_df = _first_non_empty_ts(sk, ["budget_headcount","budget_hc","headcount_budget","hc_budget"])
-    budget_m  = _monthly_reduce(budget_df, value_candidates=("hc","headcount","value","count"), how="sum")
+    # For headcount, monthly should reflect average level across the month, not sum of weeks
+    budget_m  = _monthly_reduce(budget_df, value_candidates=("hc","headcount","value","count"), how="mean")
     for m in month_ids:
         hc.loc[hc["metric"] == "Budgeted HC (#)",         m] = float(budget_m.get(m, 0.0))
         hc.loc[hc["metric"] == "Planned/Tactical HC (#)", m] = float(budget_m.get(m, 0.0))
 
     # ---- Attrition (planned/actual/pct) monthly ----
-    att_plan_m = _monthly_reduce(_first_non_empty_ts(sk, ["attrition_planned_hc","attrition_plan_hc","planned_attrition_hc"]),
-                                 value_candidates=("hc","headcount","value","count"), how="sum")
-    att_act_m  = _monthly_reduce(_first_non_empty_ts(sk, ["attrition_actual_hc","attrition_actual","actual_attrition_hc"]),
-                                 value_candidates=("hc","headcount","value","count"), how="sum")
+    # For attrition headcount, weekly inputs should ROLL UP by SUM to a monthly total
+    # (not MEAN). Using mean dilutes monthly counts by ~4x when source is weekly.
+    att_plan_m = _monthly_reduce(
+        _first_non_empty_ts(sk, ["attrition_planned_hc", "attrition_plan_hc", "planned_attrition_hc"]),
+        value_candidates=("hc", "headcount", "value", "count"),
+        how="sum",
+    )
+    att_act_m = _monthly_reduce(
+        _first_non_empty_ts(sk, ["attrition_actual_hc", "attrition_actual", "actual_attrition_hc"]),
+        value_candidates=("hc", "headcount", "value", "count"),
+        how="sum",
+    )
     att_pct_m  = _monthly_reduce(_first_non_empty_ts(sk, ["attrition_pct","attrition_percent","attrition%","attrition_rate"]),
                                  value_candidates=("pct","percent","value"), how="mean")
     try:
@@ -1254,10 +1263,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             plan_hc += float(attr_delta)
         plan_hc = max(0.0, plan_hc)
         planned_pct_val = None
-        if isinstance(att_plan_pct_saved, dict):
-            planned_pct_val = att_plan_pct_saved.get(m)
-        if planned_pct_val is None:
-            planned_pct_val = att_pct_m.get(m)
+        # Always compute monthly planned % from monthly planned HC and a monthly HC baseline.
+        # Do not average weekly percentages, which dilutes the monthly rate by ~4x.
         if planned_pct_val is None:
             # Baseline for planned %: previous month's Actual Agent HC snapshot; fallback to current month's start HC,
             # then Planned/Tactical HC, then Budgeted HC.
@@ -1523,10 +1530,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             #     k = str(pd.to_datetime(t).to_period('M').to_timestamp().date())
             #     sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(scv)
             #     tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
-            for t, scv, ttwh in zip(idx, h_sc, total_time_worked_h):
-                k = _month_key([t])[0]  # collapse to month midpoint
-                sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(scv)
-                tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
+            # for t, scv, ttwh in zip(idx, h_sc, total_time_worked_h):
+            #     k = _month_key([t])[0]  # collapse to month midpoint
+            #     sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(scv)
+            #     tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
             # Capture overtime hours (monthly) from shrinkage raw (Back Office)
             try:
                 mk = _month_key(sec_ot.index)
@@ -1826,14 +1833,14 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             if pct > 0:
                 if pct > 1.0:
                     pct = pct / 100.0
-                # Denominator preference: planned HC -> actual HC snapshot -> budget
+                # Denominator preference: actual HC -> planned HC snapshot -> budget
                 try:
-                    denom_f = float(hc_plan_row.get(m, 0.0) or 0.0)
+                    denom_f = float(hc_actual_row.get(m, 0.0) or 0.0)
                 except Exception:
                     denom_f = 0.0
                 if denom_f <= 0:
                     try:
-                        denom_f = float(hc_actual_row.get(m, 0.0) or 0.0)
+                        denom_f = float(hc_plan_row.get(m, 0.0) or 0.0)
                     except Exception:
                         denom_f = 0.0
                 if denom_f <= 0:
