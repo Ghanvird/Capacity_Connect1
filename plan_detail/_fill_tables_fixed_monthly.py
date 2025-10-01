@@ -2288,7 +2288,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             sut = float(bF_sut.get(mm, s_target_sut))
             sh_pct = float(shr_planned_pct_m.get(mm, np.nan))
             sh_frac = (sh_pct/100.0) if (not pd.isna(sh_pct)) else float(planned_shrink_fraction)
-            denom = max(1e-6, monthly_hours * max(0.01, 1.0 - sh_frac))
+            denom = max(1e-6, monthly_hours * float(util_bo) * max(0.01, 1.0 - sh_frac))
             fte = ((vol * sut) / 3600.0) / denom
             upper_df.loc[upper_df["metric"] == "FTE Required @ Forecast Volume", mm] = fte
     elif "FTE Required @ Forecast Volume" in spec["upper"]:
@@ -2313,7 +2313,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             # By default use planned shrink to match provided examples; switch to 'shr_actual_pct_m' if desired
             sh_pct = float(shr_actual_pct_m.get(mm, np.nan))
             sh_frac = (sh_pct/100.0) if (not pd.isna(sh_pct)) else float(planned_shrink_fraction)
-            denom = max(1e-6, monthly_hours * max(0.01, 1.0 - sh_frac))
+            denom = max(1e-6, monthly_hours * float(util_bo) * max(0.01, 1.0 - sh_frac))
             fte = ((vol * sut) / 3600.0) / denom
             upper_df.loc[upper_df["metric"] == "FTE Required @ Actual Volume", mm] = fte
     elif "FTE Required @ Actual Volume" in spec["upper"]:
@@ -2406,6 +2406,56 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 if not pd.isna(v):
                     seat.loc[seat["metric"] == nm, m] = v
             # Do not override monthly Variance from weekly; keep computed (req - avail)
+
+    # ---- Align BvA (BO) with Upper linear formula ----
+    try:
+        is_bo_monthly = str(ch_first or '').strip().lower() in ("back office", "bo")
+        if is_bo_monthly:
+            # Helper to read a month->value dict for a metric from 'shr'
+            def _metric_row_map(df: pd.DataFrame, metric_name: str) -> dict:
+                if not isinstance(df, pd.DataFrame) or df.empty or "metric" not in df.columns:
+                    return {}
+                mser = df["metric"].astype(str).str.strip()
+                if metric_name not in mser.values:
+                    return {}
+                row = df.loc[mser == metric_name].iloc[0]
+                out = {}
+                for mm in month_ids:
+                    try:
+                        out[mm] = float(pd.to_numeric(row.get(mm), errors="coerce"))
+                    except Exception:
+                        out[mm] = np.nan
+                return out
+
+            weekly_hours = float(settings.get("weekly_hours", settings.get("weekly_hours_per_fte", 40.0)) or 40.0)
+            monthly_hours = weekly_hours * (52.0/12.0)
+            shr_plan_pct = _metric_row_map(shr, "Planned Shrinkage %")
+            shr_act_pct  = _metric_row_map(shr, "Overall Shrinkage %")
+
+            for mm in month_ids:
+                # Budgeted FTE (#): use forecast items and planned SUT
+                vol_b = float(bF_itm.get(mm, 0.0))
+                sut_b = float(bF_sut.get(mm, s_target_sut))
+                sp = shr_plan_pct.get(mm, np.nan)
+                sp = float(sp) if not pd.isna(sp) else float(planned_shrink_fraction * 100.0)
+                sp_frac = (sp/100.0) if sp > 1.0 else max(0.0, float(sp))
+                denom_b = max(1e-6, monthly_hours * float(util_bo) * max(0.01, 1.0 - sp_frac))
+                bud_linear = ((vol_b * sut_b) / 3600.0) / denom_b
+
+                # Actual FTE (#): use actual items and actual SUT; shrink = Overall Shrinkage %
+                vol_a = float(bA_itm.get(mm, 0.0))
+                sut_a = float(bA_sut.get(mm, bF_sut.get(mm, s_target_sut)))
+                sa = shr_act_pct.get(mm, np.nan)
+                sa = float(sa) if not pd.isna(sa) else float(planned_shrink_fraction * 100.0)
+                sa_frac = (sa/100.0) if sa > 1.0 else max(0.0, float(sa))
+                denom_a = max(1e-6, monthly_hours * float(util_bo) * max(0.01, 1.0 - sa_frac))
+                act_linear = ((vol_a * sut_a) / 3600.0) / denom_a
+
+                bva.loc[bva["metric"] == "Budgeted FTE (#)", mm] = bud_linear
+                bva.loc[bva["metric"] == "Actual FTE (#)",   mm] = act_linear
+                bva.loc[bva["metric"] == "Variance (#)",     mm] = act_linear - bud_linear
+    except Exception:
+        pass
 
     # ---- rounding & display formatting ----
     def _round_cols_int(df, col_ids):  # month friendly
