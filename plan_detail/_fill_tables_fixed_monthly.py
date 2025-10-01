@@ -12,9 +12,104 @@ from cap_store import load_roster_long, resolve_holidays, resolve_settings
 from capacity_core import required_fte_daily
 from plan_detail._calc import _load_roster_normalized, _nh_effective_count 
 from plan_detail._common import _assemble_bo, _assemble_chat, _assemble_ob, _assemble_voice, _blank_grid, _canon_scope, _first_non_empty_ts, _learning_curve_for_week, _load_or_blank, _load_or_empty_bulk_files, _load_or_empty_notes, _load_ts_with_fallback, _parse_ratio_setting, get_plan_meta
-from common import summarize_shrinkage_bo
 from plan_store import get_plan
 from dash import dash_table
+
+def _bo_bucket(activity: str) -> str:
+    try:
+        if isinstance(activity, str):
+            s = activity
+        elif pd.isna(activity):
+            s = ""
+        else:
+            s = str(activity)
+    except Exception:
+        s = ""
+    s = s.strip().lower()
+    # flexible matching
+    if "divert" in s: return "diverted"
+    if "down" in s or s == "downtime": return "downtime"
+    if "staff complement" in s or s == "staff complement": return "staff_complement"
+    if "flex" in s or s == "flexitime": return "flextime"
+    if "lend" in s or s == "lend staff": return "lend_staff"
+    if "borrow" in s or s == "borrowed staff": return "borrowed_staff"
+    if "overtime" in s or s=="ot" or s == "overtime": return "overtime"
+    if "core time" in s or s=="core": return "core_time"
+    if "time worked" in s: return "time_worked"
+    if "work out" in s or "workout" in s: return "work_out"
+    return "other"
+
+
+def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
+    """Daily BO summary in hours with buckets needed for new shrinkage formula.
+    Buckets come from `_bo_bucket` applied to the free-text `activity` field.
+    Returns per-day rows including:
+      - "OOO Hours"      := Downtime
+      - "In Office Hours": Diverted Time
+      - "Base Hours"     := Staff Complement
+      - "TTW Hours"      := Staff Complement - Downtime + Flexi + Overtime + Borrowed - Lend
+    """
+    if dff is None or dff.empty:
+        return pd.DataFrame()
+    d = dff.copy()
+    d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
+
+    # Derive explicit buckets
+    d["bucket"] = d.get("activity", "").map(_bo_bucket)
+
+    keys = ["date", "journey", "sub_business_area", "channel"]
+    if "country" in d.columns:
+        keys.append("country")
+    if "site" in d.columns:
+        keys.append("site")
+
+    # Use hour granularity directly if present
+    if "time_hours" in d.columns:
+        val_col = "time_hours"
+        factor = 1.0
+    else:
+        val_col = "duration_seconds"
+        factor = 1.0 / 3600.0
+
+    agg = (
+        d.groupby(keys + ["bucket"], dropna=False)[val_col]
+         .sum()
+         .reset_index()
+    )
+    pivot = agg.pivot_table(index=keys, columns="bucket", values=val_col, fill_value=0.0).reset_index()
+
+    def _col(frame: pd.DataFrame, names: list[str]) -> pd.Series:
+        for nm in names:
+            if nm in frame.columns:
+                return frame[nm]
+        return pd.Series(0.0, index=frame.index)
+
+    sc  = _col(pivot, ["staff_complement"]) * factor
+    dwn = _col(pivot, ["downtime"]) * factor
+    flx = _col(pivot, ["flextime"]) * factor
+    ot  = _col(pivot, ["overtime"]) * factor
+    bor = _col(pivot, ["borrowed_staff", "borrowed"]) * factor
+    lnd = _col(pivot, ["lend_staff", "lend"]) * factor
+    div = _col(pivot, ["diverted"]) * factor
+
+    ttw = sc - dwn + flx + ot + bor - lnd
+
+    pivot["OOO Hours"] = dwn
+    pivot["In Office Hours"] = div
+    pivot["Base Hours"] = sc
+    pivot["TTW Hours"] = ttw
+
+    pivot = pivot.rename(columns={
+        "journey": "Business Area",
+        "sub_business_area": "Sub Business Area",
+        "channel": "Channel",
+        "country": "Country",
+        "site": "Site",
+    })
+
+    keep_keys = [c for c in ["date", "Business Area", "Sub Business Area", "Channel", "Country", "Site"] if c in pivot.columns]
+    keep = keep_keys + ["OOO Hours", "In Office Hours", "Base Hours", "TTW Hours"]
+    return pivot[keep].sort_values(keep_keys)
 
 def _get_fw_value(fw_df, metric, col_id, default=0.0):
     """
@@ -655,15 +750,80 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         except Exception:
             return {}
     overtime_m = _row_to_month_dict(fw_saved, "Overtime Hours (#)")
+
+    # Independent: compute Back Office Overtime Hours from shrinkage_raw_backoffice (do not touch shrinkage logic)
+    def _compute_monthly_ot_from_raw() -> dict:
+        try:
+            braw = load_df("shrinkage_raw_backoffice")
+        except Exception:
+            return {}
+        if not isinstance(braw, pd.DataFrame) or braw.empty:
+            return {}
+        df = braw.copy()
+        L = {str(c).strip().lower(): c for c in df.columns}
+        c_date = L.get("date")
+        c_act  = L.get("activity")
+        c_sec  = L.get("duration_seconds") or L.get("seconds") or L.get("duration")
+        c_hr   = L.get("hours") or L.get("duration_hours")
+        c_ba   = L.get("journey") or L.get("business area") or L.get("ba") or L.get("vertical")
+        c_sba  = L.get("sub_business_area") or L.get("sub business area") or L.get("sub_ba") or L.get("sub ba")
+        c_ch   = L.get("channel") or L.get("lob")
+        c_site = L.get("site") or L.get("location") or L.get("country") or L.get("city")
+        if not c_date or not c_act:
+            return {}
+        # Plan scope filters (Back Office only)
+        mask = pd.Series(True, index=df.index)
+        if c_ba and p.get("vertical"):
+            mask &= df[c_ba].astype(str).str.strip().str.lower().eq(str(p.get("vertical")).strip().lower())
+        if c_sba and p.get("sub_ba"):
+            mask &= df[c_sba].astype(str).str.strip().str.lower().eq(str(p.get("sub_ba")).strip().lower())
+        if c_ch:
+            mask &= df[c_ch].astype(str).str.strip().str.lower().isin(["back office","bo","backoffice"])
+        if c_site and (p.get("site") or p.get("location") or p.get("country")):
+            target = str(p.get("site") or p.get("location") or p.get("country")).strip().lower()
+            loc_l = df[c_site].astype(str).str.strip().str.lower()
+            if loc_l.eq(target).any():
+                mask &= loc_l.eq(target)
+        df = df.loc[mask]
+        if df.empty:
+            return {}
+        # Normalize and filter overtime activity
+        df[c_date] = pd.to_datetime(df[c_date], errors="coerce")
+        df = df.dropna(subset=[c_date])
+        act = df[c_act].astype(str).str.strip().str.lower()
+        m_ot = act.str.contains(r"\bover\s*time\b|\bovertime\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
+        df = df.loc[m_ot]
+        if df.empty:
+            return {}
+        if c_sec:
+            hours = pd.to_numeric(df[c_sec], errors="coerce").fillna(0.0) / 3600.0
+        elif c_hr:
+            hours = pd.to_numeric(df[c_hr], errors="coerce").fillna(0.0)
+        else:
+            return {}
+        tmp = pd.DataFrame({"date": df[c_date], "hours": hours})
+        tmp["month"] = _mid(tmp["date"]) 
+        agg = tmp.groupby("month", as_index=False)["hours"].sum()
+        return {str(r["month"]): float(r["hours"]) for _, r in agg.iterrows()}
+
+    _ot_m_raw = _compute_monthly_ot_from_raw()
     backlog_m  = _row_to_month_dict(fw_saved, "Backlog (Items)")
     if backlog_m_local and ("backlog" in lower_opts):
         backlog_m = backlog_m_local
  
     # Prepare map for monthly Overtime Hours; values populated later from shrinkage raw
+    
+    
     try:
         overtime_hours_m
     except NameError:
         overtime_hours_m = {}
+    if "overtime Hours (#)" in fw_rows:
+        for m in month_ids:
+            val = overtime_hours_m.get(m, None)
+            if val is not None:
+                fw.loc[fw["metric"] == "Overtime Hours (#)", m] = float(val)
+                
 
     # ---- Apply Backlog carryover (Back Office only): add previous month's backlog to next month's BO forecast ----
     if backlog_carryover and str(ch_first).strip().lower() in ("back office", "bo") and backlog_m and ("backlog" in lower_opts):
@@ -1468,17 +1628,11 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
         elif c_date and c_act and (c_sec or (L.get("hours") or L.get("duration_hours"))) and not b.empty:
-            # Activity-based feed: accept seconds OR hours as duration column
-            c_hr = L.get("hours") or L.get("duration_hours")
-            cols = [c for c in [c_date, c_act, c_sec, c_hr] if c]
-            d = b[cols].copy()
+            d = b[[c_date, c_act, c_sec]].copy()
             d[c_act] = d[c_act].astype(str).str.strip().str.lower()
-            if c_sec:
-                d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
-            if c_hr:
-                d[c_hr]  = pd.to_numeric(d[c_hr],  errors="coerce").fillna(0.0)
+            d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
             d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
-            act = d[c_act]
+            act = d[c_act] 
             # Broaden classifiers similar to weekly
             m_div  = act.str.contains(r"\bdivert(?:ed)?\b", regex=True, na=False) | act.eq("diverted")
             m_dow  = act.str.contains(r"\bdowntime\b|\bdown\b", regex=True, na=False) | act.eq("downtime")
@@ -1487,48 +1641,26 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             m_ot   = act.str.contains(r"\bover\s*time\b|\bovertime\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
             m_lend = act.str.contains(r"\blend(?:ed)?\b|\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
             m_borr = act.str.contains(r"\bborrow(?:ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
-            if c_sec:
-                sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
-                sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
-                sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
-                sec_fx   = d.loc[m_fx,   c_sec].groupby(d[c_date]).sum()
-                sec_ot   = d.loc[m_ot,   c_sec].groupby(d[c_date]).sum()
-                sec_lend = d.loc[m_lend, c_sec].groupby(d[c_date]).sum()
-                sec_borr = d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
-                idx = pd.to_datetime(pd.Index(
-                    set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) | set(sec_fx.index) |
-                    set(sec_ot.index)  | set(sec_lend.index)| set(sec_borr.index)
-                ), errors="coerce").sort_values()
-                def get(s): return s.reindex(idx, fill_value=0.0)
-                # Seconds -> Hours
-                s_div = get(sec_div).astype(float); h_div = s_div / 3600.0
-                s_dow = get(sec_dow).astype(float); h_dow = s_dow / 3600.0
-                s_sc  = get(sec_sc).astype(float);  h_sc  = s_sc  / 3600.0
-                s_fx  = get(sec_fx).astype(float);  h_fx  = s_fx  / 3600.0
-                s_ot  = get(sec_ot).astype(float);  h_ot  = s_ot  / 3600.0
-                s_len = get(sec_lend).astype(float);h_len = s_len / 3600.0
-                s_bor = get(sec_borr).astype(float);h_bor = s_bor / 3600.0
-            else:
-                hr_div  = d.loc[m_div,  c_hr].groupby(d[c_date]).sum()
-                hr_dow  = d.loc[m_dow,  c_hr].groupby(d[c_date]).sum()
-                hr_sc   = d.loc[m_sc,   c_hr].groupby(d[c_date]).sum()
-                hr_fx   = d.loc[m_fx,   c_hr].groupby(d[c_date]).sum()
-                hr_ot   = d.loc[m_ot,   c_hr].groupby(d[c_date]).sum()
-                hr_lend = d.loc[m_lend, c_hr].groupby(d[c_date]).sum()
-                hr_borr = d.loc[m_borr, c_hr].groupby(d[c_date]).sum()
-                idx = pd.to_datetime(pd.Index(
-                    set(hr_div.index) | set(hr_dow.index) | set(hr_sc.index) | set(hr_fx.index) |
-                    set(hr_ot.index)  | set(hr_lend.index)| set(hr_borr.index)
-                ), errors="coerce").sort_values()
-                def get(s): return s.reindex(idx, fill_value=0.0)
-                # Already in Hours
-                h_div = get(hr_div).astype(float)
-                h_dow = get(hr_dow).astype(float)
-                h_sc  = get(hr_sc).astype(float)
-                h_fx  = get(hr_fx).astype(float)
-                h_ot  = get(hr_ot).astype(float)
-                h_len = get(hr_lend).astype(float)
-                h_bor = get(hr_borr).astype(float)
+            sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
+            sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
+            sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
+            sec_fx   = d.loc[m_fx,   c_sec].groupby(d[c_date]).sum()
+            sec_ot   = d.loc[m_ot,   c_sec].groupby(d[c_date]).sum()
+            sec_lend = d.loc[m_lend, c_sec].groupby(d[c_date]).sum()
+            sec_borr = d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
+            idx = pd.to_datetime(pd.Index(
+                set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) | set(sec_fx.index) |
+                set(sec_ot.index)  | set(sec_lend.index)| set(sec_borr.index)
+            ), errors="coerce").sort_values()
+            def get(s): return s.reindex(idx, fill_value=0.0)
+            # Seconds -> Hours
+            s_div = get(sec_div).astype(float); h_div = s_div / 3600.0
+            s_dow = get(sec_dow).astype(float); h_dow = s_dow / 3600.0
+            s_sc  = get(sec_sc).astype(float);  h_sc  = s_sc  / 3600.0
+            s_fx  = get(sec_fx).astype(float);  h_fx  = s_fx  / 3600.0
+            s_ot  = get(sec_ot).astype(float);  h_ot  = s_ot  / 3600.0
+            s_len = get(sec_lend).astype(float);h_len = s_len / 3600.0
+            s_bor = get(sec_borr).astype(float);h_bor = s_bor / 3600.0
 
             # Denominators per business rule
             total_time_worked_h = (h_sc - h_dow + h_fx + h_ot + h_bor - h_len).clip(lower=0)
@@ -1556,14 +1688,11 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             #     tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
             # Capture overtime hours (monthly) from shrinkage raw (Back Office)
             try:
-                if c_sec:
-                    mk = _month_key(sec_ot.index)
-                    g_ot = pd.DataFrame({"month": mk, "ot": (sec_ot.astype(float) / 3600.0)}).groupby("month", as_index=False).sum()
-                else:
-                    mk = _month_key(hr_ot.index)
-                    g_ot = pd.DataFrame({"month": mk, "ot": (hr_ot.astype(float))}).groupby("month", as_index=False).sum()
+                mk = _month_key(sec_ot.index)
+                g_ot = pd.DataFrame({"month": mk, "ot": (sec_ot.astype(float) / 3600)}).groupby("month", as_index=False).sum()
                 for _, r2 in g_ot.iterrows():
-                    k2 = str(r2["month"]) ; overtime_hours_m[k2] = overtime_hours_m.get(k2, 0.0) + float(r2["ot"])
+                    k2 = str(r2["month"])
+                    overtime_hours_m[k2] = overtime_hours_m.get(k2, 0.0) + float(r2["ot"])
             except Exception:
                 pass
         # As a robustness fallback (and to match weekly behavior), also derive monthly OOO/SC/TTW via common.summarize_shrinkage_bo
@@ -1607,10 +1736,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                         tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(r3['TTW Hours'])
         except Exception:
             pass
-    # After computing overtime_hours_m from shrinkage raw, write into FW grid
+    # After computing shrinkage, write independent overtime (from raw) into FW grid (does not alter shrinkage)
     if "Overtime Hours (#)" in fw_rows:
         for m in month_ids:
-            val = overtime_hours_m.get(m, None)
+            val = _ot_m_raw.get(m, None)
+            if val is None:
+                val = overtime_m.get(m, None)
             if val is not None:
                 fw.loc[fw["metric"] == "Overtime Hours (#)", m] = float(val)
     try:
@@ -2397,4 +2528,3 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         bulk_df.to_dict("records")  if isinstance(bulk_df,  pd.DataFrame) else [],
         notes_df.to_dict("records") if isinstance(notes_df, pd.DataFrame) else [],
     )
-
