@@ -2112,7 +2112,31 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
 
     # ---- Upper summary table (same rows) ----
     upper_df = _blank_grid(spec["upper"], month_ids)
-    if "FTE Required @ Forecast Volume" in spec["upper"]:
+    # For Back Office in monthly view, align FTE to linear monthly formula:
+    # FTE = ((Monthly Items * SUT_sec) / 3600) / MonthlyHoursPerFTE / (1 - Shrink)
+    # Use planned shrink for consistency with examples; can be toggled later if needed.
+    is_bo_monthly = str(ch_first or '').strip().lower() in ("back office", "bo")
+    weekly_hours = float(settings.get("weekly_hours", settings.get("weekly_hours_per_fte", 40.0)) or 40.0)
+    monthly_hours = weekly_hours * (52.0/12.0)
+    # Read monthly shrink rows (numeric, pre-formatting)
+    def _row_as_dict_safe(df, metric_name):
+        try:
+            return _row_as_dict(df, metric_name)
+        except Exception:
+            return {m: np.nan for m in month_ids}
+    shr_planned_pct_m = _row_as_dict_safe(shr, "Planned Shrinkage %")
+    shr_actual_pct_m  = _row_as_dict_safe(shr, "Overall Shrinkage %")
+
+    if ("FTE Required @ Forecast Volume" in spec["upper"]) and is_bo_monthly:
+        for mm in month_ids:
+            vol = float(bF_itm.get(mm, 0.0))
+            sut = float(bF_sut.get(mm, s_target_sut))
+            sh_pct = float(shr_planned_pct_m.get(mm, np.nan))
+            sh_frac = (sh_pct/100.0) if (not pd.isna(sh_pct)) else float(planned_shrink_fraction)
+            denom = max(1e-6, monthly_hours * max(0.01, 1.0 - sh_frac))
+            fte = ((vol * sut) / 3600.0) / denom
+            upper_df.loc[upper_df["metric"] == "FTE Required @ Forecast Volume", mm] = fte
+    elif "FTE Required @ Forecast Volume" in spec["upper"]:
         for mm in month_ids:
             upper_df.loc[upper_df["metric"] == "FTE Required @ Forecast Volume", mm] = float(req_m_forecast.get(mm, 0.0))
     # Optional: FTE Required @ Queue (scale forecast requirement by Queue/Forecast load)
@@ -2126,12 +2150,31 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             base_req = float(req_m_forecast.get(m, 0.0))
             reqq = (base_req * (qval / fval)) if fval > 0 else 0.0
             upper_df.loc[upper_df["metric"] == "FTE Required @ Queue", m] = reqq
-    if "FTE Required @ Actual Volume" in spec["upper"]:
+    if ("FTE Required @ Actual Volume" in spec["upper"]) and is_bo_monthly:
+        for mm in month_ids:
+            vol = float(bA_itm.get(mm, 0.0))
+            # Prefer actual SUT; fallback to forecast/target
+            sut = float(bA_sut.get(mm, bF_sut.get(mm, s_target_sut)))
+            # By default use planned shrink to match provided examples; switch to 'shr_actual_pct_m' if desired
+            sh_pct = float(shr_actual_pct_m.get(mm, np.nan))
+            sh_frac = (sh_pct/100.0) if (not pd.isna(sh_pct)) else float(planned_shrink_fraction)
+            denom = max(1e-6, monthly_hours * max(0.01, 1.0 - sh_frac))
+            fte = ((vol * sut) / 3600.0) / denom
+            upper_df.loc[upper_df["metric"] == "FTE Required @ Actual Volume", mm] = fte
+    elif "FTE Required @ Actual Volume" in spec["upper"]:
         for mm in month_ids:
             upper_df.loc[upper_df["metric"] == "FTE Required @ Actual Volume", mm] = float(req_m_actual.get(mm, 0.0))
     if "FTE Over/Under MTP Vs Actual" in spec["upper"]:
         for mm in month_ids:
-            upper_df.loc[upper_df["metric"] == "FTE Over/Under MTP Vs Actual", mm] = float(req_m_forecast.get(mm, 0.0)) - float(req_m_actual.get(mm, 0.0))
+            if is_bo_monthly:
+                try:
+                    mtp = float(pd.to_numeric(upper_df.loc[upper_df["metric"] == "FTE Required @ Forecast Volume", mm], errors="coerce").fillna(0).iloc[0])
+                    act = float(pd.to_numeric(upper_df.loc[upper_df["metric"] == "FTE Required @ Actual Volume", mm], errors="coerce").fillna(0).iloc[0])
+                except Exception:
+                    mtp, act = float(req_m_forecast.get(mm, 0.0)), float(req_m_actual.get(mm, 0.0))
+                upper_df.loc[upper_df["metric"] == "FTE Over/Under MTP Vs Actual", mm] = mtp - act
+            else:
+                upper_df.loc[upper_df["metric"] == "FTE Over/Under MTP Vs Actual", mm] = float(req_m_forecast.get(mm, 0.0)) - float(req_m_actual.get(mm, 0.0))
     if "FTE Over/Under Tactical Vs Actual" in spec["upper"]:
         for mm in month_ids:
             upper_df.loc[upper_df["metric"] == "FTE Over/Under Tactical Vs Actual", mm] = float(req_m_tactical.get(mm, 0.0)) - float(req_m_actual.get(mm, 0.0))
