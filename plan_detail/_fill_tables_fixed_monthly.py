@@ -658,20 +658,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     backlog_m  = _row_to_month_dict(fw_saved, "Backlog (Items)")
     if backlog_m_local and ("backlog" in lower_opts):
         backlog_m = backlog_m_local
-
-
-    # Write Overtime Hours (#) from shrinkage raw into FW when available
-    # Ensure the overtime_hours_m map exists before reading
+ 
+    # Prepare map for monthly Overtime Hours; values populated later from shrinkage raw
     try:
         overtime_hours_m
     except NameError:
         overtime_hours_m = {}
-    if "Overtime Hours (#)" in fw_rows:
-        for m in month_ids:
-            val = overtime_hours_m.get(m, None)
-            if val is not None:
-                fw.loc[fw["metric"] == "Overtime Hours (#)", m] = float(val)
-
 
     # ---- Apply Backlog carryover (Back Office only): add previous month's backlog to next month's BO forecast ----
     if backlog_carryover and str(ch_first).strip().lower() in ("back office", "bo") and backlog_m and ("backlog" in lower_opts):
@@ -1475,10 +1467,16 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
-        elif c_date and c_act and c_sec and not b.empty:
-            d = b[[c_date, c_act, c_sec]].copy()
+        elif c_date and c_act and (c_sec or (L.get("hours") or L.get("duration_hours"))) and not b.empty:
+            # Activity-based feed: accept seconds OR hours as duration column
+            c_hr = L.get("hours") or L.get("duration_hours")
+            cols = [c for c in [c_date, c_act, c_sec, c_hr] if c]
+            d = b[cols].copy()
             d[c_act] = d[c_act].astype(str).str.strip().str.lower()
-            d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
+            if c_sec:
+                d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
+            if c_hr:
+                d[c_hr]  = pd.to_numeric(d[c_hr],  errors="coerce").fillna(0.0)
             d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
             act = d[c_act]
             # Broaden classifiers similar to weekly
@@ -1486,29 +1484,51 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             m_dow  = act.str.contains(r"\bdowntime\b|\bdown\b", regex=True, na=False) | act.eq("downtime")
             m_sc   = act.str.contains(r"\bstaff\s*complement\b|\bsc[_\s-]*included[_\s-]*time\b|\bincluded\s*time\b|\bstaffed\s*hours\b", regex=True, na=False) | act.eq("staff complement")
             m_fx   = act.str.contains(r"\bflexi?time\b|\bflex\b", regex=True, na=False) | act.eq("flexitime")
-            m_ot   = act.str.contains(r"\bover\s*time\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
+            m_ot   = act.str.contains(r"\bover\s*time\b|\bovertime\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
             m_lend = act.str.contains(r"\blend(?:ed)?\b|\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
             m_borr = act.str.contains(r"\bborrow(?:ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
-            sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
-            sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
-            sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
-            sec_fx   = d.loc[m_fx,   c_sec].groupby(d[c_date]).sum()
-            sec_ot   = d.loc[m_ot,   c_sec].groupby(d[c_date]).sum()
-            sec_lend = d.loc[m_lend, c_sec].groupby(d[c_date]).sum()
-            sec_borr = d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
-            idx = pd.to_datetime(pd.Index(
-                set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) | set(sec_fx.index) |
-                set(sec_ot.index)  | set(sec_lend.index)| set(sec_borr.index)
-            ), errors="coerce").sort_values()
-            def get(s): return s.reindex(idx, fill_value=0.0)
-            # Seconds -> Hours
-            s_div = get(sec_div).astype(float); h_div = s_div / 3600.0
-            s_dow = get(sec_dow).astype(float); h_dow = s_dow / 3600.0
-            s_sc  = get(sec_sc).astype(float);  h_sc  = s_sc  / 3600.0
-            s_fx  = get(sec_fx).astype(float);  h_fx  = s_fx  / 3600.0
-            s_ot  = get(sec_ot).astype(float);  h_ot  = s_ot  / 3600.0
-            s_len = get(sec_lend).astype(float);h_len = s_len / 3600.0
-            s_bor = get(sec_borr).astype(float);h_bor = s_bor / 3600.0
+            if c_sec:
+                sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
+                sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
+                sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
+                sec_fx   = d.loc[m_fx,   c_sec].groupby(d[c_date]).sum()
+                sec_ot   = d.loc[m_ot,   c_sec].groupby(d[c_date]).sum()
+                sec_lend = d.loc[m_lend, c_sec].groupby(d[c_date]).sum()
+                sec_borr = d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
+                idx = pd.to_datetime(pd.Index(
+                    set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) | set(sec_fx.index) |
+                    set(sec_ot.index)  | set(sec_lend.index)| set(sec_borr.index)
+                ), errors="coerce").sort_values()
+                def get(s): return s.reindex(idx, fill_value=0.0)
+                # Seconds -> Hours
+                s_div = get(sec_div).astype(float); h_div = s_div / 3600.0
+                s_dow = get(sec_dow).astype(float); h_dow = s_dow / 3600.0
+                s_sc  = get(sec_sc).astype(float);  h_sc  = s_sc  / 3600.0
+                s_fx  = get(sec_fx).astype(float);  h_fx  = s_fx  / 3600.0
+                s_ot  = get(sec_ot).astype(float);  h_ot  = s_ot  / 3600.0
+                s_len = get(sec_lend).astype(float);h_len = s_len / 3600.0
+                s_bor = get(sec_borr).astype(float);h_bor = s_bor / 3600.0
+            else:
+                hr_div  = d.loc[m_div,  c_hr].groupby(d[c_date]).sum()
+                hr_dow  = d.loc[m_dow,  c_hr].groupby(d[c_date]).sum()
+                hr_sc   = d.loc[m_sc,   c_hr].groupby(d[c_date]).sum()
+                hr_fx   = d.loc[m_fx,   c_hr].groupby(d[c_date]).sum()
+                hr_ot   = d.loc[m_ot,   c_hr].groupby(d[c_date]).sum()
+                hr_lend = d.loc[m_lend, c_hr].groupby(d[c_date]).sum()
+                hr_borr = d.loc[m_borr, c_hr].groupby(d[c_date]).sum()
+                idx = pd.to_datetime(pd.Index(
+                    set(hr_div.index) | set(hr_dow.index) | set(hr_sc.index) | set(hr_fx.index) |
+                    set(hr_ot.index)  | set(hr_lend.index)| set(hr_borr.index)
+                ), errors="coerce").sort_values()
+                def get(s): return s.reindex(idx, fill_value=0.0)
+                # Already in Hours
+                h_div = get(hr_div).astype(float)
+                h_dow = get(hr_dow).astype(float)
+                h_sc  = get(hr_sc).astype(float)
+                h_fx  = get(hr_fx).astype(float)
+                h_ot  = get(hr_ot).astype(float)
+                h_len = get(hr_lend).astype(float)
+                h_bor = get(hr_borr).astype(float)
 
             # Denominators per business rule
             total_time_worked_h = (h_sc - h_dow + h_fx + h_ot + h_bor - h_len).clip(lower=0)
@@ -1536,8 +1556,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             #     tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
             # Capture overtime hours (monthly) from shrinkage raw (Back Office)
             try:
-                mk = _month_key(sec_ot.index)
-                g_ot = pd.DataFrame({"month": mk, "ot": (sec_ot.astype(float) / 3600.0)}).groupby("month", as_index=False).sum()
+                if c_sec:
+                    mk = _month_key(sec_ot.index)
+                    g_ot = pd.DataFrame({"month": mk, "ot": (sec_ot.astype(float) / 3600.0)}).groupby("month", as_index=False).sum()
+                else:
+                    mk = _month_key(hr_ot.index)
+                    g_ot = pd.DataFrame({"month": mk, "ot": (hr_ot.astype(float))}).groupby("month", as_index=False).sum()
                 for _, r2 in g_ot.iterrows():
                     k2 = str(r2["month"]) ; overtime_hours_m[k2] = overtime_hours_m.get(k2, 0.0) + float(r2["ot"])
             except Exception:
@@ -1583,12 +1607,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                         tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(r3['TTW Hours'])
         except Exception:
             pass
-            # After computing overtime_hours_m from shrinkage raw, write into FW grid
-            if "Overtime Hours (#)" in fw_rows:
-                for m in month_ids:
-                    val = overtime_hours_m.get(m, None)
-                    if val is not None:
-                        fw.loc[fw["metric"] == "Overtime Hours (#)", m] = float(val)
+    # After computing overtime_hours_m from shrinkage raw, write into FW grid
+    if "Overtime Hours (#)" in fw_rows:
+        for m in month_ids:
+            val = overtime_hours_m.get(m, None)
+            if val is not None:
+                fw.loc[fw["metric"] == "Overtime Hours (#)", m] = float(val)
     try:
         shr_saved_df = load_df(f"plan_{pid}_shr")
     except Exception:
@@ -2049,9 +2073,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 eff_shr = min(0.99, max(0.0, bo_shr_base + shr_add))
                 base_prod_hours = wd * bo_hpd * (1.0 - eff_shr) * util_bo
                 try:
-                    ot = float(overtime_m.get(m, 0.0) or 0.0)
+                    # Prefer shrinkage-derived monthly overtime hours when available
+                    ot = float((overtime_hours_m.get(m, None) if 'overtime_hours_m' in locals() else None))
+                    if pd.isna(ot) or ot is None:
+                        ot = float(overtime_m.get(m, 0.0) or 0.0)
                 except Exception:
-                    ot = 0.0
+                    ot = float(overtime_m.get(m, 0.0) or 0.0)
                 if sut <= 0.0 or agents_eff <= 0.0:
                     handling_capacity[m] = 0.0
                 else:
