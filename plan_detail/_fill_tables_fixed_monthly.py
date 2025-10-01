@@ -1,5 +1,4 @@
 import ast
-import ast
 import calendar
 import json
 import math
@@ -13,6 +12,7 @@ from cap_store import load_roster_long, resolve_holidays, resolve_settings
 from capacity_core import required_fte_daily
 from plan_detail._calc import _load_roster_normalized, _nh_effective_count 
 from plan_detail._common import _assemble_bo, _assemble_chat, _assemble_ob, _assemble_voice, _blank_grid, _canon_scope, _first_non_empty_ts, _learning_curve_for_week, _load_or_blank, _load_or_empty_bulk_files, _load_or_empty_notes, _load_ts_with_fallback, _parse_ratio_setting, get_plan_meta
+from common import summarize_shrinkage_bo
 from plan_store import get_plan
 from dash import dash_table
 
@@ -1535,6 +1535,47 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                     k2 = str(r2["month"]) ; overtime_hours_m[k2] = overtime_hours_m.get(k2, 0.0) + float(r2["ot"])
             except Exception:
                 pass
+        # As a robustness fallback (and to match weekly behavior), also derive monthly OOO/SC/TTW via common.summarize_shrinkage_bo
+        try:
+            dsum = summarize_shrinkage_bo(b)
+            if isinstance(dsum, pd.DataFrame) and not dsum.empty:
+                d2 = dsum.copy()
+                # Filter to current plan scope
+                def _filt_eq(series, val):
+                    try:
+                        if not val: return pd.Series([True]*len(series))
+                        s = series.astype(str).str.strip().str.lower()
+                        return s.eq(str(val).strip().lower())
+                    except Exception:
+                        return pd.Series([True]*len(series))
+                m = pd.Series([True]*len(d2))
+                if 'Business Area' in d2.columns and p.get('vertical'):
+                    m &= _filt_eq(d2['Business Area'], p.get('vertical'))
+                if 'Sub Business Area' in d2.columns and p.get('sub_ba'):
+                    m &= _filt_eq(d2['Sub Business Area'], p.get('sub_ba'))
+                if 'Channel' in d2.columns:
+                    m &= d2['Channel'].astype(str).str.strip().str.lower().isin(['back office','bo','backoffice'])
+                if loc_first:
+                    # if data has a specific country/site and it matches, filter; otherwise don't restrict
+                    for col in ('Country','Site'):
+                        if col in d2.columns:
+                            s = d2[col].astype(str).str.strip()
+                            sl = s.str.lower()
+                            tgt = loc_first.strip().lower()
+                            if sl.ne("").any() and sl.ne("all").any() and sl.eq(tgt).any():
+                                m &= sl.eq(tgt)
+                d2 = d2.loc[m]
+                if not d2.empty:
+                    d2['month'] = _mid(d2['date'])
+                    agg = d2.groupby('month', as_index=False)[['OOO Hours','In Office Hours','Base Hours','TTW Hours']].sum()
+                    for _, r3 in agg.iterrows():
+                        k = str(r3['month'])
+                        ooo_hours_m[k] = ooo_hours_m.get(k, 0.0) + float(r3['OOO Hours'])
+                        io_hours_m[k]  = io_hours_m.get(k, 0.0)  + float(r3['In Office Hours'])
+                        sc_hours_m[k]  = sc_hours_m.get(k, 0.0)  + float(r3['Base Hours'])
+                        tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(r3['TTW Hours'])
+        except Exception:
+            pass
             # After computing overtime_hours_m from shrinkage raw, write into FW grid
             if "Overtime Hours (#)" in fw_rows:
                 for m in month_ids:
@@ -2282,3 +2323,4 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         bulk_df.to_dict("records")  if isinstance(bulk_df,  pd.DataFrame) else [],
         notes_df.to_dict("records") if isinstance(notes_df, pd.DataFrame) else [],
     )
+
