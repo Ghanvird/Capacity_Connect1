@@ -432,6 +432,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 sl_target_pct = x * 100.0 if x <= 1.0 else x
             except Exception:
                 pass
+            # Prefer shrinkage-derived overtime hours for FW and downstream usage
+            try:
+                if isinstance(overtime_hours_w, dict) and len(overtime_hours_w) > 0:
+                    overtime_w = overtime_hours_w
+            except Exception:
+                pass
             break
     if sl_target_pct is None:
         sl_target_pct = 80.0
@@ -1675,10 +1681,16 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             _agg_weekly(idx, ooo, ino, base)
 
         # Activity-based feed
-        elif c_date and c_act and c_sec and not b.empty:
-            d = b[[c_date, c_act, c_sec]].copy()
+        elif c_date and c_act and (c_sec or (L.get("hours") or L.get("duration_hours"))) and not b.empty:
+            # Activity-based feed: accept seconds OR hours as duration column
+            c_hr = L.get("hours") or L.get("duration_hours")
+            cols = [c for c in [c_date, c_act, c_sec, c_hr] if c]
+            d = b[cols].copy()
             d[c_act]  = d[c_act].astype(str).str.strip().str.lower()
-            d[c_sec]  = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
+            if c_sec:
+                d[c_sec]  = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
+            if c_hr:
+                d[c_hr]   = pd.to_numeric(d[c_hr],  errors="coerce").fillna(0.0)
             d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
             act = d[c_act]
 
@@ -1687,23 +1699,37 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             m_dow  = act.str.contains(r"\bdowntime\b|\bdown\b", regex=True, na=False) | act.eq("downtime")
             m_sc   = act.str.contains(r"\bstaff\s*complement\b|\bstaffed\s*hours\b|\bsc[_\s-]*included[_\s-]*time\b|\bincluded\s*time\b", regex=True, na=False) | act.eq("staff complement")
             m_fx   = act.str.contains(r"\bflexi?time\b|\bflex\b", regex=True, na=False) | act.eq("flexitime")
-            m_ot   = act.str.contains(r"\bover\s*time\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
+            m_ot   = act.str.contains(r"\bover\s*time\b|\bovertime\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
             m_lend = act.str.contains(r"\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
             m_borr = act.str.contains(r"\bborrow(?:ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
 
-            # Aggregate seconds
-            sec_div, sec_dow, sec_sc = d.loc[m_div, c_sec].groupby(d[c_date]).sum(), d.loc[m_dow, c_sec].groupby(d[c_date]).sum(), d.loc[m_sc, c_sec].groupby(d[c_date]).sum()
-            sec_fx, sec_ot = d.loc[m_fx, c_sec].groupby(d[c_date]).sum(), d.loc[m_ot, c_sec].groupby(d[c_date]).sum()
-            sec_lend, sec_borr = d.loc[m_lend, c_sec].groupby(d[c_date]).sum(), d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
+            # Aggregate durations: prefer seconds when present; else use hours directly
+            if c_sec:
+                sec_div, sec_dow, sec_sc = d.loc[m_div, c_sec].groupby(d[c_date]).sum(), d.loc[m_dow, c_sec].groupby(d[c_date]).sum(), d.loc[m_sc, c_sec].groupby(d[c_date]).sum()
+                sec_fx, sec_ot = d.loc[m_fx, c_sec].groupby(d[c_date]).sum(), d.loc[m_ot, c_sec].groupby(d[c_date]).sum()
+                sec_lend, sec_borr = d.loc[m_lend, c_sec].groupby(d[c_date]).sum(), d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
 
-            idx = pd.to_datetime(pd.Index(set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) |
-                                        set(sec_fx.index)  | set(sec_ot.index)  | set(sec_lend.index) | set(sec_borr.index)),
-                                errors="coerce").sort_values()
-            def get(s): return s.reindex(idx, fill_value=0.0).astype(float)
+                idx = pd.to_datetime(pd.Index(set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) |
+                                             set(sec_fx.index)  | set(sec_ot.index)  | set(sec_lend.index) | set(sec_borr.index)),
+                                     errors="coerce").sort_values()
+                def get(s): return s.reindex(idx, fill_value=0.0).astype(float)
 
-            # Hours
-            h_div, h_dow, h_sc = get(sec_div)/3600.0, get(sec_dow)/3600.0, get(sec_sc)/3600.0
-            h_fx, h_ot, h_len, h_bor = get(sec_fx)/3600.0, get(sec_ot)/3600.0, get(sec_lend)/3600.0, get(sec_borr)/3600.0
+                # Seconds -> Hours
+                h_div, h_dow, h_sc = get(sec_div)/3600.0, get(sec_dow)/3600.0, get(sec_sc)/3600.0
+                h_fx, h_ot, h_len, h_bor = get(sec_fx)/3600.0, get(sec_ot)/3600.0, get(sec_lend)/3600.0, get(sec_borr)/3600.0
+            else:
+                hr_div, hr_dow, hr_sc = d.loc[m_div, c_hr].groupby(d[c_date]).sum(), d.loc[m_dow, c_hr].groupby(d[c_date]).sum(), d.loc[m_sc, c_hr].groupby(d[c_date]).sum()
+                hr_fx, hr_ot = d.loc[m_fx, c_hr].groupby(d[c_date]).sum(), d.loc[m_ot, c_hr].groupby(d[c_date]).sum()
+                hr_lend, hr_borr = d.loc[m_lend, c_hr].groupby(d[c_date]).sum(), d.loc[m_borr, c_hr].groupby(d[c_date]).sum()
+
+                idx = pd.to_datetime(pd.Index(set(hr_div.index) | set(hr_dow.index) | set(hr_sc.index) |
+                                             set(hr_fx.index)  | set(hr_ot.index)  | set(hr_lend.index) | set(hr_borr.index)),
+                                     errors="coerce").sort_values()
+                def get(s): return s.reindex(idx, fill_value=0.0).astype(float)
+
+                # Already in Hours
+                h_div, h_dow, h_sc = get(hr_div), get(hr_dow), get(hr_sc)
+                h_fx, h_ot, h_len, h_bor = get(hr_fx), get(hr_ot), get(hr_lend), get(hr_borr)
 
             # Denominators
             ooo_hours = h_dow
@@ -1714,13 +1740,19 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             # Weekly aggregation
             _agg_weekly(idx, ooo_hours, ino_hours, sc_hours)
 
-            # Track denominators
-            for t, scv in zip(idx, sc_hours):
-                k = str(pd.to_datetime(t).date())
-                sc_hours_w[k] = sc_hours_w.get(k, 0.0) + float(scv)
-            for t, ttw in zip(idx, ttw_hours):
-                k = str(pd.to_datetime(t).date())
-                tt_worked_hours_w[k] = tt_worked_hours_w.get(k, 0.0) + float(ttw)
+            wk = _week_key(idx)
+            g_ttw = pd.DataFrame({"week": wk, "ttw": ttw_hours}).groupby("week", as_index=False).sum()
+            for _, r in g_ttw.iterrows():
+                k = str(r["week"])
+                tt_worked_hours_w[k] = tt_worked_hours_w.get(k, 0.0) + float(r["ttw"])
+
+            # Track SC denominators (weekly)
+            wk = _week_key(idx)
+            g_sc = pd.DataFrame({"week": wk, "sc": sc_hours}).groupby("week", as_index=False).sum()
+            for _, r in g_sc.iterrows():
+                k = str(r["week"])
+                sc_hours_w[k] = sc_hours_w.get(k, 0.0) + float(r["sc"])
+
 
             # Daily shrink fractions
             for t, d_hrs, v_hrs in zip(idx, ooo_hours, ino_hours):
@@ -1731,10 +1763,14 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 ino_f = (float(v_hrs) / ttw) if ttw > 0 else 0.0
                 bo_shrink_frac_daily[k] = max(0.0, min(0.99, ooo_f + ino_f))
 
-            # Weekly overtime
+            # Weekly overtime from activity == overtime
             try:
-                wk = _week_key(sec_ot.index)
-                g_ot = pd.DataFrame({"week": wk, "ot": (sec_ot.astype(float) / 3600.0)}).groupby("week", as_index=False).sum()
+                if c_sec:
+                    wk = _week_key(sec_ot.index)
+                    g_ot = pd.DataFrame({"week": wk, "ot": (sec_ot.astype(float) / 3600.0)}).groupby("week", as_index=False).sum()
+                else:
+                    wk = _week_key(hr_ot.index)
+                    g_ot = pd.DataFrame({"week": wk, "ot": (hr_ot.astype(float))}).groupby("week", as_index=False).sum()
                 for _, r2 in g_ot.iterrows():
                     k2 = str(r2["week"])
                     overtime_hours_w[k2] = overtime_hours_w.get(k2, 0.0) + float(r2["ot"])
@@ -1839,6 +1875,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             val = overtime_hours_w.get(w, None)
             if val is not None:
                 fw.loc[fw["metric"] == "Overtime Hours (#)", w] = float(val)
+    # Ensure downstream capacity uses shrinkage-derived overtime
+    try:
+        if isinstance(overtime_hours_w, dict) and len(overtime_hours_w) > 0:
+            overtime_w = overtime_hours_w
+    except Exception:
+        pass
 
     # ---- BvA ----
     for w in week_ids:
