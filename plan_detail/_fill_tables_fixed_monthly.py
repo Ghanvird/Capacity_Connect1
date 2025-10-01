@@ -1,4 +1,5 @@
 import ast
+import ast
 import calendar
 import json
 import math
@@ -623,7 +624,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             queue_m[m] = qv
             fw.loc[fw["metric"] == "Queue (Items)", m] = qv
 
-    # Save current FW to support Backlog/Overtime readback
+    # Save current FW to support Backlog/Overtime/Shrinkage readback
     fw_saved = load_df(f"plan_{pid}_fw")
 
     def _row_to_month_dict(df: pd.DataFrame, metric_name: str) -> dict:
@@ -1047,7 +1048,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 c = k
                 break
         if c:
-            r[c] = pd.to_datetime(r[c], errors="coerce")
+            try:
+                r[c] = pd.to_datetime(r[c], errors="coerce", format="mixed")
+            except TypeError:
+                r[c] = pd.to_datetime(r[c], errors="coerce")
             r = r.dropna(subset=[c])
             r["month"] = _mid(r[c])
             g = r.groupby("month")[c].count().to_dict()
@@ -1067,7 +1071,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         # normalize timestamps
         for c in ("production_start","prod_start","terminate_date","term_date"):
             if c in R.columns:
-                R[c] = pd.to_datetime(R[c], errors="coerce").dt.normalize()
+                try:
+                    R[c] = pd.to_datetime(R[c], errors="coerce", format="mixed").dt.normalize()
+                except TypeError:
+                    R[c] = pd.to_datetime(R[c], errors="coerce").dt.normalize()
         if "production_start" not in R.columns and "prod_start" in R.columns:
             R["production_start"] = R["prod_start"]
         if "terminate_date" not in R.columns and "term_date" in R.columns:
@@ -1081,7 +1088,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             pass
         out = {}
         for mid in mids:
-            base = pd.to_datetime(mid, errors="coerce").normalize()
+            try:
+                base = pd.to_datetime(mid, errors="coerce", format="%Y-%m-%d").normalize()
+            except Exception:
+                base = pd.to_datetime(mid, errors="coerce").normalize()
             if pd.isna(base):
                 out[mid] = 0; continue
             y, m = int(base.year), int(base.month)
@@ -1106,12 +1116,24 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         if c_ps:
             for mm in month_ids:
                 try:
-                    dt0 = pd.to_datetime(mm, errors="coerce")
+                    try:
+                        dt0 = pd.to_datetime(mm, errors="coerce", format="%Y-%m-%d")
+                    except Exception:
+                        dt0 = pd.to_datetime(mm, errors="coerce")
                     if pd.isna(dt0):
                         continue
                     dt0 = pd.Timestamp(dt0).to_period('M').to_timestamp().date()
-                    ps = pd.to_datetime(R[c_ps], errors="coerce").dt.date
-                    td = pd.to_datetime(R[c_td], errors="coerce").dt.date if c_td else None
+                    try:
+                        ps = pd.to_datetime(R[c_ps], errors="coerce", format="mixed").dt.date
+                    except TypeError:
+                        ps = pd.to_datetime(R[c_ps], errors="coerce").dt.date
+                    if c_td:
+                        try:
+                            td = pd.to_datetime(R[c_td], errors="coerce", format="mixed").dt.date
+                        except TypeError:
+                            td = pd.to_datetime(R[c_td], errors="coerce").dt.date
+                    else:
+                        td = None
                     mask = ps <= dt0
                     if td is not None:
                         mask &= ((td.isna()) | (td >= dt0))
@@ -1312,7 +1334,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         if variance_label:
             att.loc[att["metric"] == variance_label, m] = float(pct) - float(planned_pct_val or 0.0)
 
-    # ---- Shrinkage raw ? monthly ---
+    # ---- Shrinkage raw - monthly ---
     ch_key = str(ch_first or '').strip().lower()
     def _planned_shr(val, fallback):
         try:
@@ -1388,8 +1410,15 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
             def col(name): return pv[name] if name in pv.columns else 0.0
             base = col("SC_INCLUDED_TIME")
-            ooo  = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
-            ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
+            # Match weekly buckets: broaden OOO/INO codes
+            ooo  = (
+                col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term") +
+                col("SC_VACATION") + col("SC_LEAVE") + col("SC_UNPAID")
+            )
+            ino  = (
+                col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION") +
+                col("SC_MEETING") + col("SC_COACHING")
+            )
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
             # Also accumulate monthly SC denominator
@@ -1438,8 +1467,15 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             d2[c_date]  = pd.to_datetime(d2[c_date], errors="coerce").dt.date
             pv = d2.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
             def col(name): return pv[name] if name in pv.columns else 0.0
-            base = col("SC_INCLUDED_TIME"); ooo = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
-            ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
+            base = col("SC_INCLUDED_TIME")
+            ooo = (
+                col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term") +
+                col("SC_VACATION") + col("SC_LEAVE") + col("SC_UNPAID")
+            )
+            ino  = (
+                col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION") +
+                col("SC_MEETING") + col("SC_COACHING")
+            )
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
         elif c_date and c_act and c_sec and not b.empty:
@@ -1492,9 +1528,13 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             except Exception:
                 pass
             # Track denominators for BO shrink formulas (month key)
-            mk = _month_key(idx)
-            for t, scv, ttwh in zip(mk, h_sc, total_time_worked_h):
-                k = str(pd.to_datetime(t).to_period('M').to_timestamp().date())
+            # mk = _month_key(idx)
+            # for t, scv, ttwh in zip(mk, h_sc, total_time_worked_h):
+            #     k = str(pd.to_datetime(t).to_period('M').to_timestamp().date())
+            #     sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(scv)
+            #     tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
+            for t, scv, ttwh in zip(idx, h_sc, total_time_worked_h):
+                k = _month_key([t])[0]  # collapse to month midpoint
                 sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(scv)
                 tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
             # Capture overtime hours (monthly) from shrinkage raw (Back Office)
@@ -1572,14 +1612,20 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             else:
                 base = ooo + ino
             base_hours_m[m] = base
-        # Prefer BO denominators automatically when present
-        use_bo_denoms = (scm > 0.0 or ttwm > 0.0) or (str(ch_first).strip().lower() in ("back office","bo") or ("back office" in str(ch_first).strip().lower()))
-        if use_bo_denoms:
+        # Pick formula by channel/available denominators, mirroring weekly behavior
+        ch_lower = str(ch_first or "").strip().lower()
+        is_bo_ch = (ch_lower in ("back office","bo")) or ("back office" in ch_lower)
+        if is_bo_ch or (scm > 0.0 and ttwm > 0.0):
+            # Back Office rule: OOO% = Downtime/SC, In-Office% = Divert/TTW
             ooo_pct = (100.0 * ooo / scm) if scm > 0 else 0.0
             ino_pct = (100.0 * ino / ttwm) if ttwm > 0 else 0.0
             ov_pct  = (ooo_pct + ino_pct)
+        elif base > 0.0:
+            # Voice-like rule: both OOO% and In-Office% over Base hours
+            ooo_pct = (100.0 * ooo / base)
+            ino_pct = (100.0 * ino / base)
+            ov_pct  = (100.0 * (ooo + ino) / base)
         else:
-            # If SC/TTW denominators are missing, do not fall back to base or saved values; use 0%.
             ooo_pct = 0.0
             ino_pct = 0.0
             ov_pct  = 0.0
@@ -1810,10 +1856,16 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                     c = k
                     break
             if c:
-                r2[c] = pd.to_datetime(r2[c], errors="coerce")
+                try:
+                    r2[c] = pd.to_datetime(r2[c], errors="coerce", format="mixed")
+                except TypeError:
+                    r2[c] = pd.to_datetime(r2[c], errors="coerce")
                 r2 = r2.dropna(subset=[c])
                 r2["month"] = _mid(r2[c])
-                first = pd.to_datetime(r2["month"], errors="coerce").dt.normalize()
+                try:
+                    first = pd.to_datetime(r2["month"], errors="coerce", format="%Y-%m-%d").dt.normalize()
+                except Exception:
+                    first = pd.to_datetime(r2["month"], errors="coerce").dt.normalize()
                 on_first = (r2[c].dt.normalize() == first)
                 g2 = r2.loc[on_first].groupby("month")[c].count().to_dict()
                 first_day_joins_m = {m: int(g2.get(m, 0)) for m in month_ids}
