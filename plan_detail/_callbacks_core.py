@@ -1,4 +1,4 @@
-﻿# file: plan_detail/_callbacks_core.py
+# file: plan_detail/_callbacks_core.py
 
 
 # file: plan_detail/_callbacks_core.py
@@ -2435,18 +2435,33 @@ def register_plan_detail_core(app: dash.Dash):
             prevent_initial_call=True,
         )
         def _hdr_meta(pid, _tick):
-            p = get_plan(pid) or {}
+            try:
+                pid_i = int(pid)
+            except Exception:
+                return "", "", "", ""
+
+            row = get_plan(pid_i) or {}
+            meta = get_plan_meta(pid_i) or {}
+
+            # Prefer plan meta; fall back to plan row fields
+            created_by = meta.get("created_by") or row.get("owner") or row.get("created_by") or ""
+            created_on = meta.get("created_on") or row.get("created_at") or ""
+            updated_by = (
+                meta.get("last_updated_by")
+                or meta.get("updated_by")
+                or row.get("updated_by")
+                or created_by
+                or ""
+            )
+            updated_on = meta.get("last_updated_on") or row.get("updated_at") or ""
+
             def fmt(ts):
                 try:
                     return pd.to_datetime(ts).strftime("%Y-%m-%d %H:%M UTC")
                 except Exception:
                     return ""
-            return (
-                p.get("created_by") or "",
-                fmt(p.get("created_at")),
-                p.get("updated_by") or p.get("created_by") or "",
-                fmt(p.get("updated_at")),
-            )
+
+            return created_by, fmt(created_on), updated_by, fmt(updated_on)
             
         @app.callback(
             Output("plan-msg", "children", allow_duplicate=True),
