@@ -687,10 +687,16 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             forecast_aht_sut = (f_num / f_den) if f_den > 0 else 0.0
             forecast_aht_sut = float(forecast_aht_sut) if pd.notna(forecast_aht_sut) else 0.0
             forecast_aht_sut = max(0.0, forecast_aht_sut)
+            # What-If: reflect AHT delta in FW row so user sees impact
+            try:
+                if _wf_active(w) and aht_delta:
+                    forecast_aht_sut = max(0.0, forecast_aht_sut * (1.0 + aht_delta / 100.0))
+            except Exception:
+                pass
             if "Forecast AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "Forecast AHT/SUT", w] = forecast_aht_sut
 
-            # Budgeted AHT/SUT (Voice planned)
+            # Budgeted AHT/SUT (Voice planned) – do not apply What-If AHT delta here
             bud_aht = planned_aht_w.get(w, s_budget_aht)
             if "Budgeted AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = bud_aht
@@ -1001,14 +1007,17 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     req_w_tactical = _daily_to_weekly(req_daily_tactical)
     req_w_budgeted = _daily_to_weekly(req_daily_budgeted)
 
-    # What-If: adjust forecast requirements by volume and shrink deltas
-    if vol_delta or shrink_delta:
+    # What-If: adjust forecast requirements by volume, AHT and shrink deltas
+    if vol_delta or shrink_delta or aht_delta:
         for w in list(req_w_forecast.keys()):
             if not _wf_active(w):
                 continue
             v = float(req_w_forecast[w])
             if vol_delta:
                 v *= (1.0 + vol_delta / 100.0)
+            if aht_delta:
+                # Approximate: FTE requirement scales ~linearly with AHT
+                v *= (1.0 + aht_delta / 100.0)
             if shrink_delta:
                 # Approximate impact: scale by 1/(1 - delta)
                 denom = max(0.1, 1.0 - (shrink_delta / 100.0))
@@ -1704,6 +1713,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                     ov_pct = min(100.0, max(0.0, ov_pct + shrink_delta))
 
                 planned_pct = float(saved_plan_pct_w.get(w, 100.0 * planned_shrink_fraction))
+                # What-If: also reflect shrink delta onto Planned Shrinkage % for display
+                try:
+                    if _wf_active(w) and shrink_delta:
+                        planned_pct = min(100.0, max(0.0, planned_pct + shrink_delta))
+                except Exception:
+                    pass
                 variance_pp = ov_pct - planned_pct
 
                 shr.loc[shr["metric"] == "OOO Shrink Hours (#)",       w] = ooo
@@ -1767,7 +1782,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     req_w_tactical = _daily_to_weekly(req_daily_tactical)
     req_w_budgeted = _daily_to_weekly(req_daily_budgeted)
 
-    # Write Overtime Hours (#) from shrinkage raw into FW (independent of shrinkage logic)
+    # Write Overtime Hours (#) from shrinkage raw into FW and merged FW (independent of shrinkage logic)
     if "Overtime Hours (#)" in fw_rows:
         for w in week_ids:
             val = _ot_w_raw.get(w, None)
@@ -1776,14 +1791,23 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 val = overtime_w.get(w, None)
             if val is not None:
                 fw.loc[fw["metric"] == "Overtime Hours (#)", w] = float(val)
+                # Also reflect in merged FW so the UI receives it
+                try:
+                    fw_to_use.loc[fw_to_use["metric"] == "Overtime Hours (#)", w] = float(val)
+                except Exception:
+                    pass
 
     # ---- BvA ----
+    # Align Weekly Budgeted FTE with the same calculation used for
+    # 'FTE Required @ Forecast Volume' to avoid discrepancies.
     for w in week_ids:
         if w not in bva.columns:
             bva[w] = pd.Series(np.nan, index=bva.index, dtype="float64")
         elif not pd.api.types.is_float_dtype(bva[w].dtype):
             bva[w] = pd.to_numeric(bva[w], errors="coerce").astype("float64")
-        bud = float(req_w_budgeted.get(w, 0.0))
+        # Use weekly forecast requirement for Budgeted FTE to match
+        # 'FTE Required @ Forecast Volume'.
+        bud = float(req_w_forecast.get(w, 0.0))
         act = float(req_w_actual.get(w,   0.0))
         bva.loc[bva["metric"] == "Budgeted FTE (#)", w] = bud
         bva.loc[bva["metric"] == "Actual FTE (#)",   w] = act
