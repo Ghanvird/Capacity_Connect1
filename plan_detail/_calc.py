@@ -2022,7 +2022,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 agents_eff += max(0.0, ot) / max(1.0, wd_voice * hpd)
 
             base_aht = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
-            aht = max(1.0, float(base_aht) * (1.0 + aht_delta / 100.0))  # What-If AHT ?
+            # What-If AHT applies to future-only when no explicit window set
+            aht = float(base_aht)
+            if _wf_active(w) and aht_delta:
+                aht = max(1.0, aht * (1.0 + aht_delta / 100.0))
+            else:
+                aht = max(1.0, aht)
             n = weekly_voice_intervals.get(w)
             intervals = int(n) if isinstance(n, (int, np.integer)) and n > 0 else intervals_per_week_default
             calls_per_ivl = _erlang_calls_capacity(agents_eff, aht, sl_seconds, ivl_sec, sl_target_pct)
@@ -2083,7 +2088,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             ivl_min_ob = int(float(settings.get("ob_interval_minutes", settings.get("interval_minutes", 30)) or 30))
             ivl_sec_ob = max(60, ivl_min_ob * 60)
             base_aht = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
-            aht = max(1.0, float(base_aht) * (1.0 + aht_delta / 100.0))
+            aht = float(base_aht)
+            if _wf_active(w) and aht_delta:
+                aht = max(1.0, aht * (1.0 + aht_delta / 100.0))
+            else:
+                aht = max(1.0, aht)
             items_per_ivl = _erlang_calls_capacity(agents_eff, aht, sl_seconds, ivl_sec_ob, sl_target_pct)
             # Coverage minutes per day -> intervals per week using bo_wd workdays
             hrs = float(settings.get("hours_per_fte", 8.0) or 8.0)
@@ -2114,7 +2123,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             ivl_min_ch = int(float(settings.get("chat_interval_minutes", settings.get("interval_minutes", 30)) or 30))
             ivl_sec_ch = max(60, ivl_min_ch * 60)
             base_aht = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
-            aht = max(1.0, (float(base_aht) / eff_conc) * (1.0 + aht_delta / 100.0))
+            aht = float(base_aht) / max(1e-6, eff_conc)
+            if _wf_active(w) and aht_delta:
+                aht = max(1.0, aht * (1.0 + aht_delta / 100.0))
+            else:
+                aht = max(1.0, aht)
             items_per_ivl = _erlang_calls_capacity(agents_eff, aht, sl_seconds, ivl_sec_ch, sl_target_pct)
             hrs = float(settings.get("hours_per_fte", 8.0) or 8.0)
             cov_min = int(float(settings.get("chat_coverage_minutes", hrs * 60.0) or (hrs * 60.0)))
@@ -2128,7 +2141,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         if ch_low == "voice":
             weekly_load = float(weekly_demand_voice.get(w, 0.0))
             base_aht_sut = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
-            aht_sut = max(1.0, float(base_aht_sut) * (1.0 + aht_delta / 100.0))  # apply What-If to SL too
+            aht_sut = float(base_aht_sut)
+            if _wf_active(w) and aht_delta:
+                aht_sut = max(1.0, aht_sut * (1.0 + aht_delta / 100.0))
+            else:
+                aht_sut = max(1.0, aht_sut)
             n = weekly_voice_intervals.get(w)
             intervals = int(n) if isinstance(n, (int, np.integer)) and n > 0 else intervals_per_week_default
             calls_per_ivl = weekly_load / float(max(1, intervals))
@@ -2166,7 +2183,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 ivl_per_week = int(round(bo_wd * bo_hpd / (ivl_sec / 3600.0)))
                 items_per_ivl = weekly_load / float(max(1, ivl_per_week))
                 base_sut = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
-                sut = max(1.0, float(base_sut) * (1.0 + aht_delta / 100.0))
+                sut = float(base_sut)
+                if _wf_active(w) and aht_delta:
+                    sut = max(1.0, sut * (1.0 + aht_delta / 100.0))
+                else:
+                    sut = max(1.0, sut)
                 lc = _learning_curve_for_week(settings, lc_ovr_df, w)
                 def eff(buckets, prod_pct_list, uplift_pct_list):
                     total = 0.0
