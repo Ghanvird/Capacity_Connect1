@@ -770,8 +770,8 @@ def register_plan_detail_core(app: dash.Dash):
             State("tbl-fw", "columns"),
             Input("plan-refresh-tick", "data"),
             State("plan-grain", "data"),
-            State("plan-whatif", "data"),            # <-- ADD
-            State("fw-backlog-carryover", "value"),  # backlog toggle
+            State("plan-whatif", "data"),            # what-if deltas
+            Input("fw-backlog-carryover", "value"),  # backlog toggle now triggers refresh
             prevent_initial_call=True,
         )
         def _fill_tables(ptype, pid, fw_cols, _tick, grain, whatif, backlog_toggle):
@@ -2401,9 +2401,10 @@ def register_plan_detail_core(app: dash.Dash):
             Output("opt-updated-on", "children", allow_duplicate=True),
             Input("plan-detail-id", "data"),
             Input("plan-refresh-tick", "data"),   # so it refreshes after saves/what-ifs
+            Input("plan-opt-canvas", "is_open"),   # refresh values when panel opens
             prevent_initial_call=True
         )
-        def _opt_meta(pid, _tick):
+        def _opt_meta(pid, _tick, _is_open):
             try:
                 pid = int(pid)
             except Exception:
@@ -2432,9 +2433,10 @@ def register_plan_detail_core(app: dash.Dash):
             Output("opt-updated-on", "children"),
             Input("plan-detail-id", "data"),
             Input("plan-refresh-tick", "data"),
+            Input("plan-opt-canvas", "is_open"),   # refresh values when panel opens
             prevent_initial_call=True,
         )
-        def _hdr_meta(pid, _tick):
+        def _hdr_meta(pid, _tick, _is_open):
             try:
                 pid_i = int(pid)
             except Exception:
