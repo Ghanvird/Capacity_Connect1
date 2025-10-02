@@ -30,15 +30,38 @@ def page_shrink_attr():
                         html.Div(dcc.Graph(id="fig-shrink", style={"height":"280px"}, config={"displayModeBar": False}), className="loading-block"),
                     ]),
 
+                    dbc.Tab(label="Voice Shrinkage (Raw)", tab_id="inner-voice", children=[
+                        dcc.Store(id="voice-shr-raw-store"),
+                        dbc.Row([
+                            dbc.Col(dcc.Upload(id="up-shr-voice-raw",
+                                               children=html.Div(["⬆️ Upload Voice Shrinkage (HH:MM) XLSX/CSV"]),
+                                               multiple=False, className="upload-box"), md=6),
+                            dbc.Col(dbc.Button("Save Voice Shrinkage", id="btn-save-shr-voice-raw", color="primary", className="w-100"), md=3),
+                            dbc.Col(dbc.Button("Download Alvaria Template", id="btn-dl-shr-voice-template", outline=True, color="secondary", className="w-100"), md=3),
+                        ], className="my-2"),
+                        dcc.Download(id="dl-shr-voice-template"),
+                        html.H6("Uploaded (normalized)"),
+                        html.Div(dash_table.DataTable(id="tbl-shr-voice-raw", page_size=8, style_table={"overflowX":"auto"},
+                                             style_as_list_view=True, style_header={"textTransform":"none"}), className="loading-block"),
+                        html.H6("Daily Summary (derived)"),
+                        html.Div(dash_table.DataTable(id="tbl-shr-voice-sum", page_size=8, style_table={"overflowX":"auto"},
+                                             style_as_list_view=True, style_header={"textTransform":"none"}), className="loading-block"),
+                        html.Div(html.Div(id="voice-shr-save-msg", className="text-success mt-2"), className="loading-block"),
+                    ]),
+
                     dbc.Tab(label="Back Office Shrinkage (Raw)", tab_id="inner-bo", children=[
                         dcc.Store(id="bo-shr-raw-store"),
                         dbc.Row([
                             dbc.Col(dcc.Upload(id="up-shr-bo-raw",
-                                               children=html.Div(["⬆️ Upload Back Office Shrinkage (seconds) XLSX/CSV"]),
+                                               children=html.Div(["⬆️ Upload Back Office Shrinkage (Voice HH:MM or BO seconds) XLSX/CSV"]),
                                                multiple=False, className="upload-box"), md=6),
                             dbc.Col(dbc.Button("Save Back Office Shrinkage", id="btn-save-shr-bo-raw", color="primary", className="w-100"), md=3),
-                            dbc.Col(dbc.Button("Download BO Template", id="btn-dl-shr-bo-template", outline=True, color="secondary", className="w-100"), md=3),
+                            dbc.Col(html.Div([
+                                dbc.Button("Download Alvaria Template", id="btn-dl-shr-bo-voice-template", outline=True, color="secondary", className="w-100"),
+                                dbc.Button("Download Control IQ Template", id="btn-dl-shr-bo-template", outline=True, color="secondary", className="w-100 mt-2"),
+                            ]), md=3),
                         ], className="my-2"),
+                        dcc.Download(id="dl-shr-bo-voice-template"),
                         dcc.Download(id="dl-shr-bo-template"),
                         html.H6("Uploaded (normalized)"),
                         html.Div(dash_table.DataTable(id="tbl-shr-bo-raw", page_size=8, style_table={"overflowX":"auto"},
@@ -49,23 +72,50 @@ def page_shrink_attr():
                         html.Div(html.Div(id="bo-shr-save-msg", className="text-success mt-2"), className="loading-block"),
                     ]),
 
-                    dbc.Tab(label="Voice Shrinkage (Raw)", tab_id="inner-voice", children=[
-                        dcc.Store(id="voice-shr-raw-store"),
+                    dbc.Tab(label="Chat Shrinkage (Raw)", tab_id="inner-chat", children=[
+                        dcc.Store(id="chat-shr-raw-store"),
                         dbc.Row([
-                            dbc.Col(dcc.Upload(id="up-shr-voice-raw",
-                                               children=html.Div(["⬆️ Upload Voice Shrinkage (HH:MM) XLSX/CSV"]),
+                            dbc.Col(dcc.Upload(id="up-shr-chat-raw",
+                                               children=html.Div(["⬆️ Upload Chat Shrinkage (Voice HH:MM or BO seconds) XLSX/CSV"]),
                                                multiple=False, className="upload-box"), md=6),
-                            dbc.Col(dbc.Button("Save Voice Shrinkage", id="btn-save-shr-voice-raw", color="primary", className="w-100"), md=3),
-                            dbc.Col(dbc.Button("Download Voice Template", id="btn-dl-shr-voice-template", outline=True, color="secondary", className="w-100"), md=3),
+                            dbc.Col(dbc.Button("Save Chat Shrinkage", id="btn-save-shr-chat-raw", color="primary", className="w-100"), md=3),
+                            dbc.Col(html.Div([
+                                dbc.Button("Download Alvaria Template", id="btn-dl-shr-chat-voice-template", outline=True, color="secondary", className="w-100"),
+                                dbc.Button("Download Control IQ Template", id="btn-dl-shr-chat-bo-template", outline=True, color="secondary", className="w-100 mt-2"),
+                            ]), md=3),
                         ], className="my-2"),
-                        dcc.Download(id="dl-shr-voice-template"),
+                        dcc.Download(id="dl-shr-chat-voice-template"),
+                        dcc.Download(id="dl-shr-chat-bo-template"),
                         html.H6("Uploaded (normalized)"),
-                        html.Div(dash_table.DataTable(id="tbl-shr-voice-raw", page_size=8, style_table={"overflowX":"auto"},
+                        html.Div(dash_table.DataTable(id="tbl-shr-chat-raw", page_size=8, style_table={"overflowX":"auto"},
                                              style_as_list_view=True, style_header={"textTransform":"none"}), className="loading-block"),
                         html.H6("Daily Summary (derived)"),
-                        html.Div(dash_table.DataTable(id="tbl-shr-voice-sum", page_size=8, style_table={"overflowX":"auto"},
+                        html.Div(dash_table.DataTable(id="tbl-shr-chat-sum", page_size=8, style_table={"overflowX":"auto"},
                                              style_as_list_view=True, style_header={"textTransform":"none"}), className="loading-block"),
-                        html.Div(html.Div(id="voice-shr-save-msg", className="text-success mt-2"), className="loading-block"),
+                        html.Div(html.Div(id="chat-shr-save-msg", className="text-success mt-2"), className="loading-block"),
+                    ]),
+
+                    dbc.Tab(label="Outbound Shrinkage (Raw)", tab_id="inner-ob", children=[
+                        dcc.Store(id="ob-shr-raw-store"),
+                        dbc.Row([
+                            dbc.Col(dcc.Upload(id="up-shr-ob-raw",
+                                               children=html.Div(["⬆️ Upload Outbound Shrinkage (Voice HH:MM or BO seconds) XLSX/CSV"]),
+                                               multiple=False, className="upload-box"), md=6),
+                            dbc.Col(dbc.Button("Save Outbound Shrinkage", id="btn-save-shr-ob-raw", color="primary", className="w-100"), md=3),
+                            dbc.Col(html.Div([
+                                dbc.Button("Download Alvaria Template", id="btn-dl-shr-ob-voice-template", outline=True, color="secondary", className="w-100"),
+                                dbc.Button("Download Control IQ Template", id="btn-dl-shr-ob-bo-template", outline=True, color="secondary", className="w-100 mt-2"),
+                            ]), md=3),
+                        ], className="my-2"),
+                        dcc.Download(id="dl-shr-ob-voice-template"),
+                        dcc.Download(id="dl-shr-ob-bo-template"),
+                        html.H6("Uploaded (normalized)"),
+                        html.Div(dash_table.DataTable(id="tbl-shr-ob-raw", page_size=8, style_table={"overflowX":"auto"},
+                                             style_as_list_view=True, style_header={"textTransform":"none"}), className="loading-block"),
+                        html.H6("Daily Summary (derived)"),
+                        html.Div(dash_table.DataTable(id="tbl-shr-ob-sum", page_size=8, style_table={"overflowX":"auto"},
+                                             style_as_list_view=True, style_header={"textTransform":"none"}), className="loading-block"),
+                        html.Div(html.Div(id="ob-shr-save-msg", className="text-success mt-2"), className="loading-block"),
                     ]),
                 ])
             ]),
@@ -93,6 +143,3 @@ def page_shrink_attr():
             ]),
         ])
     ], fluid=True), className="loading-page")
-
-
-
