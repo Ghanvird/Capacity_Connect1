@@ -1815,6 +1815,40 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 except Exception:
                     pass
 
+    # Compute Actual-shrinkage-adjusted weekly requirement just before upper table
+    req_w_actual_adj = dict(req_w_actual)
+    try:
+        def _to_frac(val):
+            try:
+                v = float(val)
+                return v/100.0 if v > 1.0 else v
+            except Exception:
+                try:
+                    s = str(val).strip().rstrip('%')
+                    v = float(s)
+                    return v/100.0 if v > 1.0 else v
+                except Exception:
+                    return None
+        act_row = None
+        plan_row = None
+        if isinstance(shr, pd.DataFrame) and not shr.empty and "metric" in shr.columns:
+            m = shr["metric"].astype(str).str.strip().str.lower()
+            if (m == "overall shrinkage %").any():
+                act_row = shr.loc[m == "overall shrinkage %"].iloc[0].to_dict()
+            if (m == "planned shrinkage %").any():
+                plan_row = shr.loc[m == "planned shrinkage %"].iloc[0].to_dict()
+        for w in week_ids:
+            if w not in req_w_actual_adj:
+                continue
+            s_act = _to_frac(act_row.get(w)) if isinstance(act_row, dict) and (w in act_row) else None
+            if s_act is None:
+                continue
+            denom_new = max(0.01, 1.0 - float(s_act or 0.0))
+            # Use the unadjusted actual requirement as baseline and scale only by Actual shrink
+            req_w_actual_adj[w] = float(req_w_actual.get(w, 0.0)) / denom_new
+    except Exception:
+        pass
+
     # ---- BvA ----
     # Align Weekly Budgeted FTE with the same calculation used for
     # 'FTE Required @ Forecast Volume' to avoid discrepancies.
@@ -2072,12 +2106,14 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             if bo_model == "tat":
                 shr_add = (shrink_delta / 100.0) if (_wf_active(w) and shrink_delta) else 0.0
                 eff_shr = min(0.99, max(0.0, bo_shr_base + shr_add))
-                base_prod_hours = bo_wd * bo_hpd * (1.0 - eff_shr) * util_bo
+                # Refactor for clarity: total productive hours = (regular+OT hours) * (1 - shrink) * util
+                base_hours = bo_wd * bo_hpd
                 try:
                     ot = float(overtime_w.get(w, 0.0) or 0.0)
                 except Exception:
                     ot = 0.0
-                total_prod_hours = (float(agents_eff) * base_prod_hours) + (max(0.0, ot) * (1.0 - eff_shr) * util_bo)
+                total_hours = (float(agents_eff) * base_hours) + max(0.0, ot)
+                total_prod_hours = total_hours * (1.0 - eff_shr) * util_bo
                 handling_capacity[w] = total_prod_hours * (3600.0 / sut)
             else:
                 ivl_per_week = int(round(bo_wd * bo_hpd / (ivl_sec / 3600.0)))
@@ -2285,40 +2321,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                     if weekly_load>0: break
             cap = float(handling_capacity.get(w, 0.0))
             proj_sl[w] = 0.0 if weekly_load <= 0 else min(100.0, 100.0 * cap / weekly_load)
-
-    # Compute Actual-shrinkage-adjusted weekly requirement just before upper table
-    req_w_actual_adj = dict(req_w_actual)
-    try:
-        def _to_frac(val):
-            try:
-                v = float(val)
-                return v/100.0 if v > 1.0 else v
-            except Exception:
-                try:
-                    s = str(val).strip().rstrip('%')
-                    v = float(s)
-                    return v/100.0 if v > 1.0 else v
-                except Exception:
-                    return None
-        act_row = None
-        plan_row = None
-        if isinstance(shr, pd.DataFrame) and not shr.empty and "metric" in shr.columns:
-            m = shr["metric"].astype(str).str.strip().str.lower()
-            if (m == "overall shrinkage %").any():
-                act_row = shr.loc[m == "overall shrinkage %"].iloc[0].to_dict()
-            if (m == "planned shrinkage %").any():
-                plan_row = shr.loc[m == "planned shrinkage %"].iloc[0].to_dict()
-        for w in week_ids:
-            if w not in req_w_actual_adj:
-                continue
-            s_act = _to_frac(act_row.get(w)) if isinstance(act_row, dict) and (w in act_row) else None
-            if s_act is None:
-                continue
-            denom_new = max(0.01, 1.0 - float(s_act or 0.0))
-            # Use the unadjusted actual requirement as baseline and scale only by Actual shrink
-            req_w_actual_adj[w] = float(req_w_actual.get(w, 0.0)) / denom_new
-    except Exception:
-        pass
 
     # ---- Upper summary table ----
     upper_df = _blank_grid(spec["upper"], week_ids)
