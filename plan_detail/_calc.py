@@ -1871,6 +1871,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         # 'FTE Required @ Forecast Volume'.
         bud = float(req_w_forecast.get(w, 0.0))
         act = float(req_w_actual.get(w,   0.0))
+        act = act/(1 - ov_pct)
         bva.loc[bva["metric"] == "Budgeted FTE (#)", w] = bud
         bva.loc[bva["metric"] == "Actual FTE (#)",   w] = act
         bva.loc[bva["metric"] == "Variance (#)",     w] = act - bud
@@ -2329,6 +2330,42 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             cap = float(handling_capacity.get(w, 0.0))
             proj_sl[w] = 0.0 if weekly_load <= 0 else min(100.0, 100.0 * cap / weekly_load)
 
+    # Compute Actual-shrinkage-adjusted weekly requirement just before upper table
+    req_w_actual_adj = dict(req_w_actual)
+    try:
+        def _to_frac(val):
+            try:
+                v = float(val)
+                return v/100.0 if v > 1.0 else v
+            except Exception:
+                try:
+                    s = str(val).strip().rstrip('%')
+                    v = float(s)
+                    return v/100.0 if v > 1.0 else v
+                except Exception:
+                    return None
+        act_row = None
+        plan_row = None
+        if isinstance(shr, pd.DataFrame) and not shr.empty and "metric" in shr.columns:
+            m = shr["metric"].astype(str).str.strip().str.lower()
+            if (m == "overall shrinkage %").any():
+                act_row = shr.loc[m == "overall shrinkage %"].iloc[0].to_dict()
+            if (m == "planned shrinkage %").any():
+                plan_row = shr.loc[m == "planned shrinkage %"].iloc[0].to_dict()
+        base_planned_default = 0.0
+        for w in week_ids:
+            if w not in req_w_actual_adj:
+                continue
+            s_act = _to_frac(act_row.get(w)) if isinstance(act_row, dict) and (w in act_row) else None
+            if s_act is None:
+                continue
+            s_pl = _to_frac(plan_row.get(w)) if isinstance(plan_row, dict) and (w in plan_row) else base_planned_default
+            denom_old = max(0.01, 1.0 - float(s_pl or 0.0))
+            denom_new = max(0.01, 1.0 - float(s_act or 0.0))
+            req_w_actual_adj[w] = float(req_w_actual_adj.get(w, 0.0)) * (denom_old / denom_new)
+    except Exception:
+        pass
+
     # ---- Upper summary table ----
     upper_df = _blank_grid(spec["upper"], week_ids)
     if "FTE Required @ Forecast Volume" in spec["upper"]:
@@ -2347,16 +2384,16 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             upper_df.loc[upper_df["metric"] == "FTE Required @ Queue", w] = reqq
     if "FTE Required @ Actual Volume" in spec["upper"]:
         for w in week_ids:
-            upper_df.loc[upper_df["metric"] == "FTE Required @ Actual Volume", w] = float(req_w_actual.get(w, 0.0))
+            upper_df.loc[upper_df["metric"] == "FTE Required @ Actual Volume", w] = float(req_w_actual_adj.get(w, 0.0))
     if "FTE Over/Under MTP Vs Actual" in spec["upper"]:
         for w in week_ids:
-            upper_df.loc[upper_df["metric"] == "FTE Over/Under MTP Vs Actual", w] = float(req_w_forecast.get(w, 0.0)) - float(req_w_actual.get(w, 0.0))
+            upper_df.loc[upper_df["metric"] == "FTE Over/Under MTP Vs Actual", w] = float(req_w_forecast.get(w, 0.0)) - float(req_w_actual_adj.get(w, 0.0))
     if "FTE Over/Under Tactical Vs Actual" in spec["upper"]:
         for w in week_ids:
-            upper_df.loc[upper_df["metric"] == "FTE Over/Under Tactical Vs Actual", w] = float(req_w_tactical.get(w, 0.0)) - float(req_w_actual.get(w, 0.0))
+            upper_df.loc[upper_df["metric"] == "FTE Over/Under Tactical Vs Actual", w] = float(req_w_tactical.get(w, 0.0)) - float(req_w_actual_adj.get(w, 0.0))
     if "FTE Over/Under Budgeted Vs Actual" in spec["upper"]:
         for w in week_ids:
-            upper_df.loc[upper_df["metric"] == "FTE Over/Under Budgeted Vs Actual", w] = float(req_w_budgeted.get(w, 0.0)) - float(req_w_actual.get(w, 0.0))
+            upper_df.loc[upper_df["metric"] == "FTE Over/Under Budgeted Vs Actual", w] = float(req_w_budgeted.get(w, 0.0)) - float(req_w_actual_adj.get(w, 0.0))
     if "Projected Supply HC" in spec["upper"]:
         for w in week_ids:
             upper_df.loc[upper_df["metric"] == "Projected Supply HC", w] = projected_supply.get(w, 0.0)
