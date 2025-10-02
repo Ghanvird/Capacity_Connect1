@@ -653,6 +653,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             except Exception:
                 pass
         forecast_aht_sut = (f_num / f_den) if f_den > 0 else s_target_aht
+        # What-If: reflect AHT delta in FW row so user sees impact
+        try:
+            if _wf_active_month(m) and aht_delta:
+                forecast_aht_sut = max(1.0, float(forecast_aht_sut) * (1.0 + aht_delta / 100.0))
+        except Exception:
+            pass
         if "Forecast AHT/SUT" in fw_rows:
             fw.loc[fw["metric"] == "Forecast AHT/SUT", m] = forecast_aht_sut
 
@@ -987,12 +993,15 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     req_m_forecast = _daily_to_monthly(req_daily_forecast, is_bo=is_bo_ch)
     req_m_tactical = _daily_to_monthly(req_daily_tactical, is_bo=is_bo_ch)
     req_m_budgeted = _daily_to_monthly(req_daily_budgeted, is_bo=is_bo_ch)
-    # What-If: adjust forecast requirements by volume and shrink deltas
-    if vol_delta or shrink_delta:
+    # What-If: adjust forecast requirements by volume, AHT and shrink deltas
+    if vol_delta or shrink_delta or aht_delta:
         for mid in list(req_m_forecast.keys()):
             v = float(req_m_forecast[mid])
             if vol_delta:
                 v *= (1.0 + vol_delta / 100.0)
+            if aht_delta:
+                # Approximate: FTE requirement scales ~linearly with AHT/SUT
+                v *= (1.0 + aht_delta / 100.0)
             if shrink_delta:
                 denom = max(0.1, 1.0 - (shrink_delta / 100.0))
                 v /= denom
@@ -1822,6 +1831,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         if _wf_active_month(m) and shrink_delta:
             ov_pct = min(100.0, max(0.0, ov_pct + shrink_delta))
         planned_pct = float(saved_plan_pct.get(m, 100.0 * planned_shrink_fraction))
+        # What-If: reflect shrink delta onto Planned Shrinkage % for display
+        try:
+            if _wf_active_month(m) and shrink_delta:
+                planned_pct = min(100.0, max(0.0, planned_pct + shrink_delta))
+        except Exception:
+            pass
         variance_pp = ov_pct - planned_pct
         shr.loc[shr["metric"] == "OOO Shrink Hours (#)",       m] = ooo
         shr.loc[shr["metric"] == "In-Office Shrink Hours (#)", m] = ino
@@ -2286,6 +2301,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         for mm in month_ids:
             vol = float(bF_itm.get(mm, 0.0))
             sut = float(bF_sut.get(mm, s_target_sut))
+            # What-If: apply AHT/SUT delta to requirement calc as well
+            try:
+                if _wf_active_month(mm) and aht_delta:
+                    sut = max(1.0, sut * (1.0 + aht_delta / 100.0))
+            except Exception:
+                pass
             sh_pct = float(shr_planned_pct_m.get(mm, np.nan))
             sh_frac = (sh_pct/100.0) if (not pd.isna(sh_pct)) else float(planned_shrink_fraction)
             denom = max(1e-6, monthly_hours * float(util_bo) * max(0.01, 1.0 - sh_frac))
@@ -2310,6 +2331,11 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             vol = float(bA_itm.get(mm, 0.0))
             # Prefer actual SUT; fallback to forecast/target
             sut = float(bA_sut.get(mm, bF_sut.get(mm, s_target_sut)))
+            try:
+                if _wf_active_month(mm) and aht_delta:
+                    sut = max(1.0, sut * (1.0 + aht_delta / 100.0))
+            except Exception:
+                pass
             # By default use planned shrink to match provided examples; switch to 'shr_actual_pct_m' if desired
             sh_pct = float(shr_actual_pct_m.get(mm, np.nan))
             sh_frac = (sh_pct/100.0) if (not pd.isna(sh_pct)) else float(planned_shrink_fraction)
