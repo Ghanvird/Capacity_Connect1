@@ -2252,14 +2252,19 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     proj_sl = {}
     for m in month_ids:
         if ch_first.lower() == "voice":
-            if "Forecast" in fw_rows:
-                try:
-                    ser = pd.to_numeric(fw.loc[fw["metric"] == "Forecast", m], errors="coerce")
-                    monthly_load = float(ser.iloc[0]) if not ser.empty and pd.notna(ser.iloc[0]) else 0.0
-                except Exception:
-                    monthly_load = float(vF_vol.get(m, 0.0))
+            # Prefer Actual > Forecast > Tactical for demand
+            try:
+                av = float(vA_vol.get(m, 0.0) or 0.0)
+            except Exception:
+                av = 0.0
+            if av > 0:
+                monthly_load = av
             else:
-                monthly_load = float(vF_vol.get(m, 0.0))
+                fv = float(vF_vol.get(m, 0.0) or 0.0)
+                if fv > 0:
+                    monthly_load = fv
+                else:
+                    monthly_load = float(vT_vol.get(m, 0.0) or 0.0)
             aht_sut = (vA_aht.get(m) if not np.isnan(vA_aht.get(m, np.nan)) else vF_aht.get(m, s_target_aht))
             try:
                 if _wf_active_month(m) and aht_delta:
@@ -2292,10 +2297,19 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
             proj_sl[m] = 100.0 * sl_frac
         else:
-            monthly_load = (
-                _get_fw_value(fw, "Forecast", m, 0.0)
-                if "Forecast" in fw_rows else float(bF_itm.get(m, 0.0) or 0.0)
-            )
+            # Back Office and others: Actual > Forecast > Tactical items
+            try:
+                ab = float(bA_itm.get(m, 0.0) or 0.0)
+            except Exception:
+                ab = 0.0
+            if ab > 0:
+                monthly_load = ab
+            else:
+                fb = float(bF_itm.get(m, 0.0) or 0.0)
+                if fb > 0:
+                    monthly_load = fb
+                else:
+                    monthly_load = float(bT_itm.get(m, 0.0) or 0.0)
             cap = float(handling_capacity.get(m, 0.0))
             proj_sl[m] = 0.0 if monthly_load <= 0 else min(100.0, 100.0 * cap / monthly_load)
 
