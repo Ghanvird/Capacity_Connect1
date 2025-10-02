@@ -592,8 +592,8 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             f_voice *= (1.0 + vol_delta / 100.0)
             f_bo    *= (1.0 + vol_delta / 100.0)
 
-        weekly_demand_voice[w] = f_voice if f_voice > 0 else (a_voice if a_voice > 0 else t_voice)
-        weekly_demand_bo[w]    = f_bo    if f_bo    > 0 else (a_bo    if a_bo    > 0 else t_bo)
+        weekly_demand_voice[w] = a_voice if a_voice > 0 else (f_voice if f_voice > 0 else t_voice)
+        weekly_demand_bo[w]    = a_bo    if a_bo    > 0 else (f_bo    if f_bo    > 0 else t_bo)
 
         if "Forecast" in fw_rows:
             fw.loc[fw["metric"] == "Forecast", w] = f_voice + f_bo
@@ -2084,9 +2084,9 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             base_sut = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
             sut = float(base_sut)
             if _wf_active(w) and aht_delta:
-                sut = max(1.0, sut * (1.0 + aht_delta / 100.0))
+                sut = max(0.0, sut * (1.0 + aht_delta / 100.0))
             else:
-                sut = max(1.0, sut)
+                sut = max(0.0, sut)
 
             lc = _learning_curve_for_week(settings, lc_ovr_df, w)
             def eff(buckets, prod_pct_list, uplift_pct_list):
@@ -2239,9 +2239,9 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 base_sut = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
                 sut = float(base_sut)
                 if _wf_active(w) and aht_delta:
-                    sut = max(1.0, sut * (1.0 + aht_delta / 100.0))
+                    sut = max(0.0, sut * (1.0 + aht_delta / 100.0))
                 else:
-                    sut = max(1.0, sut)
+                    sut = max(0.0, sut)
                 lc = _learning_curve_for_week(settings, lc_ovr_df, w)
                 def eff(buckets, prod_pct_list, uplift_pct_list):
                     total = 0.0
