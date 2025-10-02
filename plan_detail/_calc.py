@@ -319,11 +319,16 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     _nest_ahtm_w  = dict((whatif.get("nesting_aht_multiplier") or {}))
 
     # helper: active window
+    # Default behavior: if no explicit start/end window is set, treat only future weeks as active
+    _today_w_default = _monday(dt.date.today()).isoformat()
     def _wf_active(w):
+        w = str(w)
         if not wf_start and not wf_end:
-            return True
-        if wf_start and w < wf_start: return False
-        if wf_end   and w > wf_end:   return False
+            return w > _today_w_default
+        if wf_start and w < str(wf_start):
+            return False
+        if wf_end and w > str(wf_end):
+            return False
         return True
 
     # helpers for per-week nest overrides
@@ -1504,7 +1509,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             monday = ds.dt.normalize() - pd.to_timedelta(ds.dt.weekday, unit="D")
             return monday.dt.date.astype(str)
         else:
-            ds = pd.DatatimeIndex(ds)
+            ds = pd.DatetimeIndex(ds)
             monday = idx.normalize() - pd.to_timedelta(ds.weekday, unit="D")
             return pd.Index(monday.date.astype(str))
 
