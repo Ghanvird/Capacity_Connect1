@@ -1042,50 +1042,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 v /= denom
             req_w_forecast[w] = v
 
-    # Align Actual requirement to Actual Shrinkage (weekly). We scale the
-    # weekly actual requirement by replacing any planned/base shrinkage with the
-    # observed Overall Shrinkage % from the Shrink table.
-    try:
-        def _to_frac(val):
-            try:
-                v = float(val)
-                return v/100.0 if v > 1.0 else v
-            except Exception:
-                try:
-                    s = str(val).strip().rstrip('%')
-                    v = float(s)
-                    return v/100.0 if v > 1.0 else v
-                except Exception:
-                    return None
-
-        act_row = None
-        plan_row = None
-        if isinstance(shr, pd.DataFrame) and not shr.empty and "metric" in shr.columns:
-            m = shr["metric"].astype(str).str.strip().str.lower()
-            if (m == "overall shrinkage %").any():
-                act_row = shr.loc[m == "overall shrinkage %"].iloc[0].to_dict()
-            if (m == "planned shrinkage %").any():
-                plan_row = shr.loc[m == "planned shrinkage %"].iloc[0].to_dict()
-
-        # If no planned value captured in the weekly shrink table, assume 0 planned shrink
-        # to reflect earlier behavior where Actual requirement may have ignored shrink.
-        base_planned_default = 0.0
-        for w in week_ids:
-            if w not in req_w_actual:
-                continue
-            s_act = _to_frac(act_row.get(w)) if isinstance(act_row, dict) and (w in act_row) else None
-            if s_act is None:
-                continue  # no actual shrinkage for this week
-            s_pl = _to_frac(plan_row.get(w)) if isinstance(plan_row, dict) and (w in plan_row) else base_planned_default
-            try:
-                denom_old = max(0.01, 1.0 - float(s_pl or 0.0))
-                denom_new = max(0.01, 1.0 - float(s_act or 0.0))
-                req_w_actual[w] = float(req_w_actual.get(w, 0.0)) * (denom_old / denom_new)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
     # ---- Interval supply from global roster_long (if available) ----
     schedule_supply_avg = {}
     try:
@@ -2352,17 +2308,15 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 act_row = shr.loc[m == "overall shrinkage %"].iloc[0].to_dict()
             if (m == "planned shrinkage %").any():
                 plan_row = shr.loc[m == "planned shrinkage %"].iloc[0].to_dict()
-        base_planned_default = 0.0
         for w in week_ids:
             if w not in req_w_actual_adj:
                 continue
             s_act = _to_frac(act_row.get(w)) if isinstance(act_row, dict) and (w in act_row) else None
             if s_act is None:
                 continue
-            s_pl = _to_frac(plan_row.get(w)) if isinstance(plan_row, dict) and (w in plan_row) else base_planned_default
-            denom_old = max(0.01, 1.0 - float(s_pl or 0.0))
             denom_new = max(0.01, 1.0 - float(s_act or 0.0))
-            req_w_actual_adj[w] = float(req_w_actual_adj.get(w, 0.0)) * (denom_old / denom_new)
+            # Use the unadjusted actual requirement as baseline and scale only by Actual shrink
+            req_w_actual_adj[w] = float(req_w_actual.get(w, 0.0)) / denom_new
     except Exception:
         pass
 
