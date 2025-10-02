@@ -24,9 +24,13 @@ from cap_db import load_df as _load_df_ds, save_df as _save_df_ds
     Input("up-attr", "contents"),
     Input("up-shr-bo-raw", "contents"),
     Input("up-shr-voice-raw", "contents"),
+    Input("up-shr-chat-raw", "contents"),
+    Input("up-shr-ob-raw", "contents"),
     Input("btn-save-attr", "n_clicks"),
     Input("btn-save-shr-bo-raw", "n_clicks"),
     Input("btn-save-shr-voice-raw", "n_clicks"),
+    Input("btn-save-shr-chat-raw", "n_clicks"),
+    Input("btn-save-shr-ob-raw", "n_clicks"),
     prevent_initial_call=True,
 )
 def _shrink_show_loader(*_):
@@ -49,6 +53,10 @@ def _shrink_show_loader(*_):
     Input("bo-shr-save-msg", "children"),
     Input("tbl-shr-voice-raw", "data"),
     Input("voice-shr-save-msg", "children"),
+    Input("tbl-shr-chat-raw", "data"),
+    Input("chat-shr-save-msg", "children"),
+    Input("tbl-shr-ob-raw", "data"),
+    Input("ob-shr-save-msg", "children"),
     prevent_initial_call=True,
 )
 def _shrink_hide_loader(*_):
@@ -413,6 +421,32 @@ def dl_shr_bo_tmpl(_n):
 def dl_shr_voice_tmpl(_n):
     return dcc.send_data_frame(shrinkage_voice_raw_template_df().to_csv, "shrinkage_voice_raw_template.csv", index=False)
 
+@app.callback(Output("dl-shr-bo-voice-template","data"),
+          Input("btn-dl-shr-bo-voice-template","n_clicks"), prevent_initial_call=True)
+def dl_shr_bo_voice_tmpl(_n):
+    return dcc.send_data_frame(shrinkage_voice_raw_template_df().to_csv, "shrinkage_voice_raw_template.csv", index=False)
+
+# Extra template downloads for Chat/Outbound tabs (reuse same templates)
+@app.callback(Output("dl-shr-chat-voice-template","data"),
+          Input("btn-dl-shr-chat-voice-template","n_clicks"), prevent_initial_call=True)
+def dl_shr_chat_voice_tmpl(_n):
+    return dcc.send_data_frame(shrinkage_voice_raw_template_df().to_csv, "shrinkage_voice_raw_template.csv", index=False)
+
+@app.callback(Output("dl-shr-chat-bo-template","data"),
+          Input("btn-dl-shr-chat-bo-template","n_clicks"), prevent_initial_call=True)
+def dl_shr_chat_bo_tmpl(_n):
+    return dcc.send_data_frame(shrinkage_bo_raw_template_df().to_csv, "shrinkage_backoffice_raw_template.csv", index=False)
+
+@app.callback(Output("dl-shr-ob-voice-template","data"),
+          Input("btn-dl-shr-ob-voice-template","n_clicks"), prevent_initial_call=True)
+def dl_shr_ob_voice_tmpl(_n):
+    return dcc.send_data_frame(shrinkage_voice_raw_template_df().to_csv, "shrinkage_voice_raw_template.csv", index=False)
+
+@app.callback(Output("dl-shr-ob-bo-template","data"),
+          Input("btn-dl-shr-ob-bo-template","n_clicks"), prevent_initial_call=True)
+def dl_shr_ob_bo_tmpl(_n):
+    return dcc.send_data_frame(shrinkage_bo_raw_template_df().to_csv, "shrinkage_backoffice_raw_template.csv", index=False)
+
 # === Shrinkage RAW: Upload/preview/summary (Back Office) ===
 
 @app.callback(
@@ -523,26 +557,161 @@ def up_shr_voice(contents, filename):
         dff.to_dict("records")
     )
 
+# === Shrinkage RAW: Upload/preview/summary (Chat) ===
+@app.callback(
+    Output("tbl-shr-chat-raw","data"),
+    Output("tbl-shr-chat-raw","columns"),
+    Output("tbl-shr-chat-sum","data"),
+    Output("tbl-shr-chat-sum","columns"),
+    Output("chat-shr-raw-store","data"),
+    Input("up-shr-chat-raw","contents"),
+    State("up-shr-chat-raw","filename"),
+    prevent_initial_call=True
+)
+def up_shr_chat(contents, filename):
+    df = parse_upload(contents, filename)
+    try:
+        is_voice = is_voice_shrinkage_like(df)
+    except Exception:
+        is_voice = False
+    if is_voice:
+        dff = normalize_shrinkage_voice(df)
+        if not dff.empty:
+            if "Channel" in dff.columns:
+                dff["Channel"] = dff["Channel"].replace("", np.nan).fillna("Chat")
+            else:
+                dff["Channel"] = "Chat"
+        summ = summarize_shrinkage_voice(dff)
+    else:
+        dff = normalize_shrinkage_bo(df)
+        if not dff.empty:
+            if "channel" in dff.columns:
+                dff["channel"] = dff["channel"].replace("", np.nan).fillna("Chat")
+            else:
+                dff["channel"] = "Chat"
+        summ = summarize_shrinkage_bo(dff)
+    if dff.empty:
+        return [], [], [], [], None
+    return (
+        dff.to_dict("records"), lock_variance_cols(shrink_daily_columns(dff)),
+        summ.to_dict("records"), lock_variance_cols(shrink_daily_columns(summ)),
+        dff.to_dict("records")
+    )
+
+@app.callback(
+    Output("chat-shr-save-msg","children", allow_duplicate=True),
+    Output("shr-msg-timer","disabled", allow_duplicate=True),
+    Input("btn-save-shr-chat-raw","n_clicks"),
+    State("chat-shr-raw-store","data"),
+    prevent_initial_call=True
+)
+def save_shr_chat(_n, store):
+    dff = pd.DataFrame(store or [])
+    if dff.empty:
+        return "Nothing to save.", False
+    _save_df_ds("shrinkage_raw_chat", dff)
+    if "superstate" in dff.columns:
+        daily = summarize_shrinkage_voice(dff)
+        weekly = weekly_shrinkage_from_voice_summary(daily)
+    else:
+        daily = summarize_shrinkage_bo(dff)
+        weekly = weekly_shrinkage_from_bo_summary(daily)
+    combined = _merge_shrink_weekly(load_shrinkage(), weekly)
+    save_shrinkage(combined)
+    details = [f"raw rows: {len(dff)}"]
+    if isinstance(weekly, pd.DataFrame) and not weekly.empty:
+        details.append(f"weekly points: {len(weekly)}")
+    return f"Saved Chat shrinkage ({', '.join(details)})", False
+
+# === Shrinkage RAW: Upload/preview/summary (Outbound) ===
+@app.callback(
+    Output("tbl-shr-ob-raw","data"),
+    Output("tbl-shr-ob-raw","columns"),
+    Output("tbl-shr-ob-sum","data"),
+    Output("tbl-shr-ob-sum","columns"),
+    Output("ob-shr-raw-store","data"),
+    Input("up-shr-ob-raw","contents"),
+    State("up-shr-ob-raw","filename"),
+    prevent_initial_call=True
+)
+def up_shr_ob(contents, filename):
+    df = parse_upload(contents, filename)
+    try:
+        is_voice = is_voice_shrinkage_like(df)
+    except Exception:
+        is_voice = False
+    if is_voice:
+        dff = normalize_shrinkage_voice(df)
+        if not dff.empty:
+            if "Channel" in dff.columns:
+                dff["Channel"] = dff["Channel"].replace("", np.nan).fillna("Outbound")
+            else:
+                dff["Channel"] = "Outbound"
+        summ = summarize_shrinkage_voice(dff)
+    else:
+        dff = normalize_shrinkage_bo(df)
+        if not dff.empty:
+            if "channel" in dff.columns:
+                dff["channel"] = dff["channel"].replace("", np.nan).fillna("Outbound")
+            else:
+                dff["channel"] = "Outbound"
+        summ = summarize_shrinkage_bo(dff)
+    if dff.empty:
+        return [], [], [], [], None
+    return (
+        dff.to_dict("records"), lock_variance_cols(shrink_daily_columns(dff)),
+        summ.to_dict("records"), lock_variance_cols(shrink_daily_columns(summ)),
+        dff.to_dict("records")
+    )
+
+@app.callback(
+    Output("ob-shr-save-msg","children", allow_duplicate=True),
+    Output("shr-msg-timer","disabled", allow_duplicate=True),
+    Input("btn-save-shr-ob-raw","n_clicks"),
+    State("ob-shr-raw-store","data"),
+    prevent_initial_call=True
+)
+def save_shr_ob(_n, store):
+    dff = pd.DataFrame(store or [])
+    if dff.empty:
+        return "Nothing to save.", False
+    _save_df_ds("shrinkage_raw_outbound", dff)
+    if "superstate" in dff.columns:
+        daily = summarize_shrinkage_voice(dff)
+        weekly = weekly_shrinkage_from_voice_summary(daily)
+    else:
+        daily = summarize_shrinkage_bo(dff)
+        weekly = weekly_shrinkage_from_bo_summary(daily)
+    combined = _merge_shrink_weekly(load_shrinkage(), weekly)
+    save_shrinkage(combined)
+    details = [f"raw rows: {len(dff)}"]
+    if isinstance(weekly, pd.DataFrame) and not weekly.empty:
+        details.append(f"weekly points: {len(weekly)}")
+    return f"Saved Outbound shrinkage ({', '.join(details)})", False
+
 # --- Auto-dismiss shrink page messages ---
 @app.callback(
     Output("shr-msg-timer", "disabled", allow_duplicate=True),
     Input("bo-shr-save-msg", "children"),
     Input("voice-shr-save-msg", "children"),
+    Input("chat-shr-save-msg", "children"),
+    Input("ob-shr-save-msg", "children"),
     Input("attr-save-msg", "children"),
     prevent_initial_call=True
 )
-def _arm_shrink_timer(m1, m2, m3):
-    msg = "".join([str(m or "") for m in (m1, m2, m3)]).strip()
+def _arm_shrink_timer(m1, m2, m3, m4, m5):
+    msg = "".join([str(m or "") for m in (m1, m2, m3, m4, m5)]).strip()
     return False if msg else dash.no_update
 
 @app.callback(
     Output("bo-shr-save-msg", "children", allow_duplicate=True),
     Output("voice-shr-save-msg", "children", allow_duplicate=True),
+    Output("chat-shr-save-msg", "children", allow_duplicate=True),
+    Output("ob-shr-save-msg", "children", allow_duplicate=True),
     Output("attr-save-msg", "children", allow_duplicate=True),
     Output("shr-msg-timer", "disabled", allow_duplicate=True),
     Input("shr-msg-timer", "n_intervals"),
     prevent_initial_call=True
 )
 def _clear_shrink_msgs(_n):
-    return "", "", "", True
-
+    return "", "", "", "", "", True
