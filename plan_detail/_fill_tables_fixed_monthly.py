@@ -998,8 +998,11 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     req_m_tactical = _daily_to_monthly(req_daily_tactical, is_bo=is_bo_ch)
     req_m_budgeted = _daily_to_monthly(req_daily_budgeted, is_bo=is_bo_ch)
     # What-If: adjust forecast requirements by volume, AHT and shrink deltas
+    # Apply to future months only when no explicit window is set
     if vol_delta or shrink_delta or aht_delta:
         for mid in list(req_m_forecast.keys()):
+            if not _wf_active_month(mid):
+                continue
             v = float(req_m_forecast[mid])
             if vol_delta:
                 v *= (1.0 + vol_delta / 100.0)
@@ -2185,7 +2188,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 aht = 0.0
             else:
                 aht = float(_a) if (not pd.isna(_a) and _a > 0) else float(_f)
-                aht = max(1.0, aht * (1.0 + aht_delta / 100.0))
+                if _wf_active_month(m) and aht_delta:
+                    aht = max(1.0, aht * (1.0 + aht_delta / 100.0))
+                else:
+                    aht = max(1.0, aht)
             intervals = monthly_voice_intervals.get(m, 0)
             if agents_eff <= 0.0 or intervals <= 0:
                 handling_capacity[m] = 0.0
@@ -2201,7 +2207,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 sut = 0.0
             else:
                 sut = float(_sa) if (not pd.isna(_sa) and _sa > 0) else float(_sf)
-                sut = max(1.0, sut * (1.0 + aht_delta / 100.0))
+                if _wf_active_month(m) and aht_delta:
+                    sut = max(1.0, sut * (1.0 + aht_delta / 100.0))
+                else:
+                    sut = max(1.0, sut)
             lc = _learning_curve_for_month(settings, lc_ovr_df, m)
 
             def eff(buckets, prod_pct_list, uplift_pct_list):
@@ -2252,7 +2261,13 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             else:
                 monthly_load = float(vF_vol.get(m, 0.0))
             aht_sut = (vA_aht.get(m) if not np.isnan(vA_aht.get(m, np.nan)) else vF_aht.get(m, s_target_aht))
-            aht_sut = max(1.0, float(aht_sut) * (1.0 + aht_delta / 100.0))
+            try:
+                if _wf_active_month(m) and aht_delta:
+                    aht_sut = max(1.0, float(aht_sut) * (1.0 + aht_delta / 100.0))
+                else:
+                    aht_sut = max(1.0, float(aht_sut))
+            except Exception:
+                aht_sut = max(1.0, float(aht_sut))
             intervals = monthly_voice_intervals.get(m, 1)
             calls_per_ivl = monthly_load / float(max(1, intervals))
             lc = _learning_curve_for_month(settings, lc_ovr_df, m)
