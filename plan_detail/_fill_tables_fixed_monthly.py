@@ -177,8 +177,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     # helper: use the persisted window as an ?active future? flag using month ids too
 
     def _wf_active_month(m):
-        # treat wf_start/wf_end as weeks; if not provided, all months are active
-        return True if (not wf_start and not wf_end) else True  # keep permissive for month view
+        # Default: if no explicit window set, apply what-if only to future months
+        today_m = pd.to_datetime(dt.date.today()).to_period("M").to_timestamp().date().isoformat()
+        if not wf_start and not wf_end:
+            return str(m) > today_m
+        # If a custom window is provided (as weeks), keep permissive behavior for now
+        return True
 
     # helpers for nest overrides (applied when month is in active window)
     def _ovr_login_frac_m(m):
