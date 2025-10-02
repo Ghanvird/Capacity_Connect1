@@ -2394,6 +2394,43 @@ def register_plan_detail_core(app: dash.Dash):
                 tick = 0
             return "What-if cleared ✅", False, tick + 1
 
+        # Reset What-If input fields to 0 on Clear button
+        @app.callback(
+            Output("whatif-aht-delta", "value"),
+            Output("whatif-shr-delta", "value"),
+            Output("whatif-attr-delta", "value"),
+            Output("whatif-vol-delta", "value"),
+            Input("whatif-clear", "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def _whatif_reset_inputs(n):
+            if not n:
+                raise dash.exceptions.PreventUpdate
+            return 0, 0, 0, 0
+
+        # Keep What-If inputs in sync with store: when cleared ({}), force zeros
+        @app.callback(
+            Output("whatif-aht-delta", "value", allow_duplicate=True),
+            Output("whatif-shr-delta", "value", allow_duplicate=True),
+            Output("whatif-attr-delta", "value", allow_duplicate=True),
+            Output("whatif-vol-delta", "value", allow_duplicate=True),
+            Input("plan-whatif", "data"),
+            prevent_initial_call=True,
+        )
+        def _whatif_sync_inputs(store):
+            try:
+                d = dict(store or {})
+            except Exception:
+                d = {}
+            if not d:
+                return 0, 0, 0, 0
+            def f(v):
+                try:
+                    return float(v)
+                except Exception:
+                    return 0
+            return f(d.get("aht_delta")), f(d.get("shrink_delta")), f(d.get("attr_delta")), f(d.get("vol_delta"))
+
         @app.callback(
             Output("opt-created-by", "children", allow_duplicate=True),
             Output("opt-created-on", "children", allow_duplicate=True),
