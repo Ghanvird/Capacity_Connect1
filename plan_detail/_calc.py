@@ -630,6 +630,13 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         forecast_aht_sut = (f_num / f_den) if f_den > 0 else 0.0
         forecast_aht_sut = float(forecast_aht_sut) if pd.notna(forecast_aht_sut) else 0.0
         forecast_aht_sut = max(0.0, forecast_aht_sut)
+        # Reflect What-If AHT/SUT delta in FW row for non-Voice channels as well
+        try:
+            _ch = str(ch_first or '').strip().lower()
+            if _wf_active(w) and aht_delta and _ch not in ("voice",):
+                forecast_aht_sut = max(0.0, forecast_aht_sut * (1.0 + aht_delta / 100.0))
+        except Exception:
+            pass
         wk_aht_sut_forecast[w] = forecast_aht_sut
 
         # Budgeted & Forecast AHT/SUT rows
@@ -947,6 +954,12 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             # AHT/SUT rows
             aht_act = float(a_aht.get(w, 0.0) or 0.0)
             aht_for = float((planned_aht_w.get(w, f_aht.get(w, 0.0)) if ch_key != 'bo' else planned_sut_w.get(w, f_aht.get(w, 0.0))) or 0.0)
+            # Apply What-If AHT/SUT to Forecast row for future weeks so user sees uplift
+            try:
+                if _wf_active(w) and aht_delta:
+                    aht_for = max(0.0, aht_for * (1.0 + aht_delta / 100.0))
+            except Exception:
+                pass
             if "Actual AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "Actual AHT/SUT", w] = aht_act
             if "Forecast AHT/SUT" in fw_rows:
@@ -1510,7 +1523,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             return monday.dt.date.astype(str)
         else:
             ds = pd.DatetimeIndex(ds)
-            monday = idx.normalize() - pd.to_timedelta(ds.weekday, unit="D")
+            monday = ds.normalize() - pd.to_timedelta(ds.weekday, unit="D")
             return pd.Index(monday.date.astype(str))
 
     def _agg_weekly(date_idx, ooo_series, ino_series, base_series):
@@ -2034,7 +2047,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             handling_capacity[w] = calls_per_ivl * intervals
         elif ch_low in ("back office", "bo"):
             base_sut = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
-            sut = max(1.0, float(base_sut) * (1.0 + aht_delta / 100.0))  # What-If SUT ?
+            sut = float(base_sut)
+            if _wf_active(w) and aht_delta:
+                sut = max(1.0, sut * (1.0 + aht_delta / 100.0))
+            else:
+                sut = max(1.0, sut)
 
             lc = _learning_curve_for_week(settings, lc_ovr_df, w)
             def eff(buckets, prod_pct_list, uplift_pct_list):
