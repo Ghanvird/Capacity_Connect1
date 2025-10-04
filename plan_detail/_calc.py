@@ -2221,7 +2221,18 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                     ot = 0.0
                 total_hours = (float(agents_eff) * base_hours) + max(0.0, ot)
                 total_prod_hours = total_hours * (1.0 - eff_shr) * util_bo
-                handling_capacity[w] = total_prod_hours * (3600.0 / sut)
+                # Guard against zero/invalid SUT. Fall back to planned/target if needed.
+                try:
+                    sut_safe = float(sut)
+                except Exception:
+                    sut_safe = 0.0
+                if sut_safe <= 0.0:
+                    try:
+                        sut_safe = float(planned_sut_w.get(w, s_target_sut))
+                    except Exception:
+                        sut_safe = float(s_target_sut)
+                sut_safe = max(1.0, float(sut_safe))
+                handling_capacity[w] = total_prod_hours * (3600.0 / sut_safe)
             else:
                 ivl_per_week = int(round(bo_wd * bo_hpd / (ivl_sec / 3600.0)))
                 agents_eff_u = max(1.0, float(agents_eff) * util_bo)
