@@ -628,7 +628,18 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             f_num += ovr_sut_bo * f_bo; f_den += f_bo
         elif b_sut_col_F:
             f_num += _get(bF_w, w, b_sut_col_F, 0.0) * _get(bF_w, w, b_itm_col, 0.0); f_den += _get(bF_w, w, b_itm_col, 0.0)
-        forecast_aht_sut = (f_num / f_den) if f_den > 0 else 0.0
+        if f_den > 0:
+            forecast_aht_sut = (f_num / f_den)
+        else:
+            # Robust fallback: use planned/budgeted AHT/SUT weighted by forecast loads (or default targets)
+            bud_aht = planned_aht_w.get(w, s_budget_aht)
+            bud_sut = planned_sut_w.get(w, s_budget_sut)
+            fb_num = 0.0; fb_den = 0.0
+            if f_voice > 0:
+                fb_num += float(bud_aht) * float(f_voice); fb_den += float(f_voice)
+            if f_bo > 0:
+                fb_num += float(bud_sut) * float(f_bo);    fb_den += float(f_bo)
+            forecast_aht_sut = (fb_num / fb_den) if fb_den > 0 else float(s_budget_aht)
         forecast_aht_sut = float(forecast_aht_sut) if pd.notna(forecast_aht_sut) else 0.0
         forecast_aht_sut = max(0.0, forecast_aht_sut)
         # Reflect What-If AHT/SUT delta in FW row for non-Voice channels as well
@@ -2192,6 +2203,15 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             intervals = int(n) if isinstance(n, (int, np.integer)) and n > 0 else intervals_per_week_default
             calls_per_ivl = _erlang_calls_capacity(agents_eff, aht, sl_seconds, ivl_sec, sl_target_pct)
             handling_capacity[w] = calls_per_ivl * intervals
+            # Optional debug for Voice only (does not alter logic)
+            if os.environ.get("CAP_DEBUG_VOICE"):
+                try:
+                    print(
+                        f"[VOICE-WEEK][{w}] vol={weekly_demand_voice.get(w,0)} aht={aht:.1f} occ={occ_frac_w.get(w,0):.2f} agents_eff={agents_eff:.2f} "
+                        f"intervals={intervals} cap={handling_capacity[w]:.1f} sl={proj_sl.get(w,0.0):.1f}"
+                    )
+                except Exception:
+                    pass
         elif ch_low in ("back office", "bo"):
             base_sut = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
             sut = float(base_sut)
@@ -2351,6 +2371,13 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 )
             sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
             proj_sl[w] = 100.0 * sl_frac
+            if os.environ.get("CAP_DEBUG_VOICE"):
+                try:
+                    print(
+                        f"[VOICE-WEEK-SL][{w}] load={weekly_load:.1f} aht={aht_sut:.1f} intervals={intervals} agents_eff={agents_eff:.2f} sl={proj_sl[w]:.1f}"
+                    )
+                except Exception:
+                    pass
         elif ch_low in ("back office", "bo"):
             weekly_load = float(weekly_demand_bo.get(w, 0.0))
             if bo_model == "tat":
