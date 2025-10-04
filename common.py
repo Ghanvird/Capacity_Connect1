@@ -1,504 +1,1366 @@
+# file: app.py
 from __future__ import annotations
-import datetime as dt
-from typing import List, Tuple, Dict
-import base64, io, re
-
+import os, platform, getpass, base64, io, datetime as dt
 import pandas as pd
 import numpy as np
-
-import dash
-from dash import html, dcc, dash_table, Input, Output, State, no_update
+from typing import List
+from planning_workspace import planning_layout, register_planning_ws
+from dash import Dash, html, dcc, dash_table, Output, Input, State, callback
+try:
+    from dash.dash_table import Format, Scheme, Symbol, FormatTemplate
+except Exception:
+    # Fallback if import path differs; access via dash_table.Format at runtime
+    Format = getattr(dash_table, "Format", None)
+    Scheme = getattr(getattr(dash_table, "Format", object), "Scheme", None)
+    Symbol = getattr(getattr(dash_table, "Format", object), "Symbol", None)
+    FormatTemplate = getattr(dash_table, "FormatTemplate", None)
 import dash_bootstrap_components as dbc
+from dash.exceptions import PreventUpdate
+import plotly.express as px
+import dash_svg as svg
+from datetime import date, timedelta
+import re
+from plan_store import get_plan
+from cap_db import save_df, load_df, _conn
+from plan_detail import layout_for_plan, plan_detail_validation_layout, register_plan_detail
 
-from plan_store import get_plan, create_plan
-from cap_db import save_df, load_df
-from cap_store import load_headcount, get_clients_hierarchy  # <-- single source for BA/Level 3/Site
-from cap_store import load_timeseries, resolve_settings, load_roster, load_hiring, load_roster_long, load_defaults, load_roster_wide
-from capacity_core import voice_requirements_interval, voice_rollups, bo_rollups, required_fte_daily, supply_fte_daily
-import os, getpass, re
-import pandas as pd
-from datetime import datetime, timezone
-from flask import request, session
-# Optional capacity_core
-try:
-    from capacity_core import min_agents, offered_load_erlangs  # (placeholder for future calcs)
-except Exception:
-    def min_agents(*args, **kwargs): return None
-    def offered_load_erlangs(*args, **kwargs): return None
+# ---- Core math & demo (replace with real when ready) ----
+from capacity_core import (
+    required_fte_daily, supply_fte_daily, understaffed_accounts_next_4w,
+    kpi_hiring, kpi_shrinkage,
+    make_projects_sample, make_voice_sample, make_backoffice_sample,
+    make_outbound_sample, make_roster_sample, make_hiring_sample,
+    make_shrinkage_sample, make_attrition_sample, _last_next_4, min_agents,
+    voice_requirements_interval,
+)
 
-# Dash ctx fallback
-try:
-    from dash import ctx
-except Exception:
-    from dash import callback_context as ctx  # type: ignore
+# ---- SQLite persistence & dynamic sources (NO Mapping 1 anywhere) ----
+from cap_store import (
+    init_db, load_defaults, save_defaults, save_roster_long, save_roster_wide,
+    load_roster, save_roster, load_roster_long, load_roster_wide,
+    load_hiring, save_hiring, load_attrition_raw, save_attrition_raw,
+    load_shrinkage, save_shrinkage,
+    load_attrition, save_attrition,
+    save_scoped_settings, resolve_settings,
+    ensure_indexes, save_timeseries, brid_manager_map,
+    load_headcount, level2_to_journey_map, load_timeseries, get_clients_hierarchy
+)
 
-pd.set_option('future.no_silent_downcasting', True)
+# Initialize DB file
+init_db()
+ensure_indexes()
 
-CHANNEL_DEFAULTS = ["Voice", "Back Office", "Outbound", "Blended", "Chat", "MessageUs"]
+SYSTEM_NAME = (os.environ.get("HOSTNAME") or getpass.getuser() or platform.node())
 
-_PLANS_INDEX_KEY = "plans_index"  # where plan metadata lives
-# adjust this list if you add more per-plan tables
-_PLAN_TABLE_SUFFIXES = [
-    "fw","hc","attr","shr","train","ratio","seat","bva","nh","emp","bulk_files","notes","lc_overrides"
-]
-# ──────────────────────────────────────────────────────────────────────────────
-# === Learning-curve + per-week overrides helpers =============================
+# ---------------------- Dash App ----------------------
+# (app init moved to app_instance.py)
 
-def _as_pct_list(val, length: int | None = None, default: float = 0.0) -> list[float]:
-    """
-    Accepts '50,60,70' | [50,60,70] | None, returns list of floats (percent, not fraction).
-    Pads/truncates to `length` (if provided).
-    """
-    import numpy as np
-    out: list[float] = []
-    if isinstance(val, str):
-        parts = [p.strip().replace("%", "") for p in val.split(",")]
-        for p in parts:
-            try: out.append(float(p))
-            except Exception: out.append(default)
-    elif isinstance(val, (list, tuple, np.ndarray)):
-        for p in val:
-            try: out.append(float(str(p).replace("%","")))
-            except Exception: out.append(default)
-    if length is not None:
-        out = (out + [default]*length)[:length]
-    return out
 
-def _pick_override_for_week(ovr_list, week_id: str):
-    """
-    Given a list of dicts like [{"start_week":"2025-09-01","nesting_prod_pct":"50,60"}...]
-    return the last row with start_week <= week_id. Returns {} if none.
-    """
-    import pandas as pd
-    if not isinstance(ovr_list, (list, tuple)) or not ovr_list:
-        return {}
-    df = pd.DataFrame(ovr_list)
-    if "start_week" not in df.columns:  # tolerate different casing
-        return {}
-    df = df.copy()
-    df["start_week"] = pd.to_datetime(df["start_week"], errors="coerce").dt.date.astype(str)
-    df = df.dropna(subset=["start_week"])
-    if df.empty:
-        return {}
-    df = df.sort_values("start_week")
-    pick = df[df["start_week"] <= str(week_id)]
-    return (pick.iloc[-1].to_dict() if not pick.empty else {})
+# ====================== helpers ======================
 
-def _learning_curve_for_week(settings: dict, lc_overrides_df, week_id: str) -> dict:
-    """
-    Returns dict with lists (percents, not fractions):
-      nesting_prod_pct, nesting_aht_uplift_pct,
-      sda_prod_pct, sda_aht_uplift_pct,
-      throughput_train_pct, throughput_nest_pct
-    Pulls base from `settings` then applies latest override in lc_overrides_df up to week_id.
-    """
-    import pandas as pd
-    base = dict(settings or {})
-    # defaults
-    n_weeks  = int(float(base.get("nesting_weeks", base.get("default_nesting_weeks", 0)) or 0))
-    s_weeks  = int(float(base.get("sda_weeks",      base.get("default_sda_weeks", 0)) or 0))
+def build_roster_template_wide(start_date: dt.date, end_date: dt.date, include_sample: bool = False) -> pd.DataFrame:
+    base_cols = [
+        "BRID", "Name", "Team Manager",
+        "Business Area", "Sub Business Area", "LOB",
+        "Site", "Location", "Country"
+    ]
+    if not isinstance(start_date, dt.date):
+        start_date = pd.to_datetime(start_date).date()
+    if not isinstance(end_date, dt.date):
+        end_date = pd.to_datetime(end_date).date()
+    if start_date > end_date:
+        start_date, end_date = end_date, start_date
 
-    out = dict(
-        nesting_prod_pct       = _as_pct_list(base.get("nesting_productivity_pct"), n_weeks, default=100.0),
-        nesting_aht_uplift_pct = _as_pct_list(base.get("nesting_aht_uplift_pct"), n_weeks, default=0.0),
-        sda_prod_pct           = _as_pct_list(base.get("sda_productivity_pct"),     s_weeks, default=100.0),
-        sda_aht_uplift_pct     = _as_pct_list(base.get("sda_aht_uplift_pct"),       s_weeks, default=0.0),
-        throughput_train_pct   = float(str(base.get("throughput_train_pct", 100)).replace("%","")),
-        throughput_nest_pct    = float(str(base.get("throughput_nest_pct",  100)).replace("%","")),
-    )
+    date_cols = [(start_date + dt.timedelta(days=i)).isoformat()
+                 for i in range((end_date - start_date).days + 1)]
+    cols = base_cols + date_cols
+    df = pd.DataFrame(columns=cols)
 
-    # optional: per-week overrides stored as a table (we load it in _calc and pass df here)
-    if isinstance(lc_overrides_df, pd.DataFrame) and not lc_overrides_df.empty:
-        sel = _pick_override_for_week(lc_overrides_df.to_dict("records"), week_id)
-        if sel:
-            if "nesting_weeks" in sel: n_weeks = int(float(sel.get("nesting_weeks") or n_weeks))
-            if "sda_weeks"     in sel: s_weeks = int(float(sel.get("sda_weeks") or s_weeks))
-            out["nesting_prod_pct"]       = _as_pct_list(sel.get("nesting_prod_pct", out["nesting_prod_pct"]), n_weeks, 100.0)
-            out["nesting_aht_uplift_pct"] = _as_pct_list(sel.get("nesting_aht_uplift_pct", out["nesting_aht_uplift_pct"]), n_weeks, 0.0)
-            out["sda_prod_pct"]           = _as_pct_list(sel.get("sda_prod_pct", out["sda_prod_pct"]), s_weeks, 100.0)
-            out["sda_aht_uplift_pct"]     = _as_pct_list(sel.get("sda_aht_uplift_pct", out["sda_aht_uplift_pct"]), s_weeks, 0.0)
-            if "throughput_train_pct" in sel: out["throughput_train_pct"] = float(str(sel["throughput_train_pct"]).replace("%",""))
-            if "throughput_nest_pct"  in sel: out["throughput_nest_pct"]  = float(str(sel["throughput_nest_pct"]).replace("%",""))
-    return out
-
-def _user():
-    return os.environ.get("HOSTNAME") or os.environ.get("USERNAME") or getpass.getuser() or "system"
-
-def _load_index() -> pd.DataFrame:
-    try:
-        df = load_df(_PLANS_INDEX_KEY)
-        if not isinstance(df, pd.DataFrame): df = pd.DataFrame()
-    except Exception:
-        df = pd.DataFrame()
-    if "plan_id" not in df.columns:
-        df["plan_id"] = pd.Series(dtype="int64")
+    if include_sample and date_cols:
+        r1 = {c: "" for c in cols}
+        r1.update({
+            "BRID": "IN0001", "Name": "Asha Rao", "Team Manager": "Priyanka Menon",
+            "Business Area": "Retail", "Sub Business Area": "Cards", "LOB": "Back Office",
+            "Site": "Chennai", "Location": "IN-Chennai", "Country": "India",
+            date_cols[0]: "09:00-17:30"
+        })
+        r2 = {c: "" for c in cols}
+        r2.update({
+            "BRID": "UK0002", "Name": "Alex Doe", "Team Manager": "Chris Lee",
+            "Business Area": "Retail", "Sub Business Area": "Cards", "LOB": "Voice",
+            "Site": "Glasgow", "Location": "UK-Glasgow", "Country": "UK",
+            date_cols[0]: "Leave"
+        })
+        if len(date_cols) > 1:
+            r1[date_cols[1]] = "10:00-18:00"
+        df = pd.DataFrame([r1, r2])[cols]
     return df
 
-def get_plan_meta(pid: int | str) -> dict:
-    """Return plan metadata row from the plans index as a dict.
-    Falls back to empty dict when not found.
-    """
-    try:
-        pid_i = int(pid)
-    except Exception:
-        return {}
-    df = _load_index()
-    if not isinstance(df, pd.DataFrame) or df.empty or "plan_id" not in df.columns:
-        return {}
-    try:
-        mask = df["plan_id"].astype("Int64").fillna(-1).astype(int) == pid_i
-        if getattr(mask, "any", lambda: False)():
-            row = df.loc[mask].tail(1).iloc[0].to_dict()
-            # Clean NaNs to friendly values
-            out = {}
-            for k, v in row.items():
-                if k == "plan_id":
-                    out[k] = pid_i
-                else:
-                    try:
-                        out[k] = ("" if pd.isna(v) else v)
-                    except Exception:
-                        out[k] = v
-            return out
-    except Exception:
-        pass
-    return {}
+def normalize_roster_wide(df_wide: pd.DataFrame) -> pd.DataFrame:
+    if df_wide is None or df_wide.empty:
+        return pd.DataFrame(columns=[
+            "BRID","Name","Team Manager","Business Area","Sub Business Area",
+            "LOB","Site","Location","Country","date","entry"
+        ])
+    id_cols = ["BRID","Name","Team Manager","Business Area","Sub Business Area","LOB","Site","Location","Country"]
+    id_cols = [c for c in id_cols if c in df_wide.columns]
+    date_cols = [c for c in df_wide.columns if c not in id_cols]
+    long = df_wide.melt(id_vars=id_cols, value_vars=date_cols, var_name="date", value_name="entry")
+    long["entry"] = long["entry"].fillna("").astype(str).str.strip()
+    long = long[long["entry"] != ""]
+    long["date"] = pd.to_datetime(long["date"], errors="coerce", dayfirst=True).dt.date
+    long = long[pd.notna(long["date"])]
+    long["is_leave"] = long["entry"].str.lower().isin({"leave","l","off","pto"})
+    return long
 
-def save_plan_meta(pid: int, meta: dict) -> None:
-    """Upsert row in the plans index."""
-    df = _load_index()
-    pid = int(pid)
-    meta = dict(meta or {})
-    meta["plan_id"] = pid
-    now = pd.Timestamp.utcnow().isoformat(timespec="seconds")
-    meta.setdefault("last_updated_on", now)
-    meta.setdefault("last_updated_by", _user())
+def _week_floor(d: pd.Timestamp | str | dt.date, week_start: str = "Monday") -> dt.date:
+    d = pd.to_datetime(d).date()
+    wd = d.weekday()
+    if (week_start or "Monday").lower().startswith("sun"):
+        return d - dt.timedelta(days=(wd + 1) % 7)
+    return d - dt.timedelta(days=wd)
 
-    if not df.empty and "plan_id" in df.columns:
-        mask = df["plan_id"].astype(int) == pid
+def _all_locations() -> list[str]:
+    """Unique Position Location Country values (used for the Site-only scope = Country)."""
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    loc_col = C["loc"]
+    if not loc_col:
+        return []
+    vals = (
+        df[loc_col]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace({"": np.nan, "na": np.nan, "none": np.nan, "all": np.nan})
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+    return vals.tolist()
+
+def _read_upload_to_df(contents, filename):
+    if not contents:
+        return pd.DataFrame()
+    _type, b64 = contents.split(",", 1)
+    buf = base64.b64decode(b64)
+    if (filename or "").lower().endswith(".csv"):
+        return pd.read_csv(io.StringIO(buf.decode("utf-8")), dtype=str)
+    return pd.read_excel(io.BytesIO(buf))
+
+def _preview_cols_data(df):
+    if df is None or df.empty:
+        return [], []
+    return [{"name": c, "id": c} for c in df.columns], df.to_dict("records")
+
+def _voice_tactical_canon(df_in: pd.DataFrame):
+    """Return (vol_df, aht_df, debug) for voice tactical uploads."""
+    if df_in is None or df_in.empty:
+        return pd.DataFrame(), pd.DataFrame(), "no rows"
+
+    df = df_in.copy()
+    L = {str(c).strip().lower(): c for c in df.columns}
+
+    # date
+    date_col = L.get("date") or L.get("week")
+    if not date_col:
+        return pd.DataFrame(), pd.DataFrame(), "missing date/week"
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+
+    # interval (optional but recommended for voice)
+    ivl_col = L.get("interval") or L.get("interval_start")
+    df["interval"] = df[ivl_col] if ivl_col else pd.NaT
+
+    # volume
+    vol_col = L.get("volume") or L.get("vol") or L.get("calls")
+    if vol_col:
+        df["volume"] = pd.to_numeric(df[vol_col], errors="coerce").fillna(0.0)
     else:
-        mask = pd.Series(False, index=df.index)
+        df["volume"] = 0.0
 
-    # ensure all columns exist
-    for k in meta.keys():
-        if k not in df.columns:
-            df[k] = None
-
-    if getattr(mask, "any", lambda: False)():
-        for k, v in meta.items():
-            df.loc[mask, k] = v
+    # aht
+    aht_col = L.get("aht_sec") or L.get("aht") or L.get("avg_aht") or L.get("aht_seconds")
+    vol_df = df[["date","interval","volume"]]
+    if aht_col:
+        aht_df = df[["date","interval", aht_col]].rename(columns={aht_col:"aht_sec"})
+        aht_df["aht_sec"] = pd.to_numeric(aht_df["aht_sec"], errors="coerce")
+        aht_df = aht_df.dropna(subset=["aht_sec"])
     else:
-        df = pd.concat([df, pd.DataFrame([meta])], ignore_index=True)
+        aht_df = pd.DataFrame(columns=["date","interval","aht_sec"])
 
-    save_df(_PLANS_INDEX_KEY, df)
+    dbg = f"mapped: date={date_col!r}, interval={ivl_col!r}, volume={vol_col!r}, aht={aht_col!r}; rows: vol={len(vol_df)}, aht={len(aht_df)}"
+    return vol_df, aht_df, dbg
 
-def clone_plan(pid: int, new_name: str) -> int:
-    """Clone an existing plan into a history entry and copy all datasets."""
-    pid = int(pid)
-    base = get_plan(pid) or {}
+def _bo_tactical_canon(df_in: pd.DataFrame):
+    """Return (vol_df, sut_df, debug) for back-office tactical uploads."""
+    if df_in is None or df_in.empty:
+        return pd.DataFrame(), pd.DataFrame(), "no rows"
 
-    payload = {
-        "org": base.get("org"),
-        "business_entity": base.get("business_entity"),
-        "vertical": base.get("vertical"),
-        "sub_ba": base.get("sub_ba"),
-        "channel": base.get("channel"),
-        "location": base.get("location"),
-        "site": base.get("site"),
-        "plan_type": base.get("plan_type"),
-        "start_week": base.get("start_week"),
-        "end_week": base.get("end_week"),
-        "ft_weekly_hours": base.get("ft_weekly_hours"),
-        "pt_weekly_hours": base.get("pt_weekly_hours"),
-        "tags": base.get("tags"),
-        "plan_name": new_name,
-        "status": "history",
-        "is_current": 0,
-    }
-    new_pid = create_plan(payload)
+    df = df_in.copy()
+    L = {str(c).strip().lower(): c for c in df.columns}
 
-    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    new_meta = {
-        **base,
-        "plan_id": new_pid,
-        "plan_name": new_name,
-        "status": "history",
-        "is_current": 0,
-        "created_on": base.get("created_on") or now,
-        "created_by": base.get("created_by") or _user(),
-        "last_updated_on": now,
-        "last_updated_by": _user(),
-    }
-    save_plan_meta(new_pid, new_meta)
+    # date
+    date_col = L.get("date") or L.get("week")
+    if not date_col:
+        return pd.DataFrame(), pd.DataFrame(), "missing date/week"
+    df["date"] = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
 
-    for sfx in _PLAN_TABLE_SUFFIXES:
-        try:
-            df = load_df(f"plan_{pid}_{sfx}")
-        except Exception:
-            df = None
-        if isinstance(df, pd.DataFrame):
-            save_df(f"plan_{new_pid}_{sfx}", df)
+    # items
+    items_col = L.get("items") or L.get("volume") or L.get("txns") or L.get("transactions")
+    df["items"] = pd.to_numeric(df[items_col], errors="coerce").fillna(0.0) if items_col else 0.0
 
-    return new_pid
-
-def extend_plan_weeks(pid: int, add_weeks: int) -> None:
-    """Push plan end week forward by N weeks and save meta."""
-    meta = get_plan(pid) or {}
-    end = pd.to_datetime(meta.get("end_week"), errors="coerce")
-    if pd.isna(end):
-        end = pd.Timestamp.utcnow().normalize()
-    new_end = (end + pd.Timedelta(days=7*int(add_weeks or 0))).date().isoformat()
-    meta["end_week"] = new_end
-    meta["last_updated_on"] = pd.Timestamp.utcnow().isoformat(timespec="seconds")
-    meta["last_updated_by"] = _user()
-    save_plan_meta(pid, meta)
-# --- New-Hire: centralized options & helpers ---------------------------------
-
-
-# Storage key for class dataset
-CLASS_STORE_FMT = "plan_{pid}_nh_classes"
-
-# Centralized dropdown options (edit here to change everywhere)
-CLASS_TYPE_OPTIONS = [
-    {"label": "Ramp-Up", "value": "ramp-up"},
-    {"label": "Backfill", "value": "backfill"},
-]
-
-CLASS_LEVEL_OPTIONS = [
-    {"label": "Trainee",        "value": "trainee"},
-    {"label": "New Agent",      "value": "new-agent"},
-    {"label": "Tenured Agent",  "value": "tenured"},
-    {"label": "Senior Agent",   "value": "senior-agent"},
-    {"label": "SME",            "value": "sme"},
-    {"label": "Cross-Skill",    "value": "cross-skill"},
-]
-
-def get_class_type_options():
-    return CLASS_TYPE_OPTIONS
-
-def get_class_level_options():
-    return CLASS_LEVEL_OPTIONS
-
-def load_nh_classes(pid: str) -> pd.DataFrame:
-    df = load_df(CLASS_STORE_FMT.format(pid=pid))
-    cols = ["class_reference","source_system_id","emp_type","status","class_type","class_level",
-            "grads_needed","billable_hc","training_weeks","nesting_weeks",
-            "induction_start","training_start","training_end","nesting_start","nesting_end","production_start",
-            "created_by","created_ts"]
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return pd.DataFrame(columns=cols)
-    for c in cols:
-        if c not in df.columns:
-            df[c] = None
-    return df[cols]
-
-def save_nh_classes(pid: str, df: pd.DataFrame):
-    save_df(CLASS_STORE_FMT.format(pid=pid), df)
-
-def current_user_fallback() -> str:
-    try:
-        return (
-            session.get("user_email") or session.get("user")
-            or request.headers.get("X-Auth-Email") or request.headers.get("X-Forwarded-User")
-            or request.headers.get("X-User") or request.headers.get("remote-user")
-            or os.getenv("USERNAME") or os.getenv("USER") or getpass.getuser() or "unknown"
-        )
-    except Exception:
-        return os.getenv("USERNAME") or os.getenv("USER") or "unknown"
-
-def next_class_reference(pid: str, df: pd.DataFrame | None = None) -> str:
-    """NH-<pid>-YYYYMMDD-## (sequential per day & plan)."""
-    df = df if isinstance(df, pd.DataFrame) else load_nh_classes(pid)
-    today = datetime.now(timezone.utc).strftime("%Y%m%d")
-    prefix = f"NH-{pid}-{today}-"
-    seq = 1
-    if "class_reference" in df.columns:
-        existing = df["class_reference"].dropna().astype(str)
-        pat = re.compile(rf"^{re.escape(prefix)}(\d{{2,}})$")
-        nums = []
-        for s in existing:
-            m = pat.match(s.strip())
-            if m:
-                try:
-                    nums.append(int(m.group(1)))
-                except:
-                    pass
-        if nums:
-            seq = max(nums) + 1
-    return f"{prefix}{seq:02d}"
-
-
-def _settings_volume_aht_overrides(sk, which: str):
-    """
-    Read 'Settings' uploads where AHT/SUT is uploaded together with volume.
-    Returns dicts:
-      - vol_w: week -> total volume/items
-      - aht_w (voice) or sut_w (bo): week -> weighted AHT/SUT
-    `which` is 'voice' or 'bo'.
-    """
-    # Try a handful of tolerant keys; keep/add keys that match your storage
-    keys_voice = [
-        "settings_voice_volume_aht", "voice_settings_upload",
-        "settings_volume_aht_voice", "voice_volume_aht", "voice_forecast_settings"
-    ]
-    keys_bo = [
-        "settings_bo_volume_sut", "settings_backoffice_volume_sut",
-        "bo_settings_upload", "backoffice_volume_sut", "bo_forecast_settings"
-    ]
-    df = _first_non_empty_ts(sk, keys_voice if which.lower()=="voice" else keys_bo)
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return {"vol_w": {}, "aht_or_sut_w": {}}
-
-    d = df.copy()
-    # Column detection
-    L = {str(c).strip().lower(): c for c in d.columns}
-    c_date = L.get("date") or L.get("week") or L.get("start_date")
-    c_vol  = L.get("vol") or L.get("volume") or L.get("calls") or L.get("items") or L.get("txns") or L.get("transactions")
-    if which.lower()=="voice":
-        c_time = L.get("aht_sec") or L.get("aht") or L.get("avg_aht")
+    # sut/aht
+    sut_col = L.get("sut_sec") or L.get("sut") or L.get("avg_sut") or L.get("aht_sec") or L.get("aht")
+    vol_df = df[["date","items"]]
+    if sut_col:
+        sut_df = df[["date", sut_col]].rename(columns={sut_col:"sut_sec"})
+        sut_df["sut_sec"] = pd.to_numeric(sut_df["sut_sec"], errors="coerce")
+        sut_df = sut_df.dropna(subset=["sut_sec"])
     else:
-        c_time = L.get("sut_sec") or L.get("sut") or L.get("avg_sut") or L.get("aht_sec")  # tolerate 'aht_sec' for BO
+        sut_df = pd.DataFrame(columns=["date","sut_sec"])
 
-    if not c_date or not c_vol or not c_time:
-        return {"vol_w": {}, "aht_or_sut_w": {}}
-
-    # Normalize & weekly group
-    d[c_date] = pd.to_datetime(d[c_date], errors="coerce")
-    d = d.dropna(subset=[c_date])
-    d["week"] = (d[c_date] - pd.to_timedelta(d[c_date].dt.weekday, unit="D")).dt.date.astype(str)
-
-    d[c_vol]  = pd.to_numeric(d[c_vol],  errors="coerce").fillna(0.0)
-    d[c_time] = pd.to_numeric(d[c_time], errors="coerce").fillna(0.0)
-
-    g = d.groupby("week", as_index=False)[[c_vol]].sum().rename(columns={c_vol: "_vol_"})
-    # weighted time per week
-    d["_num_"] = d[c_time] * d[c_vol]
-    w = d.groupby("week", as_index=False)[["_num_", c_vol]].sum()
-    w["_wt_"] = np.where(w[c_vol] > 0, w["_num_"] / w[c_vol], np.nan)
-
-    vol_w = dict(zip(g["week"], g["_vol_"]))
-    aht_or_sut_w = dict(zip(w["week"], w["_wt_"]))  # may be NaN if no volume
-
-    # Clean NaNs
-    aht_or_sut_w = {k: float(v) for k, v in aht_or_sut_w.items() if pd.notna(v) and v > 0}
-    vol_w        = {k: float(v) for k, v in vol_w.items()        if pd.notna(v) and v > 0}
-    return {"vol_w": vol_w, "aht_or_sut_w": aht_or_sut_w}
+    dbg = f"mapped: date={date_col!r}, items={items_col!r}, sut={sut_col!r}; rows: items={len(vol_df)}, sut={len(sut_df)}"
+    return vol_df, sut_df, dbg
 
 
+def _save_budget_hc_timeseries(key: str, dff: pd.DataFrame):
+    """Also persist weekly headcount for the HC tab.
+       Planned HC = Budget HC (per your requirement)."""
+    if dff is None or dff.empty:
+        return
+    if not {"week","budget_headcount"}.issubset(dff.columns):
+        return
+    hc = dff[["week","budget_headcount"]].copy()
+    hc["week"] = pd.to_datetime(hc["week"], errors="coerce").dt.date.astype(str)
+    hc.rename(columns={"budget_headcount":"headcount"}, inplace=True)
 
-# _____________________ erlangs ___________________
+    # store both budget and planned (planned = budget)
+    save_timeseries("hc_budget",  key, hc)   # week, headcount
+    save_timeseries("hc_planned", key, hc)   # week, headcount
 
-import math
 
-def _metric_week_dict(df, row_name, week_ids):
-    """Read a single 'metric' row into {week -> float}."""
-    if not isinstance(df, pd.DataFrame) or df.empty or "metric" not in df.columns:
-        return {}
-    m = df["metric"].astype(str).str.strip().eq(row_name)
-    if not m.any():
-        return {}
-    ser = pd.to_numeric(df.loc[m, week_ids].iloc[0], errors="coerce").fillna(0.0)
-    return {str(k): float(v) for k, v in ser.to_dict().items()}
+def _canon_scope(ba, sba, ch, site=None):
+    canon = lambda x: (x or '').strip()
+    if site:
+        return f"{canon(ba)}|{canon(sba)}|{canon(ch)}|{canon(site)}"
+    return f"{canon(ba)}|{canon(sba)}|{canon(ch)}|{canon(site)}"  # legacy 3-part key still valid
 
-def _prev_week_id(w, week_ids):
+def _all_sites() -> list[str]:
+    df = _hcu_df()  # uses load_headcount() safely
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    site_col = C["site"]
+    if not site_col:
+        return []
+    vals = (
+        df[site_col]
+        .dropna()
+        .astype(str)
+        .str.strip()
+        .replace({"": np.nan, "na": np.nan, "none": np.nan, "all": np.nan})
+        .dropna()
+        .drop_duplicates()
+        .sort_values()
+    )
+    return vals.tolist()
+
+def _coerce_time(s):
+    s = str(s).strip()
+    # Accept "09:00", "9:00", "900" → "09:00"
+    if ":" in s:
+        h, m = s.split(":")[0:2]
+        return f"{int(h):02d}:{int(m):02d}"
+    if s.isdigit():
+        s = s.zfill(4)
+        return f"{int(s[:2]):02d}:{int(s[2:]):02d}"
+    return ""
+
+def _minutes_to_seconds(x):
+    # Accept "HH:MM" or number of minutes; return seconds
+    s = str(x).strip()
+    if ":" in s:
+        h, m = s.split(":")[0:2]
+        return (int(h)*60 + int(m)) * 60
     try:
-        i = week_ids.index(w)
-        return week_ids[i-1] if i > 0 else None
-    except Exception:
+        return float(s) * 60.0
+    except:
         return None
 
-def _erlang_c(traffic_erlangs: float, agents: float) -> float:
-    """Classic Erlang-C waiting probability; agents may be float, we floor to int."""
-    a = max(0, int(math.floor(agents)))
-    A = max(0.0, float(traffic_erlangs))
-    if a <= 0:
-        return 1.0
-    if A >= a:
-        return 1.0
-    # p0
-    s = sum((A**k)/math.factorial(k) for k in range(a))
-    last = (A**a)/math.factorial(a) * (a/(a - A))
-    p0 = 1.0 / (s + last)
-    pw = last * p0
-    return min(1.0, max(0.0, pw))
+def _week_monday(x):
+    d = pd.to_datetime(x, errors="coerce")
+    if pd.isna(d): return None
+    d = d.normalize()
+    return (d - pd.Timedelta(days=int(d.weekday()))).date()
 
-def _erlang_service_level(offered_calls: float, aht_sec: float, agents: float,
-                          interval_sec: int, asa_sec: int) -> float:
-    """Return service level in [0..1]."""
-    if aht_sec <= 0 or interval_sec <= 0 or agents <= 0 or offered_calls <= 0:
+def _scope_key(ba, subba, channel):
+    return f"{(ba or '').strip()}|{(subba or '').strip()}|{(channel or '').strip()}"
+
+def _budget_voice_template(start_week=None, weeks=8):
+    start = _week_monday(start_week or pd.Timestamp.today())
+    rows = []
+    for w in range(weeks):
+        wk = (pd.Timestamp(start) + pd.Timedelta(weeks=w)).date()
+        rows.append(dict(week=wk.isoformat(), budget_headcount=25 + (w%3)*5, budget_aht_sec=300))
+    return pd.DataFrame(rows, columns=["week","budget_headcount","budget_aht_sec"])
+
+def _budget_bo_template(start_week=None, weeks=8):
+    start = _week_monday(start_week or pd.Timestamp.today())
+    rows = []
+    for w in range(weeks):
+        wk = (pd.Timestamp(start) + pd.Timedelta(weeks=w)).date()
+        rows.append(dict(week=wk.isoformat(), budget_headcount=30 + (w%2)*3, budget_sut_sec=600))
+    return pd.DataFrame(rows, columns=["week","budget_headcount","budget_sut_sec"])
+
+def _budget_chat_template(start_week=None, weeks=8):
+    start = _week_monday(start_week or pd.Timestamp.today())
+    rows = []
+    for w in range(weeks):
+        wk = (pd.Timestamp(start) + pd.Timedelta(weeks=w)).date()
+        rows.append(dict(week=wk.isoformat(), budget_headcount=20 + (w%3)*4, budget_aht_sec=300))
+    return pd.DataFrame(rows, columns=["week","budget_headcount","budget_aht_sec"])
+
+def _budget_ob_template(start_week=None, weeks=8):
+    start = _week_monday(start_week or pd.Timestamp.today())
+    rows = []
+    for w in range(weeks):
+        wk = (pd.Timestamp(start) + pd.Timedelta(weeks=w)).date()
+        rows.append(dict(week=wk.isoformat(), budget_headcount=15 + (w%2)*2, budget_aht_sec=300))
+    return pd.DataFrame(rows, columns=["week","budget_headcount","budget_aht_sec"])
+
+def _budget_normalize_voice(df):
+    if df is None or df.empty: return pd.DataFrame(columns=["week","budget_headcount","budget_aht_sec"])
+    L = {c.lower(): c for c in df.columns}
+    wk = L.get("week") or L.get("start_week") or L.get("monday") or list(df.columns)[0]
+    hc = L.get("budget_headcount") or "budget_headcount"
+    aht= L.get("budget_aht_sec") or "budget_aht_sec"
+    dff = df.rename(columns={wk:"week"}).copy()
+    if hc not in dff: dff[hc] = None
+    if aht not in dff: dff[aht] = None
+    dff["week"] = dff["week"].map(_week_monday).astype(str)
+    dff["budget_headcount"] = pd.to_numeric(dff[hc], errors="coerce")
+    dff["budget_aht_sec"]   = pd.to_numeric(dff[aht], errors="coerce")
+    dff = dff.dropna(subset=["week"]).drop_duplicates(subset=["week"], keep="last")
+    return dff[["week","budget_headcount","budget_aht_sec"]]
+
+def _budget_normalize_bo(df):
+    if df is None or df.empty: return pd.DataFrame(columns=["week","budget_headcount","budget_sut_sec"])
+    L = {c.lower(): c for c in df.columns}
+    wk = L.get("week") or L.get("start_week") or L.get("monday") or list(df.columns)[0]
+    hc = L.get("budget_headcount") or "budget_headcount"
+    sut= L.get("budget_sut_sec") or "budget_sut_sec"
+    dff = df.rename(columns={wk:"week"}).copy()
+    if hc not in dff: dff[hc] = None
+    if sut not in dff: dff[sut] = None
+    dff["week"] = dff["week"].map(_week_monday).astype(str)
+    dff["budget_headcount"] = pd.to_numeric(dff[hc], errors="coerce")
+    dff["budget_sut_sec"]   = pd.to_numeric(dff[sut], errors="coerce")
+    dff = dff.dropna(subset=["week"]).drop_duplicates(subset=["week"], keep="last")
+    return dff[["week","budget_headcount","budget_sut_sec"]]
+
+def _budget_normalize_chat(df):
+    if df is None or df.empty: return pd.DataFrame(columns=["week","budget_headcount","budget_aht_sec"])
+    L = {c.lower(): c for c in df.columns}
+    wk = L.get("week") or L.get("start_week") or L.get("monday") or list(df.columns)[0]
+    hc = L.get("budget_headcount") or "budget_headcount"
+    aht= L.get("budget_aht_sec") or "budget_aht_sec"
+    dff = df.rename(columns={wk:"week"}).copy()
+    if hc not in dff: dff[hc] = None
+    if aht not in dff: dff[aht] = None
+    dff["week"] = dff["week"].map(_week_monday).astype(str)
+    dff["budget_headcount"] = pd.to_numeric(dff[hc], errors="coerce")
+    dff["budget_aht_sec"]   = pd.to_numeric(dff[aht], errors="coerce")
+    dff = dff.dropna(subset=["week"]).drop_duplicates(subset=["week"], keep="last")
+    return dff[["week","budget_headcount","budget_aht_sec"]]
+
+def _budget_normalize_ob(df):
+    if df is None or df.empty: return pd.DataFrame(columns=["week","budget_headcount","budget_aht_sec"])
+    L = {c.lower(): c for c in df.columns}
+    wk = L.get("week") or L.get("start_week") or L.get("monday") or list(df.columns)[0]
+    hc = L.get("budget_headcount") or "budget_headcount"
+    aht= L.get("budget_aht_sec") or "budget_aht_sec"
+    dff = df.rename(columns={wk:"week"}).copy()
+    if hc not in dff: dff[hc] = None
+    if aht not in dff: dff[aht] = None
+    dff["week"] = dff["week"].map(_week_monday).astype(str)
+    dff["budget_headcount"] = pd.to_numeric(dff[hc], errors="coerce")
+    dff["budget_aht_sec"]   = pd.to_numeric(dff[aht], errors="coerce")
+    dff = dff.dropna(subset=["week"]).drop_duplicates(subset=["week"], keep="last")
+    return dff[["week","budget_headcount","budget_aht_sec"]]
+
+
+# === SHRINKAGE (RAW) — helpers & templates ====================================
+
+def _hhmm_to_minutes(x) -> float:
+    if pd.isna(x): return 0.0
+    s = str(x).strip()
+    if not s: return 0.0
+    # allow "HH:MM", "H:MM", "MM", "H.MM" etc.
+    m = None
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) >= 2:
+            try:
+                h = int(parts[0]); mm = int(parts[1])
+                return float(h * 60 + mm)
+            except Exception:
+                pass
+    try:
+        # fallback: numeric minutes
+        return float(s)
+    except Exception:
         return 0.0
 
-# Normalized roster loader (shadows legacy version)
-def _legacy_load_or_empty_roster(pid):
-    """Load roster normalized to current _roster_columns() ids (backward compatible)."""
-    cols = [c["id"] for c in _roster_columns()]
-    empty = pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+def _hc_lookup():
+    """Return simple dict lookups from headcount: BRID→{lm_name, site, city, country, journey, level_3}"""
     try:
-        df = load_df(f"plan_{pid}_emp")
+        hc = load_headcount()
     except Exception:
-        return empty
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return empty
-    df = df.copy()
-    if "ftpt" in df.columns and "ftpt_status" not in df.columns:
-        df["ftpt_status"] = df["ftpt"]
-    if "tl" in df.columns and "team_leader" not in df.columns:
-        df["team_leader"] = df["tl"]
-    if "status" in df.columns:
-        if "work_status" not in df.columns:
-            df["work_status"] = df["status"]
-        if "current_status" not in df.columns:
-            df["current_status"] = df["status"]
-    if "date_training" in df.columns and "training_start" not in df.columns:
-        df["training_start"] = df["date_training"]
-    if "date_nesting" in df.columns and "nesting_start" not in df.columns:
-        df["nesting_start"] = df["date_nesting"]
-    if "date_production" in df.columns and "production_start" not in df.columns:
-        df["production_start"] = df["date_production"]
-    if "date_loa" in df.columns and "loa_date" not in df.columns:
-        df["loa_date"] = df["date_loa"]
-    if "date_back_from_loa" in df.columns and "back_from_loa_date" not in df.columns:
-        df["back_from_loa_date"] = df["date_back_from_loa"]
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    out = df[cols].copy()
-    for c in out.columns:
-        if out[c].dtype == object:
-            out[c] = out[c].fillna("").astype(str)
+        hc = pd.DataFrame()
+    if not isinstance(hc, pd.DataFrame) or hc.empty:
+        return {}
+    L = {c.lower(): c for c in hc.columns}
+    def col(name):
+        return L.get(name, name)
+    out = {}
+    for _, r in hc.iterrows():
+        brid = str(r.get(col("brid"), "")).strip()
+        if not brid: 
+            continue
+        out[brid] = dict(
+            lm_name = r.get(col("line_manager_full_name")),
+            site    = r.get(col("position_location_building_description")),
+            city    = r.get(col("position_location_city")),
+            country = r.get(col("position_location_country")),
+            journey = r.get(col("journey")),
+            level_3 = r.get(col("level_3")),
+        )
     return out
-    # Traffic in Erlangs in this interval
-    A = (offered_calls * aht_sec) / float(interval_sec)
-    pw = _erlang_c(A, agents)
-    # P(wait <= T) = 1 - Pw * exp(-(a - A) * T / AHT)
-    tail = math.exp(-max(0.0, (agents - A)) * (asa_sec / max(1.0, aht_sec)))
-    sl = 1.0 - pw * tail
-    return min(1.0, max(0.0, sl))
-# ──────────────────────────────────────────────────────────────────────────────
-def _build_global_hierarchy() -> dict:
+
+# ---- Back Office RAW template (seconds) ----
+def shrinkage_bo_raw_template_df(rows: int = 16) -> pd.DataFrame:
+    today = pd.Timestamp.today().normalize().date()
+    cats = [
+        "Staff Complement","Flextime","Borrowed Staff","Lend Staff",
+        "Overtime","Core Time","Diverted","Downtime","Time Worked","Work out"
+    ]
+    demo = []
+    for i in range(rows):
+        cat = cats[i % len(cats)]
+        dur = 1800 if cat in ("Diverted","Downtime") else (3_600 if cat in ("Core Time","Time Worked") else 1200)
+        brid = f"IN{1000+i}"
+        demo.append({
+            "Category":"Shrinkage", "StartDate": today.isoformat(), "EndDate": today.isoformat(),
+            "DateId": int(pd.Timestamp(today).strftime("%Y%m%d")),
+            "Date": today.isoformat(),
+            "GroupId": "BO1", "WorkgroupId": "WG1", "WorkgroupName": "BO Cases",
+            "Activity": cat,
+            "SaffMemberId": brid, "StaffLastName": "Doe", "SatffFirstName": "Alex",
+            "StaffReferenceId": brid, "TaskId": "T-001", "Units": 10 if cat=="Work out" else 0,
+            "DurationSeconds": dur, "EmploymentType": "FT",
+            "AgentID(BRID)": brid, "Agent Name": "Alex Doe",
+            "TL Name": "",  # will be filled from Headcount on upload
+            "Time": round(dur/3600,2),
+            "Sub Business Area": ""  # will be filled from Headcount (Level 3)
+        })
+    return pd.DataFrame(demo)
+
+# ---- Voice RAW template (HH:MM) ----
+def shrinkage_voice_raw_template_df(rows: int = 18) -> pd.DataFrame:
+    today = pd.Timestamp.today().normalize().date()
+    superstates = [
+        "SC_INCLUDED_TIME","SC_ABSENCE_TOTAL","SC_A_Sick_Long_Term",
+        "SC_HOLIDAY","SC_TRAINING_TOTAL","SC_BREAKS","SC_SYSTEM_EXCEPTION"
+    ]
+    demo = []
+    for i in range(rows):
+        ss = superstates[i % len(superstates)]
+        hhmm = f"{(i%3)+1:02d}:{(i*10)%60:02d}"  # 01:00, 02:10, 03:20...
+        brid = f"UK{2000+i}"
+        demo.append({
+            "Employee": f"User {i+1}",
+            "BRID": brid, "First Name": "Sam", "Last Name": "Patel",
+            "Superstate": ss, "Date": today.isoformat(), "Day of Week": "Mon",
+            "Day": int(pd.Timestamp(today).day), "Month": int(pd.Timestamp(today).month),
+            "Year": int(pd.Timestamp(today).year), "Week Number": int(pd.Timestamp(today).isocalendar().week),
+            "Week of": (pd.Timestamp(today) - pd.Timedelta(days=pd.Timestamp(today).weekday())).date().isoformat(),
+            "Hours": hhmm, "Management_Line": "", "Location": "", "CSM": "",
+            "Monthly":"", "Weekly":"", "Business Area":"", "Sub Business Area":"", "Channel":"Voice"
+        })
+    return pd.DataFrame(demo)
+
+# ---- Back Office RAW normalize + summary ----
+def _parse_date_series(series: pd.Series) -> pd.Series:
+    """Parse dates robustly without warnings.
+    Heuristic:
+      - If ISO (YYYY-MM-DD) → explicit format
+      - If slash form → decide mm/dd vs dd/mm by values, then explicit format
+      - If dash form with 2-digit first part → decide similarly
+      - Else → default parser (no dayfirst) to avoid mm/dd + dayfirst warnings
+    """
+    s = pd.Series(series)
+    # Already datetime-like
     try:
-        hmap, sites, _locs = get_clients_hierarchy()   # {BA:{SubBA:[LOBs...]}}
+        if np.issubdtype(s.dtype, np.datetime64):
+            return pd.to_datetime(s, errors="coerce").dt.date
     except Exception:
-        hmap, sites = {}, []
+        pass
 
-    ba_list = sorted(hmap.keys())
-    sub_map = {ba: sorted((hmap.get(ba) or {}).keys()) for ba in ba_list}
+    sample = s.dropna().astype(str).str.strip()
+    if sample.empty:
+        return pd.to_datetime(s, errors="coerce").dt.date
 
-    lob_map = {}
-    for ba, subs in (hmap or {}).items():
-        for sba, channels in (subs or {}).items():
-            lob_map[f"{ba}|{sba}"] = list(channels or CHANNEL_DEFAULTS)
+    # ISO 8601: 2025-09-30
+    iso_mask = sample.str.match(r"^\d{4}-\d{1,2}-\d{1,2}$")
+    if iso_mask.any() and iso_mask.mean() > 0.5:
+        return pd.to_datetime(s, errors="coerce", format="%Y-%m-%d").dt.date
 
-    return {
-        "ba": ba_list,
-        "subba": sub_map,
-        "lob": lob_map,
-        "site": sites or []
-    }
+    # Slash separated: 09/30/2025 or 30/09/2025
+    slash_mask = sample.str.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
+    if slash_mask.any() and slash_mask.mean() > 0.5:
+        parts = sample[slash_mask].str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})$")
+        first = pd.to_numeric(parts[0], errors="coerce")
+        if (first > 12).any():
+            fmt = "%d/%m/%Y"
+        else:
+            fmt = "%m/%d/%Y"
+        return pd.to_datetime(s, errors="coerce", format=fmt).dt.date
+
+    # Dash separated ambiguous: 01-02-2025 or 30-09-2025
+    dash_mask = sample.str.match(r"^\d{1,2}-\d{1,2}-\d{2,4}$")
+    if dash_mask.any() and dash_mask.mean() > 0.5:
+        parts = sample[dash_mask].str.extract(r"^(\d{1,2})-(\d{1,2})-(\d{2,4})$")
+        first = pd.to_numeric(parts[0], errors="coerce")
+        if (first > 12).any():
+            fmt = "%d-%m-%Y"
+        else:
+            fmt = "%m-%d-%Y"
+        return pd.to_datetime(s, errors="coerce", format=fmt).dt.date
+
+    # Fallback: default parser
+    return pd.to_datetime(s, errors="coerce").dt.date
+
+def normalize_shrinkage_bo(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    L = {c.lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n.lower() in L: return L[n.lower()]
+        return None
+    # columns (case-insensitive)
+    col_act  = pick("Activity")
+    col_sec  = pick("DurationSeconds","Duration (sec)","duration_seconds")
+    col_date = pick("Date")
+    col_units = pick("Units")
+    col_brid = pick("AgentID(BRID)","StaffReferenceId","SaffMemberId","StaffMemberId","BRID")
+    col_fname = pick("SatffFirstName","StaffFirstName","FirstName")
+    col_lname = pick("StaffLastName","LastName")
+    if not (col_act and col_sec and col_date and col_brid):
+        return pd.DataFrame()
+
+    dff = df.copy()
+    dff.rename(columns={
+        col_act:"activity", col_sec:"duration_seconds", col_date:"date",
+        col_units: "units" if col_units else "units",
+        col_brid: "brid",
+        col_fname or "": "first_name", col_lname or "": "last_name"
+    }, inplace=True, errors="ignore")
+
+    dff["date"] = _parse_date_series(dff["date"])  # robust date parsing
+    dff["duration_seconds"] = pd.to_numeric(dff["duration_seconds"], errors="coerce").fillna(0).astype(float)
+    if "units" in dff.columns:
+        dff["units"] = pd.to_numeric(dff["units"], errors="coerce").fillna(0).astype(float)
+    else:
+        dff["units"] = 0.0
+    dff["brid"] = dff["brid"].astype(str).str.strip()
+
+    # enrich from headcount
+    hc = _hc_lookup()
+    dff["tl_name"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("lm_name"))
+    dff["journey"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("journey"))
+    dff["sub_business_area"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("level_3"))
+    dff["time_hours"] = dff["duration_seconds"] / 3600.0
+    dff["channel"] = "Back Office"
+    return dff
+
+def _bo_bucket(activity: str) -> str:
+    try:
+        if isinstance(activity, str):
+            s = activity
+        elif pd.isna(activity):
+            s = ""
+        else:
+            s = str(activity)
+    except Exception:
+        s = ""
+    s = s.strip().lower()
+    # flexible matching
+    if "divert" in s: return "diverted"
+    if "down" in s or s == "downtime": return "downtime"
+    if "staff complement" in s or s == "staff complement": return "staff_complement"
+    if "flex" in s or s == "flexitime": return "flextime"
+    if "lend" in s or s == "lend staff": return "lend_staff"
+    if "borrow" in s or s == "borrowed staff": return "borrowed_staff"
+    if "overtime" in s or s=="ot" or s == "overtime": return "overtime"
+    if "core time" in s or s=="core": return "core_time"
+    if "time worked" in s: return "time_worked"
+    if "work out" in s or "workout" in s: return "work_out"
+    return "other"
 
 
-def _lower_map(df: pd.DataFrame) -> dict[str, str]:
-    return {str(c).strip().lower(): c for c in df.columns}
+def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
+    """Daily BO summary in hours with buckets needed for new shrinkage formula.
+    Buckets come from `_bo_bucket` applied to the free-text `activity` field.
+    Returns per-day rows including:
+      - "OOO Hours"      := Downtime
+      - "In Office Hours": Diverted Time
+      - "Base Hours"     := Staff Complement
+      - "TTW Hours"      := Staff Complement - Downtime + Flexi + Overtime + Borrowed - Lend
+    """
+    if dff is None or dff.empty:
+        return pd.DataFrame()
+    d = dff.copy()
+    d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
+
+    # Derive explicit buckets
+    d["bucket"] = d.get("activity", "").map(_bo_bucket)
+
+    keys = ["date", "journey", "sub_business_area", "channel"]
+    if "country" in d.columns:
+        keys.append("country")
+    if "site" in d.columns:
+        keys.append("site")
+
+    # Use hour granularity directly if present
+    if "time_hours" in d.columns:
+        val_col = "time_hours"
+        factor = 1.0
+    else:
+        val_col = "duration_seconds"
+        factor = 1.0 / 3600.0
+
+    agg = (
+        d.groupby(keys + ["bucket"], dropna=False)[val_col]
+         .sum()
+         .reset_index()
+    )
+    pivot = agg.pivot_table(index=keys, columns="bucket", values=val_col, fill_value=0.0).reset_index()
+
+    def _col(frame: pd.DataFrame, names: list[str]) -> pd.Series:
+        for nm in names:
+            if nm in frame.columns:
+                return frame[nm]
+        return pd.Series(0.0, index=frame.index)
+
+    sc  = _col(pivot, ["staff_complement"]) * factor
+    dwn = _col(pivot, ["downtime"]) * factor
+    flx = _col(pivot, ["flextime"]) * factor
+    ot  = _col(pivot, ["overtime"]) * factor
+    bor = _col(pivot, ["borrowed_staff", "borrowed"]) * factor
+    lnd = _col(pivot, ["lend_staff", "lend"]) * factor
+    div = _col(pivot, ["diverted"]) * factor
+
+    ttw = sc - dwn + flx + ot + bor - lnd
+
+    pivot["OOO Hours"] = dwn
+    pivot["In Office Hours"] = div
+    pivot["Base Hours"] = sc
+    pivot["TTW Hours"] = ttw
+
+    pivot = pivot.rename(columns={
+        "journey": "Business Area",
+        "sub_business_area": "Sub Business Area",
+        "channel": "Channel",
+        "country": "Country",
+        "site": "Site",
+    })
+
+    keep_keys = [c for c in ["date", "Business Area", "Sub Business Area", "Channel", "Country", "Site"] if c in pivot.columns]
+    keep = keep_keys + ["OOO Hours", "In Office Hours", "Base Hours", "TTW Hours"]
+    return pivot[keep].sort_values(keep_keys)
+
+
+def weekly_shrinkage_from_bo_summary(daily: pd.DataFrame) -> pd.DataFrame:
+    """Weekly BO shrinkage using requested formula:
+      - Total Time Worked (TTW) = Staff Complement - Downtime + Flexi + Overtime + Borrowed - Lend
+      - In-Office Shrink % = Diverted Time / TTW
+      - Out-of-Office Shrink % = Downtime / Staff Complement
+    Output keeps standard field names but uses BO semantics:
+      - ooo_hours = Downtime
+      - ino_hours = Diverted
+      - base_hours = Staff Complement
+    """
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=["week","program","ooo_hours","ino_hours","base_hours","ooo_pct","ino_pct","overall_pct"])
+    df = daily.copy()
+    df["week"] = pd.to_datetime(df["date"], errors="coerce").dt.date.apply(lambda x: _week_floor(x, "Monday"))
+    df["program"] = df.get("Business Area", "All").fillna("All").astype(str)
+
+    # Ensure TTW exists; if not, recompute defensively
+    if "TTW Hours" not in df.columns:
+        # Fall back to classic behavior to avoid crash; results may differ
+        df["TTW Hours"] = np.nan
+
+    grp = (
+        df.groupby(["week", "program"], as_index=False)[["OOO Hours", "In Office Hours", "Base Hours", "TTW Hours"]]
+          .sum()
+    )
+
+    base = grp["Base Hours"].replace({0.0: np.nan})
+    ttw = grp["TTW Hours"].replace({0.0: np.nan})
+
+    grp["ooo_pct"] = np.where(base.gt(0), (grp["OOO Hours"] / base) * 100.0, np.nan)
+    grp["ino_pct"] = np.where(ttw.gt(0), (grp["In Office Hours"] / ttw) * 100.0, np.nan)
+    # Overall Shrinkage % = OOO % + In-Office % (per business rule)
+    grp["overall_pct"] = grp["ooo_pct"].fillna(0.0) + grp["ino_pct"].fillna(0.0)
+
+    grp = grp.rename(columns={
+        "OOO Hours": "ooo_hours",
+        "In Office Hours": "ino_hours",
+        "Base Hours": "base_hours",
+    })
+    return grp[["week","program","ooo_hours","ino_hours","base_hours","ooo_pct","ino_pct","overall_pct"]]
+
+# ---- Voice RAW normalize + summary ----
+def normalize_shrinkage_voice(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    L = {c.lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n.lower() in L: return L[n.lower()]
+        return None
+    col_date = pick("Date")
+    col_state = pick("Superstate")
+    col_hours = pick("Hours")
+    col_brid  = pick("BRID","AgentID(BRID)","Employee Id","EmployeeID")
+    if not (col_date and col_state and col_hours and col_brid):
+        return pd.DataFrame()
+
+    dff = df.copy()
+    dff.rename(columns={col_date:"date", col_state:"superstate", col_hours:"hours_raw", col_brid:"brid"}, inplace=True)
+    dff["date"] = _parse_date_series(dff["date"])  # robust date parsing
+    dff["brid"] = dff["brid"].astype(str).str.strip()
+    # convert HH:MM -> minutes, then to hours (as per spec they divide by 60)
+    mins = dff["hours_raw"].map(_hhmm_to_minutes).fillna(0.0)
+    dff["hours"] = mins/60.0
+
+    # enrich from headcount
+    hc = _hc_lookup()
+    dff["TL Name"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("lm_name"))
+    dff["Site"]    = dff["brid"].map(lambda x: (hc.get(x) or {}).get("site"))
+    dff["City"]    = dff["brid"].map(lambda x: (hc.get(x) or {}).get("city"))
+    dff["Country"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("country"))
+    dff["Business Area"] = dff.get("Business Area", pd.Series(index=dff.index)).fillna(dff["brid"].map(lambda x: (hc.get(x) or {}).get("journey")))
+    dff["Sub Business Area"] = dff.get("Sub Business Area", pd.Series(index=dff.index)).fillna(dff["brid"].map(lambda x: (hc.get(x) or {}).get("level_3")))
+    if "Channel" not in dff.columns:
+        dff["Channel"] = "Voice"
+
+    # defaults so the pivot in summarize_shrinkage_voice never drops rows
+    for col, default in [("Business Area", "All"), ("Sub Business Area", "All"), ("Country", "All")]:
+        if col not in dff.columns:
+            dff[col] = default
+        else:
+            dff[col] = dff[col].replace("", np.nan).fillna(default)
+    dff["Channel"] = dff["Channel"].replace("", np.nan).fillna("Voice")
+    return dff
+
+def summarize_shrinkage_voice(dff: pd.DataFrame) -> pd.DataFrame:
+    if dff is None or dff.empty:
+        return pd.DataFrame()
+    d = dff.copy()
+
+    keys = ["date", "Business Area", "Sub Business Area", "Channel"]
+    if "Country" in d.columns and d["Country"].notna().any():
+        keys.append("Country")
+
+    piv = d.pivot_table(index=keys, columns="superstate", values="hours", aggfunc="sum", fill_value=0.0).reset_index()
+
+    def _series(name: str) -> pd.Series:
+        return piv[name] if name in piv.columns else pd.Series(0.0, index=piv.index)
+
+    ooo_codes = [
+        "SC_ABSENCE_TOTAL",
+        "SC_A_Sick_Long_Term",
+        "SC_HOLIDAY",
+        "SC_VACATION",
+        "SC_LEAVE",
+        "SC_UNPAID",
+    ]
+    ino_codes = [
+        "SC_TRAINING_TOTAL",
+        "SC_BREAKS",
+        "SC_SYSTEM_EXCEPTION",
+        "SC_MEETING",
+        "SC_COACHING",
+    ]
+
+    piv["OOO Hours"] = sum((_series(code) for code in ooo_codes))
+    piv["In Office Hours"] = sum((_series(code) for code in ino_codes))
+    piv["Base Hours"] = _series("SC_INCLUDED_TIME")
+
+    keep = keys + ["OOO Hours", "In Office Hours", "Base Hours"]
+    return piv[keep].sort_values(keys)
+
+
+def weekly_shrinkage_from_voice_summary(daily: pd.DataFrame) -> pd.DataFrame:
+    if daily is None or daily.empty:
+        return pd.DataFrame(columns=["week","program","ooo_hours","ino_hours","base_hours","ooo_pct","ino_pct","overall_pct"])
+    df = daily.copy()
+    df["week"] = pd.to_datetime(df["date"], errors="coerce").dt.date.apply(lambda x: _week_floor(x, "Monday"))
+    df["program"] = df["Business Area"].fillna("All").astype(str)
+    agg = (
+        df.groupby(["week", "program"], as_index=False)[["OOO Hours", "In Office Hours", "Base Hours"]]
+          .sum()
+    )
+    base = agg["Base Hours"].replace({0.0: np.nan})
+    agg["ooo_pct"] = np.where(base.gt(0), (agg["OOO Hours"] / base) * 100.0, np.nan)
+    agg["ino_pct"] = np.where(base.gt(0), (agg["In Office Hours"] / base) * 100.0, np.nan)
+    agg["overall_pct"] = np.where(base.gt(0), ((agg["OOO Hours"] + agg["In Office Hours"]) / base) * 100.0, np.nan)
+    agg = agg.rename(columns={
+        "OOO Hours": "ooo_hours",
+        "In Office Hours": "ino_hours",
+        "Base Hours": "base_hours",
+    })
+    return agg[["week","program","ooo_hours","ino_hours","base_hours","ooo_pct","ino_pct","overall_pct"]]
+
+
+SHRINK_WEEKLY_FIELDS = [
+    "week",
+    "program",
+    "ooo_hours",
+    "ino_hours",
+    "base_hours",
+    "ooo_pct",
+    "ino_pct",
+    "overall_pct",
+]
+
+_SHRINK_COLUMN_ALIASES = {
+    "week": "week",
+    "startweek": "week",
+    "program": "program",
+    "businessarea": "program",
+    "journey": "program",
+    "outofofficehours": "ooo_hours",
+    "ooohours": "ooo_hours",
+    "ooohrs": "ooo_hours",
+    "inofficehours": "ino_hours",
+    "inohours": "ino_hours",
+    "productivehours": "base_hours",
+    "basehours": "base_hours",
+    "baseproductivehours": "base_hours",
+    "outofofficepct": "ooo_pct",
+    "ooopct": "ooo_pct",
+    "inofficepct": "ino_pct",
+    "inopct": "ino_pct",
+    "overalls shrinkpct": "overall_pct",
+    "overallshrinkpct": "overall_pct",
+    "overallpct": "overall_pct",
+}
+
+def _fmt_numeric(precision: int = 1):
+    if Format and Scheme:
+        try:
+            return Format(precision=precision, scheme=Scheme.fixed)
+        except Exception:
+            pass
+    return None
+
+def _fmt_percent(precision: int = 1):
+    # Prefer FormatTemplate.percentage for robust '%' rendering across Dash versions
+    if FormatTemplate is not None:
+        try:
+            return FormatTemplate.percentage(precision)
+        except Exception:
+            pass
+    if Format and Scheme and Symbol:
+        try:
+            return Format(precision=precision, scheme=Scheme.fixed, symbol=Symbol.yes, symbol_suffix="%")
+        except Exception:
+            try:
+                # Older versions use chaining API
+                return dash_table.Format(precision=precision, scheme=dash_table.Format.Scheme.fixed)
+            except Exception:
+                return None
+    return None
+
+def shrink_weekly_columns() -> list[dict]:
+    cols = [
+        {"id": "week", "name": "Week"},
+        {"id": "program", "name": "Program"},
+        {"id": "ooo_hours", "name": "Out of Office Hours (#)", "type": "numeric"},
+        {"id": "ino_hours", "name": "In-Office Hours (#)", "type": "numeric"},
+        {"id": "base_hours", "name": "Base Hours (#)", "type": "numeric"},
+        {"id": "ooo_pct", "name": "Out of Office %", "type": "numeric"},
+        {"id": "ino_pct", "name": "In-Office %", "type": "numeric"},
+        {"id": "overall_pct", "name": "Overall Shrink %", "type": "numeric"},
+    ]
+    # Apply formatting: 1 decimal everywhere; percent columns with trailing %
+    fmt_num = _fmt_numeric(1)
+    fmt_pct = _fmt_percent(1)
+    for c in cols:
+        if c.get("type") == "numeric":
+            if c["id"].endswith("_pct") and fmt_pct is not None:
+                c["format"] = fmt_pct
+            elif fmt_num is not None:
+                c["format"] = fmt_num
+    return cols
+
+def shrink_daily_columns(df_or_cols) -> list[dict]:
+    """Columns for Daily Summary tables (BO/Voice) with 1-decimal hours formatting.
+    Accepts a DataFrame or an ordered list of column names.
+    """
+    cols = list(df_or_cols.columns) if hasattr(df_or_cols, "columns") else list(df_or_cols)
+    defs = []
+    fmt_num = _fmt_numeric(1)
+    for c in cols:
+        col_def = {"id": c, "name": c}
+        # Mark hour columns as numeric and format with 1 decimal
+        if isinstance(c, str) and ("hours" in c.lower()):
+            col_def["type"] = "numeric"
+            if fmt_num is not None:
+                col_def["format"] = fmt_num
+        defs.append(col_def)
+    return defs
+
+
+def _shrink_slug(name: str) -> str:
+    slug = str(name or "").strip().lower()
+    for ch in ("%", "#", "(", ")", "-", "/"):
+        slug = slug.replace(ch, "")
+    slug = slug.replace(" ", "")
+    slug = slug.replace("_", "")
+    slug = slug.replace("outofoffice", "outofoffice")
+    slug = slug.replace("inoffice", "inoffice")
+    slug = slug.replace("overallshrink", "overallshrink")
+    return slug
+
+
+def normalize_shrink_weekly(data) -> pd.DataFrame:
+    if isinstance(data, pd.DataFrame):
+        df = data.copy()
+    else:
+        df = pd.DataFrame(data or [])
+    if df.empty:
+        return pd.DataFrame(columns=SHRINK_WEEKLY_FIELDS)
+
+    rename_map = {}
+    for col in df.columns:
+        slug = _shrink_slug(col)
+        target = _SHRINK_COLUMN_ALIASES.get(slug)
+        if target:
+            rename_map[col] = target
+        elif slug in SHRINK_WEEKLY_FIELDS:
+            rename_map[col] = slug
+    df = df.rename(columns=rename_map)
+
+    for col in SHRINK_WEEKLY_FIELDS:
+        if col not in df.columns:
+            df[col] = np.nan
+
+    df["week"] = pd.to_datetime(df["week"], errors="coerce").dt.date
+    df = df.dropna(subset=["week"])
+    df["week"] = df["week"].apply(lambda x: _week_floor(x, "Monday")).astype(str)
+    df["program"] = df["program"].fillna("All").astype(str)
+
+    numeric_cols = [c for c in SHRINK_WEEKLY_FIELDS if c not in ("week", "program")]
+    for col in numeric_cols:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = _compute_shrink_weekly_percentages(df)
+    df = df.sort_values(["week", "program"]).reset_index(drop=True)
+    return df[SHRINK_WEEKLY_FIELDS]
+
+
+def _compute_shrink_weekly_percentages(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+    # Ensure required columns exist
+    for c in ("ooo_hours", "ino_hours", "base_hours"):
+        if c not in out.columns:
+            out[c] = 0.0
+    for c in ("ooo_pct", "ino_pct", "overall_pct"):
+        if c not in out.columns:
+            out[c] = np.nan
+
+    base = out["base_hours"].replace({0.0: np.nan})
+    # Compute hours from pct if needed
+    mask_base_missing = base.isna() & out["overall_pct"].notna()
+    if mask_base_missing.any():
+        denom = out.loc[mask_base_missing, "overall_pct"].replace({0.0: np.nan})
+        hours_total = out.loc[mask_base_missing, "ooo_hours"].fillna(0) + out.loc[mask_base_missing, "ino_hours"].fillna(0)
+        out.loc[mask_base_missing, "base_hours"] = np.where(denom.notna(), hours_total * 100.0 / denom, np.nan)
+        base = out["base_hours"].replace({0.0: np.nan})
+
+    out["ooo_pct"] = np.where(out["ooo_pct"].notna(), out["ooo_pct"], np.where(base.gt(0), (out["ooo_hours"].fillna(0) / base) * 100.0, np.nan))
+    out["ino_pct"] = np.where(out["ino_pct"].notna(), out["ino_pct"], np.where(base.gt(0), (out["ino_hours"].fillna(0) / base) * 100.0, np.nan))
+    out["overall_pct"] = np.where(out["overall_pct"].notna(), out["overall_pct"],
+                                   np.where(base.gt(0), ((out["ooo_hours"].fillna(0) + out["ino_hours"].fillna(0)) / base) * 100.0, np.nan))
+
+    out["ooo_hours"] = out["ooo_hours"].fillna(0.0)
+    out["ino_hours"] = out["ino_hours"].fillna(0.0)
+    out["base_hours"] = out["base_hours"].fillna(0.0)
+    out["ooo_pct"] = out["ooo_pct"].fillna(0.0)
+    out["ino_pct"] = out["ino_pct"].fillna(0.0)
+    out["overall_pct"] = out["overall_pct"].fillna(0.0)
+    # Display-friendly rounding to 1 decimal
+    for c in ("ooo_hours","ino_hours","base_hours","ooo_pct","ino_pct","overall_pct"):
+        if c in out.columns:
+            try:
+                out[c] = pd.to_numeric(out[c], errors="coerce").fillna(0.0).round(1)
+            except Exception:
+                pass
+    return out
+
+# ---------- BRID enrichment using headcount ----------
+def enrich_with_manager(df: pd.DataFrame) -> pd.DataFrame:
+    """Add Team Manager/Manager BRID to a wide or long roster using BRID mapping."""
+    if df is None or df.empty:
+        return df
+    try:
+        mgr = brid_manager_map()  # columns: brid, line_manager_brid, line_manager_full_name
+    except Exception:
+        return df
+    if mgr is None or mgr.empty:
+        return df
+
+    out = df.copy()
+    L = {str(c).lower(): c for c in out.columns}
+    brid_col = L.get("brid") or L.get("employee id") or L.get("employee_id") or ("BRID" if "BRID" in out.columns else None)
+    if not brid_col:
+        return out
+
+    out = out.merge(mgr, left_on=brid_col, right_on="brid", how="left")
+    if "Team Manager" not in out.columns:
+        out["Team Manager"] = out["line_manager_full_name"]
+    else:
+        out["Team Manager"] = out["Team Manager"].fillna(out["line_manager_full_name"])
+    if "Manager BRID" not in out.columns:
+        out["Manager BRID"] = out["line_manager_brid"]
+    return out.drop(columns=["brid", "line_manager_full_name", "line_manager_brid"], errors="ignore")
+
+# ===== Headcount-only helpers (Scope) =====
+def _hcu_df() -> pd.DataFrame:
+    try:
+        df = load_headcount()
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+def _hcu_cols(df: pd.DataFrame) -> dict:
+    """
+    Column resolver (case-insensitive) for the Headcount Update file.
+      - ba: Journey / Business Area (a.k.a. Vertical)
+      - sba: Level 3 (Sub Business Area)
+      - loc: Country / Location
+      - site: Building / Site
+      - lob: Channel / Program if present (fallback handled later)
+    """
+    L = {str(c).strip().lower(): c for c in df.columns}
+
+    ba = (
+        L.get("journey")
+        or L.get("business area")
+        or L.get("vertical")
+        or L.get("current org unit description")
+        or L.get("current_org_unit_description")
+        or L.get("level 0")
+        or L.get("level_0")
+    )
+    sba = (
+        L.get("level 3")
+        or L.get("level_3")
+        or L.get("sub business area")
+        or L.get("sub_business_area")
+    )
+    loc = (
+        L.get("position_location_country")
+        or L.get("location country")
+        or L.get("location_country")
+        or L.get("country")
+        or L.get("location")
+    )
+    site = (
+        L.get("position_location_building_description")
+        or L.get("building description")
+        or L.get("building")
+        or L.get("site")
+    )
+    lob = (
+        L.get("lob")
+        or L.get("channel")
+        or L.get("program")
+        or L.get("position group")
+        or L.get("position_group")
+    )
+    return {"ba": ba, "sba": sba, "loc": loc, "site": site, "lob": lob}
+
+CHANNEL_LIST = ["Voice", "Back Office", "Outbound", "Blended", "Chat", "MessageUs"]
+
+def _bas_from_headcount() -> List[str]:
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    if not C["ba"]:
+        return []
+    vals = (
+        df[C["ba"]]
+        .dropna().astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+def _sbas_from_headcount(ba: str) -> List[str]:
+    if not ba:
+        return []
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    if not (C["ba"] and C["sba"]):
+        return []
+    dff = df[[C["ba"], C["sba"]]].dropna()
+    dff = dff[dff[C["ba"]].astype(str).str.strip().str.lower() == str(ba).strip().lower()]
+    vals = (
+        dff[C["sba"]]
+        .astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+def _lobs_for_ba_sba(ba: str, sba: str) -> List[str]:
+    """If headcount has a LOB/Channel column, use it; else fall back to fixed list."""
+    if not (ba and sba):
+        return []
+    df = _hcu_df()
+    if df.empty: return CHANNEL_LIST
+    C = _hcu_cols(df)
+    if not (C["ba"] and C["sba"] and C["lob"]):
+        return CHANNEL_LIST
+    dff = df[[C["ba"], C["sba"], C["lob"]]].dropna()
+    mask = (
+        dff[C["ba"]].astype(str).str.strip().str.lower().eq(str(ba).strip().lower()) &
+        dff[C["sba"]].astype(str).str.strip().str.lower().eq(str(sba).strip().lower())
+    )
+    vals = (
+        dff.loc[mask, C["lob"]]
+        .astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return CHANNEL_LIST
+
+def _locations_for_ba(ba: str) -> List[str]:
+    if not ba:
+        return []
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    if not (C["ba"] and C["loc"]):
+        return []
+    dff = df[[C["ba"], C["loc"]]].dropna()
+    dff = dff[dff[C["ba"]].astype(str).str.strip().str.lower() == str(ba).strip().lower()]
+    vals = (
+        dff[C["loc"]]
+        .astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+def _sites_for_ba_location(ba: str, location: str | None) -> List[str]:
+    if not ba:
+        return []
+    df = _hcu_df()
+    if df.empty:
+        return []
+    C = _hcu_cols(df)
+    if not (C["ba"] and C["site"]):
+        return []
+    dff = df[df[C["ba"]].astype(str).str.strip().str.lower() == str(ba).strip().lower()]
+    if C["loc"] and location:
+        dff = dff[dff[C["loc"]].astype(str).str.strip().str.lower() == str(location).strip().lower()]
+    vals = (
+        dff[C["site"]]
+        .dropna().astype(str).str.strip().replace({"": np.nan})
+        .dropna().drop_duplicates().sort_values()
+    )
+    return vals.tolist()
+
+# ---------------------- MAIN LAYOUT (unchanged shell) ----------------------
+def _planning_ids_skeleton():
+    return html.Div([
+        dcc.Store(id="ws-status"),
+        dcc.Store(id="ws-selected-ba"),
+        dcc.Store(id="ws-refresh"),
+    ], style={"display": "none"})
+
+# ---------------------- Demo data for Home ----------------------
+DEFAULT_SETTINGS = dict(
+    interval_minutes=30, hours_per_fte=8.0, shrinkage_pct=0.30, target_sl=0.80,
+    sl_seconds=20, occupancy_cap_voice=0.85, util_bo=0.85, util_ob=0.85,
+)
+
+if not load_defaults():
+    save_defaults(DEFAULT_SETTINGS)
+
+projects_df  = make_projects_sample()
+voice_df     = make_voice_sample(DEFAULT_SETTINGS["interval_minutes"], days=7)
+bo_df        = make_backoffice_sample(days=7)
+ob_df        = make_outbound_sample(days=7)
+roster_demo  = make_roster_sample()
+hiring_demo  = make_hiring_sample()
+shrink_demo  = make_shrinkage_sample()
+attr_demo    = make_attrition_sample()
+
+req_df = required_fte_daily(voice_df, bo_df, ob_df, DEFAULT_SETTINGS)
+sup_df = supply_fte_daily(roster_demo, hiring_demo)
+understaffed = understaffed_accounts_next_4w(req_df, sup_df)
+hire_lw, hire_tw, hire_nw = kpi_hiring(hiring_demo)
+shr_last4, shr_next4 = kpi_shrinkage(shrink_demo)
+attr_last4, attr_next4 = _last_next_4(attr_demo, "week", "attrition_pct")
+
+# ---------------------- Helpers (templates & normalizers) ----------------------
+ATTRITION_RAW_COLUMNS = [
+    "Reporting Full Date","BRID","Employee Name","Operational Status",
+    "Corporate Grade Description","Employee Email Address","Employee Position",
+    "Position Description","Employee Line Manager Indicator","Length of Service Date",
+    "Cost Centre","Line Manager BRID","Line Manager Name","IMH L05","IMH L06","IMH L07",
+    "Org Unit","Org Unit ID","Employee Line Manager lvl 07","Employee Line Manager lvl 08",
+    "Employee Line Manager lvl 09","City","Building","Gender Description",
+    "Voluntary Involuntary Exit Description","Resignation Date","Employee Contract HC",
+    "HC","FTE"
+]
+
+HC_COLUMNS = [
+    "Level 0","Level 1","Level 2","Level 3","Level 4","Level 5","Level 6",
+    "BRID","Full Name","Position Description","Headcount Operational Status Description",
+    "Employee Group Description","Corporate Grade Description","Line Manager BRID","Line Manager Full Name",
+    "Current Organisation Unit","Current Organisation Unit Description",
+    "Position Location Country","Position Location City","Position Location Building Description",
+    "CCID","CC Name","Journey","Position Group"
+]
+def headcount_template_df(rows: int = 5) -> pd.DataFrame:
+    sample = [
+        ["BUK","COO","Business Services","BFA","Refers","","","IN0001","Asha Rao","Agent","Active","FT","BA4","IN9999","Priyanka Menon","Ops|BFA|Refers","Ops BFA Refers","India","Chennai","DLF IT Park","12345","Complaints","Onboarding","Onboarding","Agent"],
+        ["BUK","COO","Business Services","BFA","Appeals","","","IN0002","Rahul Jain","Team Leader","Active","FT","BA5","IN8888","Arjun Mehta","Ops|BFA|Appeals","Ops BFA Appeals","India","Pune","EON Cluster C","12345","Complaints","Onboarding","Onboarding","Team Leader"],
+    ]
+    df = pd.DataFrame(sample[:rows], columns=HC_COLUMNS)
+    if rows > len(sample):
+        df = pd.concat([df, pd.DataFrame(columns=HC_COLUMNS)], ignore_index=True)
+    return df
+
+# === New combined templates (as requested) ===
+def voice_forecast_template_df():
+    return pd.DataFrame([{
+        "Date": date.today().isoformat(),
+        "Interval": "09:00",
+        "Forecast Volume": 120,
+        "Forecast AHT": 300,
+        "Business Area": "Retail Banking",
+        "Sub Business Area": "Cards",
+        "Channel": "Voice",
+    }])
+
+def voice_actual_template_df():
+    return pd.DataFrame([{
+        "Date": date.today().isoformat(),
+        "Interval": "09:00",
+        "Actual Volume": 115,
+        "Actual AHT": 310,
+        "Business Area": "Retail Banking",
+        "Sub Business Area": "Cards",
+        "Channel": "Voice",
+    }])
+
+def bo_forecast_template_df():
+    return pd.DataFrame([{
+        "Date": date.today().isoformat(),
+        "Forecast Volume": 550,
+        "Forecast SUT": 600,
+        "Business Area": "Retail Banking",
+        "Sub Business Area": "Cards",
+        "Channel": "Back Office",
+    }])
+
+def bo_actual_template_df():
+    return pd.DataFrame([{
+        "Date": date.today().isoformat(),
+        "Actual Volume": 520,
+        "Actual SUT": 610,
+        "Business Area": "Retail Banking",
+        "Sub Business Area": "Cards",
+        "Channel": "Back Office",
+    }])
+
+# === Normalizers for new combined sheets ===
+def _norm_voice_combo(df: pd.DataFrame, kind: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date","interval_start","volume"]), pd.DataFrame(columns=["date","interval_start","aht_sec"])
+    L = {str(c).lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            c = L.get(n.lower())
+            if c: return c
+        return None
+
+    date_col = pick("date")
+    intv_col = pick("interval","interval start","intervalstart","time","slot")
+    if kind == "forecast":
+        vol_col = pick("forecast volume","volume")
+        aht_col = pick("forecast aht","aht","aht (sec)")
+    else:
+        vol_col = pick("actual volume","volume")
+        aht_col = pick("actual aht","aht","aht (sec)")
+
+    if not (date_col and intv_col and vol_col and aht_col):
+        return pd.DataFrame(), pd.DataFrame()
+
+    df2 = df[[date_col, intv_col, vol_col, aht_col]].copy()
+    df2.columns = ["date","interval_start","volume","aht_sec"]
+    df2["date"] = pd.to_datetime(df2["date"], errors="coerce").dt.date.astype(str)
+    df2["interval_start"] = df2["interval_start"].astype(str).str.extract(r"(\d{1,2}:\d{2})")[0]
+    df2["volume"] = pd.to_numeric(df2["volume"], errors="coerce").fillna(0)
+    df2["aht_sec"] = pd.to_numeric(df2["aht_sec"], errors="coerce").fillna(0)
+    df2 = df2.dropna(subset=["date","interval_start"])
+    df2 = df2.drop_duplicates(["date","interval_start"], keep="last").sort_values(["date","interval_start"])
+
+    vol_df = df2[["date","interval_start","volume"]].copy()
+    aht_df = df2[["date","interval_start","aht_sec"]].copy()
+    return vol_df, aht_df
+
+def _norm_bo_combo(df: pd.DataFrame, kind: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["date","volume"]), pd.DataFrame(columns=["date","sut_sec"])
+    L = {str(c).lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            c = L.get(n.lower())
+            if c: return c
+        return None
+
+    date_col = pick("date")
+    if kind == "forecast":
+        vol_col = pick("forecast volume","volume")
+        sut_col = pick("forecast sut","sut","sut (sec)")
+    else:
+        vol_col = pick("actual volume","volume")
+        sut_col = pick("actual sut","sut","sut (sec)")
+
+    if not (date_col and vol_col and sut_col):
+        return pd.DataFrame(), pd.DataFrame()
+
+    df2 = df[[date_col, vol_col, sut_col]].copy()
+    df2.columns = ["date","volume","sut_sec"]
+    df2["date"] = pd.to_datetime(df2["date"], errors="coerce").dt.date.astype(str)
+    df2["volume"] = pd.to_numeric(df2["volume"], errors="coerce").fillna(0)
+    df2["sut_sec"] = pd.to_numeric(df2["sut_sec"], errors="coerce").fillna(0)
+    df2 = df2.dropna(subset=["date"]).drop_duplicates(["date"], keep="last").sort_values(["date"])
+
+    vol_df = df2[["date","volume"]].copy()
+    sut_df = df2[["date","sut_sec"]].copy()
+    return vol_df, sut_df
 
 # ---------- Parsing helpers ----------
 def pretty_columns(df_or_cols) -> list[dict]:
@@ -506,1045 +1368,574 @@ def pretty_columns(df_or_cols) -> list[dict]:
     return [{"name": c, "id": c} for c in cols]
 
 def lock_variance_cols(cols):
+    """
+    Return a copy of DataTable column defs with any Variance columns set read-only.
+    Matches on id or header text containing 'variance' (case-insensitive).
+    """
     out = []
     for col in cols:
         c = dict(col)  # copy
         name_txt = c.get("name", "")
-        if isinstance(name_txt, list):  # sometimes headers are multi-line arrays
+        if isinstance(name_txt, list):
             name_txt = " ".join(map(str, name_txt))
         id_txt = str(c.get("id", ""))
         if "variance" in str(name_txt).lower() or "variance" in id_txt.lower():
             c["editable"] = False
         else:
-            # make other columns explicitly editable unless already set
             c.setdefault("editable", True)
         out.append(c)
     return out
 
-def _scope_key(ba, subba, channel):
-    return f"{(ba or '').strip()}|{(subba or '').strip()}|{(channel or '').strip()}"
 
-# ──────────────────────────────────────────────────────────────────────────────
-# helpers shared
-
-def _week_monday(d):  # returns Monday date
-    d = pd.to_datetime(d, errors="coerce").date()
-    return d - pd.Timedelta(days=d.weekday())
-
-# Fullscreen overlay style (centered)
-
-def _settings_for_scope_key(sk: str) -> dict:
-    try:
-        ba, sba, ch = (sk.split("|", 2) + ["",""])[:3]
-    except Exception:
-        ba, sba, ch = "", "", ""
-    return resolve_settings(ba=ba, subba=sba, lob=ch)
-
-def _canon_scope(ba, sba, ch, site=None):
-    """
-    Build canonical scope key. If `site` present -> 4-part, else legacy 3-part.
-    Why: uploads now save per (BA|SubBA|Channel|Site) and plans must read same key.
-    """
-    canon = lambda x: (x or "").strip()
-    if site and str(site).strip():
-        return f"{canon(ba)}|{canon(sba)}|{canon(ch)}|{canon(site)}"
-    return f"{canon(ba)}|{canon(sba)}|{canon(ch)}|{canon(site)}"  # legacy
-
-def _monday(x):
-    s = pd.to_datetime(x, errors="coerce")
-    if isinstance(s, (pd.Series, pd.DatetimeIndex)):
-        if isinstance(s, pd.DatetimeIndex):
-            return (s - pd.to_timedelta(s.weekday, unit="D")).date
-        else:
-            return (s - pd.to_timedelta(s.dt.weekday, unit="D")).dt.date
-    if pd.isna(s):
-        s = pd.Timestamp(dt.date.today())
-    return (s - pd.Timedelta(days=int(s.weekday()))).date()
-
-def _weekly_voice(df):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["week", "vol", "aht"])
-
-    x = df.copy()
-    x["date"] = pd.to_datetime(x["date"], errors="coerce")
-    x = x.dropna(subset=["date"])
-
-    # Week bucket (Monday)
-    x["week"] = _monday(x["date"])
-
-    # Safe numerics
-    x["w"] = pd.to_numeric(x.get("volume"),  errors="coerce").fillna(0.0)
-    x["a"] = pd.to_numeric(x.get("aht_sec"), errors="coerce").fillna(0.0)
-
-    # Weighted-average pieces
-    x["num"] = x["w"] * x["a"]
-
-    g = (
-        x.groupby("week", as_index=False)
-         .agg(vol=("w", "sum"), num=("num", "sum"))
-    )
-    g["aht"] = np.where(g["vol"] > 0, g["num"] / g["vol"], np.nan)
-    g = g.drop(columns=["num"])
-    g["week"] = g["week"].astype(str)
-
-    return g[["week", "vol", "aht"]]
-
-
-def _weekly_bo(df):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["week", "items", "sut"])
-
-    x = df.copy()
-    x["date"] = pd.to_datetime(x["date"], errors="coerce")
-    x = x.dropna(subset=["date"])
-
-    # Week bucket (Monday)
-    x["week"] = _monday(x["date"])
-
-    # Safe numerics (for BO, aht_sec column carries SUT)
-    x["i"] = pd.to_numeric(x.get("items"),   errors="coerce").fillna(0.0)
-    x["s"] = pd.to_numeric(x.get("aht_sec"), errors="coerce").fillna(0.0)
-
-    # Weighted-average pieces
-    x["num"] = x["i"] * x["s"]
-
-    g = (
-        x.groupby("week", as_index=False)
-         .agg(items=("i", "sum"), num=("num", "sum"))
-    )
-    g["sut"] = np.where(g["items"] > 0, g["num"] / g["items"], np.nan)
-    g = g.drop(columns=["num"])
-    g["week"] = g["week"].astype(str)
-
-    return g[["week", "items", "sut"]]
-
-
-# def _assemble_voice(scope_key, which):
-#     vol = load_timeseries(f"voice_{which}_volume", scope_key)
-#     aht = load_timeseries(f"voice_{which}_aht",    scope_key)
-#     if vol is None or vol.empty:
-#         return pd.DataFrame(columns=["date","interval","volume","aht_sec","program"])
-#     df = vol.copy()
-#     if isinstance(aht, pd.DataFrame) and not aht.empty:
-#         df = df.merge(aht, on=["date","interval"], how="left")
-#     if "aht_sec" not in df.columns or df["aht_sec"].isna().all():
-#         s = _settings_for_scope_key(scope_key)
-#         df["aht_sec"] = float(s.get("target_aht", s.get("budgeted_aht", 300)) or 300)
-#     df["program"] = "WFM"
-#     return df[["date","interval","volume","aht_sec","program"]]
-
-# def _assemble_bo(scope_key, which):
-#     vol = load_timeseries(f"bo_{which}_volume", scope_key)
-#     sut = load_timeseries(f"bo_{which}_sut",    scope_key)
-#     if vol is None or vol.empty:
-#         return pd.DataFrame(columns=["date","items","aht_sec","program"])
-#     df = vol.rename(columns={"volume":"items"}).copy()
-#     if isinstance(sut, pd.DataFrame) and not sut.empty:
-#         df = df.merge(sut, on=["date"], how="left")
-#         if "aht_sec" not in df.columns and "sut_sec" in df.columns:
-#             df = df.rename(columns={"sut_sec":"aht_sec"})
-#     if "aht_sec" not in df.columns or df["aht_sec"].isna().all():
-#         s = _settings_for_scope_key(scope_key)
-#         df["aht_sec"] = float(s.get("target_sut", s.get("budgeted_sut", 600)) or 600)
-#     df["program"] = "WFM"
-#     return df[["date","items","aht_sec","program"]]
-
-# def _assemble_voice(scope_key, which):
-#     which = (which or "forecast").strip().lower()
-#     vol = load_timeseries(f"voice_{which}_volume", scope_key)
-#     aht = load_timeseries(f"voice_{which}_aht",    scope_key)
-
-#     # Empty volume → return canonical empty frame
-#     if vol is None or vol.empty:
-#         return pd.DataFrame(columns=["date","interval","volume","aht_sec","program"])
-
-#     # Canonicalize volume
-#     df = vol.copy()
-#     # Allow 'week' instead of 'date'
-#     if "date" not in df.columns and "week" in df.columns:
-#         df["date"] = pd.to_datetime(df["week"], errors="coerce").dt.normalize()
-#     else:
-#         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-#     # Allow alt volume col names
-#     if "volume" not in df.columns:
-#         for alt in ("vol","calls"):
-#             if alt in df.columns:
-#                 df = df.rename(columns={alt: "volume"})
-#                 break
-#     # interval may or may not exist (OK)
-
-#     # Merge AHT if provided
-#     if isinstance(aht, pd.DataFrame) and not aht.empty:
-#         ah = aht.copy()
-#         # Accept week/date and normalize
-#         if "date" not in ah.columns and "week" in ah.columns:
-#             ah["date"] = pd.to_datetime(ah["week"], errors="coerce").dt.normalize()
-#         else:
-#             ah["date"] = pd.to_datetime(ah["date"], errors="coerce").dt.normalize()
-#         # Canonicalize AHT column name(s)
-#         if "aht_sec" not in ah.columns:
-#             for alt in ("aht","avg_aht","aht_seconds"):
-#                 if alt in ah.columns:
-#                     ah = ah.rename(columns={alt: "aht_sec"})
-#                     break
-#         # Pick best join keys available
-#         join_keys = [k for k in ["date","interval"] if k in df.columns and k in ah.columns]
-#         if not join_keys:  # fall back to date-only
-#             join_keys = ["date"]
-#         df = df.merge(ah[[*join_keys, *(["aht_sec"] if "aht_sec" in ah.columns else [])]],
-#                       on=join_keys, how="left")
-
-#     # If still missing AHT, fill from settings defaults
-#     if "aht_sec" not in df.columns or df["aht_sec"].isna().all():
-#         s = _settings_for_scope_key(scope_key)
-#         df["aht_sec"] = float(s.get("target_aht", s.get("budgeted_aht", 300)) or 300)
-
-#     df["program"] = "WFM"
-#     # Ensure canonical columns exist
-#     if "interval" not in df.columns:
-#         df["interval"] = pd.NaT  # keeps downstream code happy if it expects the column
-#     if "volume" not in df.columns:
-#         df["volume"] = 0.0
-
-#     return df[["date","interval","volume","aht_sec","program"]]
-
-
-# def _assemble_bo(scope_key, which):
-#     which = (which or "forecast").strip().lower()
-#     vol = load_timeseries(f"bo_{which}_volume", scope_key)
-#     sut = load_timeseries(f"bo_{which}_sut",    scope_key)
-
-#     if vol is None or vol.empty:
-#         return pd.DataFrame(columns=["date","items","aht_sec","program"])
-
-#     # Canonicalize volume/items
-#     df = vol.copy()
-#     if "date" not in df.columns and "week" in df.columns:
-#         df["date"] = pd.to_datetime(df["week"], errors="coerce").dt.normalize()
-#     else:
-#         df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-#     if "items" not in df.columns:
-#         for alt in ("volume","txns","transactions"):
-#             if alt in df.columns:
-#                 df = df.rename(columns={alt: "items"})
-#                 break
-
-#     # Merge SUT (rename to aht_sec for a common downstream field)
-#     if isinstance(sut, pd.DataFrame) and not sut.empty:
-#         su = sut.copy()
-#         if "date" not in su.columns and "week" in su.columns:
-#             su["date"] = pd.to_datetime(su["week"], errors="coerce").dt.normalize()
-#         else:
-#             su["date"] = pd.to_datetime(su["date"], errors="coerce").dt.normalize()
-#         if "aht_sec" not in su.columns:
-#             for alt in ("sut_sec","sut","aht","avg_sut","sut_seconds"):
-#                 if alt in su.columns:
-#                     su = su.rename(columns={alt: "aht_sec"})
-#                     break
-#         df = df.merge(su[["date","aht_sec"]], on="date", how="left")
-
-#     if "aht_sec" not in df.columns or df["aht_sec"].isna().all():
-#         s = _settings_for_scope_key(scope_key)
-#         df["aht_sec"] = float(s.get("target_sut", s.get("budgeted_sut", 600)) or 600)
-
-#     df["program"] = "WFM"
-#     if "items" not in df.columns:
-#         df["items"] = 0.0
-
-#     return df[["date","items","aht_sec","program"]]
-
-def _assemble_voice(scope_key, which):
-    which = (which or "forecast").strip().lower()
-    vol = _load_ts_with_fallback(f"voice_{which}_volume", scope_key)
-    aht = _load_ts_with_fallback(f"voice_{which}_aht",    scope_key)
-
-    # Empty volume → return canonical empty frame
-    if vol is None or vol.empty:
-        return pd.DataFrame(columns=["date","interval","volume","aht_sec","program"])
-
-    # Canonicalize volume
-    df = vol.copy()
-    # Allow 'week' instead of 'date'
-    if "date" not in df.columns and "week" in df.columns:
-        df["date"] = pd.to_datetime(df["week"], errors="coerce").dt.normalize()
-    else:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-    # Allow alt volume col names
-    if "volume" not in df.columns:
-        for alt in ("vol","calls"):
-            if alt in df.columns:
-                df = df.rename(columns={alt: "volume"})
-                break
-
-    # Merge AHT if provided
-    if isinstance(aht, pd.DataFrame) and not aht.empty:
-        ah = aht.copy()
-        # Accept week/date and normalize
-        if "date" not in ah.columns and "week" in ah.columns:
-            ah["date"] = pd.to_datetime(ah["week"], errors="coerce").dt.normalize()
-        else:
-            ah["date"] = pd.to_datetime(ah["date"], errors="coerce").dt.normalize()
-        # Canonicalize AHT column name(s)
-        if "aht_sec" not in ah.columns:
-            # Tolerant synonyms for uploaded column headers
-            cand_names = (
-                "aht_sec","aht","avg_aht","aht_seconds","aht (sec)",
-                "forecast aht","forecast_aht","forecast aht (sec)",
-                "avg_talk_sec","talk_sec"
-            )
-            low = {str(c).strip().lower(): c for c in ah.columns}
-            picked = None
-            for nm in cand_names:
-                c = low.get(nm)
-                if c:
-                    picked = c; break
-            if picked and picked != "aht_sec":
-                ah = ah.rename(columns={picked: "aht_sec"})
-        # Pick best join keys available
-        join_keys = [k for k in ["date","interval"] if k in df.columns and k in ah.columns]
-        if not join_keys:  # fall back to date-only
-            join_keys = ["date"]
-        df = df.merge(ah[[*join_keys, *(["aht_sec"] if "aht_sec" in ah.columns else [])]],
-                      on=join_keys, how="left")
-
-    # If still missing AHT, fill from settings defaults (BA/SubBA/LOB only)
-    if "aht_sec" not in df.columns or df["aht_sec"].isna().all():
-        s = _settings_for_scope_key(scope_key)  # split first 3 parts internally
-        df["aht_sec"] = float(s.get("target_aht", s.get("budgeted_aht", 300)) or 300)
-
-    df["program"] = "WFM"
-    if "interval" not in df.columns:  # required downstream
-        df["interval"] = pd.NaT
-    if "volume" not in df.columns:
-        df["volume"] = 0.0
-
-    return df[["date","interval","volume","aht_sec","program"]]
-
-def _assemble_bo(scope_key, which):
-    which = (which or "forecast").strip().lower()
-    vol = _load_ts_with_fallback(f"bo_{which}_volume", scope_key)
-    sut = _load_ts_with_fallback(f"bo_{which}_sut",    scope_key)
-
-    if vol is None or vol.empty:
-        return pd.DataFrame(columns=["date","items","aht_sec","program"])
-
-    # Canonicalize volume/items
-    df = vol.copy()
-    if "date" not in df.columns and "week" in df.columns:
-        df["date"] = pd.to_datetime(df["week"], errors="coerce").dt.normalize()
-    else:
-        df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.normalize()
-    if "items" not in df.columns:
-        for alt in ("volume","txns","transactions"):
-            if alt in df.columns:
-                df = df.rename(columns={alt: "items"})
-                break
-
-    # Merge SUT (rename to aht_sec for common field)
-    if isinstance(sut, pd.DataFrame) and not sut.empty:
-        su = sut.copy()
-        if "date" not in su.columns and "week" in su.columns:
-            su["date"] = pd.to_datetime(su["week"], errors="coerce").dt.normalize()
-        else:
-            su["date"] = pd.to_datetime(su["date"], errors="coerce").dt.normalize()
-        if "aht_sec" not in su.columns:
-            for alt in ("sut_sec","sut","aht","avg_sut","sut_seconds"):
-                if alt in su.columns:
-                    su = su.rename(columns={alt: "aht_sec"})
-                    break
-        df = df.merge(su[["date","aht_sec"]], on="date", how="left")
-
-    if "aht_sec" not in df.columns or df["aht_sec"].isna().all():
-        s = _settings_for_scope_key(scope_key)
-        df["aht_sec"] = float(s.get("target_sut", s.get("budgeted_sut", 600)) or 600)
-
-    df["program"] = "WFM"
-    if "items" not in df.columns:
-        df["items"] = 0.0
-    return df[["date","items","aht_sec","program"]]
-
-def _assemble_chat(scope_key, which):
-    which = (which or "forecast").strip().lower()
-    vol = _load_ts_with_fallback(f"chat_{which}_volume", scope_key)
-    aht = _load_ts_with_fallback(f"chat_{which}_aht",    scope_key)
-
-    if vol is None or vol.empty:
-        return pd.DataFrame(columns=["date","items","aht_sec","program"])
-
-    df = vol.copy()
-    # normalize date
-    if "date" not in df.columns and "week" in df.columns:
-        df["date"] = pd.to_datetime(df["week"], errors="coerce").dt.normalize()
-    else:
-        df["date"] = pd.to_datetime(df.get("date"), errors="coerce").dt.normalize()
-    # normalize items column
-    if "items" not in df.columns:
-        for alt in ("chats","volume","txns","transactions","count"):
-            if alt in df.columns:
-                df = df.rename(columns={alt: "items"}); break
-
-    # merge aht if provided
-    if isinstance(aht, pd.DataFrame) and not aht.empty:
-        ah = aht.copy()
-        if "date" not in ah.columns and "week" in ah.columns:
-            ah["date"] = pd.to_datetime(ah["week"], errors="coerce").dt.normalize()
-        else:
-            ah["date"] = pd.to_datetime(ah.get("date"), errors="coerce").dt.normalize()
-        if "aht_sec" not in ah.columns:
-            for alt in ("aht","avg_aht","sut","sut_sec","aht_seconds"):
-                if alt in ah.columns:
-                    ah = ah.rename(columns={alt: "aht_sec"}); break
-        df = df.merge(ah[["date","aht_sec"]], on="date", how="left")
-
-    if "aht_sec" not in df.columns or df["aht_sec"].isna().all():
-        s = _settings_for_scope_key(scope_key)
-        df["aht_sec"] = float(s.get("chat_aht_sec", s.get("target_aht", 240)) or 240)
-
-    df["program"] = "Chat"
-    if "items" not in df.columns:
-        df["items"] = 0.0
-    return df[["date","items","aht_sec","program"]]
-
-def _assemble_ob(scope_key, which):
-    which = (which or "forecast").strip().lower()
-    # Try tolerant keys for OPC/dials and rates
-    opc   = _load_ts_with_fallback(f"ob_{which}_opc",   scope_key)
-    if opc is None or opc.empty:
-        for k in [f"outbound_{which}_opc", f"ob_{which}_dials", f"outbound_{which}_dials", f"ob_{which}_calls"]:
-            tmp = _load_ts_with_fallback(k, scope_key)
-            if isinstance(tmp, pd.DataFrame) and not tmp.empty:
-                opc = tmp; break
-    conn  = _load_ts_with_fallback(f"ob_{which}_connect_rate", scope_key)
-    if conn is None or conn.empty:
-        for k in [f"outbound_{which}_connect_rate", f"ob_{which}_connect%"]:
-            tmp = _load_ts_with_fallback(k, scope_key)
-            if isinstance(tmp, pd.DataFrame) and not tmp.empty:
-                conn = tmp; break
-    rpc   = _load_ts_with_fallback(f"ob_{which}_rpc", scope_key)
-    rpc_r = _load_ts_with_fallback(f"ob_{which}_rpc_rate", scope_key)
-    aht   = _load_ts_with_fallback(f"ob_{which}_aht", scope_key)
-
-    if opc is None or opc.empty:
-        return pd.DataFrame(columns=["date","opc","connect_rate","rpc","rpc_rate","aht_sec","program"])
-
-    # Canonicalize dates
-    d = opc.copy()
-    d["date"] = pd.to_datetime(d["date"] if "date" in d.columns else d.get("week"), errors="coerce").dt.normalize()
-    # Canonicalize OPC column
-    if "opc" not in d.columns:
-        for alt in ("dials","calls","attempts","volume"):
-            if alt in d.columns:
-                d = d.rename(columns={alt: "opc"}); break
-
-    def pick_rate(df, name):
-        if not isinstance(df, pd.DataFrame) or df.empty:
-            return None
-        x = df.copy()
-        x["date"] = pd.to_datetime(x["date"] if "date" in x.columns else x.get("week"), errors="coerce").dt.normalize()
-        # normalize column name
-        cols = {c.lower(): c for c in x.columns}
-        for c in (name, name.replace("_"," "), f"{name}%"):
-            lc = c.lower()
-            if lc in cols:
-                col = cols[lc]
-                x = x.rename(columns={col: name})
-                return x[["date", name]]
-        # If numeric unnamed column, try first non-date
-        for c in x.columns:
-            if c.lower() not in ("date","week"):
-                return x.rename(columns={c: name})[["date", name]]
-        return None
-
-    cr = pick_rate(conn, "connect_rate")
-    rpcr = pick_rate(rpc_r, "rpc_rate")
-
-    if isinstance(rpc, pd.DataFrame) and not rpc.empty:
-        rr = rpc.copy()
-        rr["date"] = pd.to_datetime(rr["date"] if "date" in rr.columns else rr.get("week"), errors="coerce").dt.normalize()
-        cols = {c.lower(): c for c in rr.columns}
-        c_rpc = cols.get("rpc") or cols.get("right party connects") or cols.get("right_party_connects")
-        if c_rpc and c_rpc != "rpc":
-            rr = rr.rename(columns={c_rpc: "rpc"})
-        d = d.merge(rr[["date","rpc"]], on="date", how="left")
-
-    if isinstance(cr, pd.DataFrame):
-        d = d.merge(cr, on="date", how="left")
-    if isinstance(rpcr, pd.DataFrame):
-        d = d.merge(rpcr, on="date", how="left")
-
-    if isinstance(aht, pd.DataFrame) and not aht.empty:
-        ah = aht.copy()
-        ah["date"] = pd.to_datetime(ah["date"] if "date" in ah.columns else ah.get("week"), errors="coerce").dt.normalize()
-        cols = {c.lower(): c for c in ah.columns}
-        c_aht = cols.get("aht_sec") or cols.get("talk_sec") or cols.get("avg_talk_sec") or cols.get("aht")
-        if c_aht and c_aht != "aht_sec":
-            ah = ah.rename(columns={c_aht: "aht_sec"})
-        d = d.merge(ah[["date","aht_sec"]], on="date", how="left")
-
-    d["program"] = "Outbound"
-    # Ensure columns present
-    for c in ["connect_rate","rpc","rpc_rate","aht_sec"]:
-        if c not in d.columns:
-            d[c] = None
-
-    return d[["date","opc","connect_rate","rpc","rpc_rate","aht_sec","program"]]
-
-def _snap_to_monday(value: str | dt.date | None) -> str:
-    if not value:
-        return ""
-    return _monday(value).isoformat()
-
-def _week_span(start_week: str | None, end_week: str | None, fallback_weeks: int = 12) -> list[str]:
-    start = _monday(start_week) if start_week else _monday(dt.date.today())
-    end   = _monday(end_week)   if end_week   else (pd.Timestamp(start) + pd.Timedelta(weeks=fallback_weeks-1)).date()
-    if end < start:
-        start, end = end, start
-    weeks = []
-    cur = pd.Timestamp(start)
-    stop = pd.Timestamp(end)
-    while cur <= stop:
-        weeks.append(cur.date().isoformat())
-        cur += pd.Timedelta(weeks=1)
-    return weeks
-
-def _week_cols(weeks: list[str]):
-    today = dt.date.today()
-    cols = [{"name": "Metric", "id": "metric", "editable": False}]
-    week_ids: list[str] = []
-    for w in weeks:
-        wd = pd.to_datetime(w, errors="coerce")
-        if pd.isna(wd):
-            continue
-        if not isinstance(wd, pd.Timestamp):
-            wd = pd.Timestamp(wd)
-        d = wd.date()
-        tag = "Actual" if d <= today else "Plan"
-        cols.append({"name": f"{tag}\n{d.strftime('%m/%d/%y')}", "id": d.isoformat()})
-        week_ids.append(d.isoformat())
-    return cols, week_ids
-
-def _month_cols(weeks: list[str]):
-    today = dt.date.today()
-    # derive month starts covering the span of given week Mondays
-    dts = [pd.to_datetime(w, errors="coerce") for w in weeks]
-    dts = [pd.Timestamp(d) for d in dts if not pd.isna(d)]
-    if not dts:
-        return _week_cols(weeks)
-    start = min(dts).to_period("M").to_timestamp()
-    end   = max(dts).to_period("M").to_timestamp()
-    months = []
-    cur = start
-    while cur <= end:
-        months.append(cur.date())
-        cur = (cur + pd.offsets.MonthBegin(1))
-    cols = [{"name": "Metric", "id": "metric", "editable": False}]
-    ids  = []
-    for m in months:
-        base = dt.date(m.year, m.month, 1)
-        tag = "Actual" if base <= dt.date(today.year, today.month, 1) else "Plan"
-        cols.append({"name": f"{tag}\n{m.strftime('%b %Y')}", "id": base.isoformat()})
-        ids.append(base.isoformat())
-    return cols, ids
-
-def _blank_grid(metrics: List[str], week_ids: List[str]) -> pd.DataFrame:
-    rows = []
-    for m in metrics:
-        r = {"metric": m}
-        for wid in week_ids:
-            r[wid] = 0.0
-        rows.append(r)
-    return pd.DataFrame(rows)
-
-def _load_or_blank(key: str, metrics: List[str], week_ids: List[str]) -> pd.DataFrame:
-    df = load_df(key)
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        for wid in week_ids:
-            if wid not in df.columns:
-                df[wid] = 0.0
-        if "metric" not in df.columns:
-            df.insert(0, "metric", metrics[: len(df)])
-        return df[["metric"] + week_ids].copy()
-    return _blank_grid(metrics, week_ids)
-
-def _round_week_cols_int(df: pd.DataFrame, week_ids: list[str]) -> pd.DataFrame:
-    """Round all weekly numeric columns to integers (no decimals) for display."""
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-    out = df.copy()
-    for wid in week_ids:
-        if wid in out.columns:
-            out[wid] = pd.to_numeric(out[wid], errors="coerce").fillna(0).round(0).astype(int)
-    return out
-
-
-# def _save_table(pid: int, tab_key: str, df: pd.DataFrame):
-#     save_df(f"plan_{pid}_{tab_key}", df if isinstance(df, pd.DataFrame) else pd.DataFrame())
-
-DEBUG_STORAGE_TRACE = True # flip to False to silence
-def _trace(msg: str) -> None:
-    if DEBUG_STORAGE_TRACE:
-        print(msg)
-
-def _save_table(pid: str | int, suffix: str, df: pd.DataFrame) -> None:
-    """Centralized writer for plan tables (adds debug tracing)."""
-    key = f"plan_{pid}_{suffix}"
-    try:
-        n = len(df) if isinstance(df, pd.DataFrame) else -1
-    except Exception:
-        n = -1
-    _trace(f"[SAVE_TABLE] key={key} rows={n}")
-    save_df(key, pd.DataFrame(df))
-
-# ──────────────────────────────────────────────────────────────────────────────
-# roster / bulk columns
-
-def _roster_columns() -> List[dict]:
-    names = [
-        ("BRID", "brid"), ("Name", "name"), ("Class Reference", "class_ref"),
-        ("Work Status", "work_status"), ("Role", "role"),
-        ("FT/PT Status", "ftpt_status"), ("FT/PT Hours", "ftpt_hours"),
-        ("Current Status", "current_status"),
-        ("Training Start", "training_start"), ("Training End", "training_end"),
-        ("Nesting Start", "nesting_start"), ("Nesting End", "nesting_end"),
-        ("Production Start", "production_start"), ("Terminate Date", "terminate_date"),
-        ("Team Leader", "team_leader"), ("AVP", "avp"),
-        ("Business Area", "biz_area"), ("Sub Business Area", "sub_biz_area"),
-        ("LOB", "lob"), ("LOA Date", "loa_date"), ("Back from LOA Date", "back_from_loa_date"),
-        ("Site", "site"),
-    ]
-    cols = []
-    for n, cid in names:
-        cols.append({"name": n, "id": cid, "presentation": "input"})
-    return cols
-
-def _bulkfile_columns() -> List[dict]:
-    return [
-        {"name": "File Name", "id": "file_name"},
-        {"name": "Extension", "id": "ext"},
-        {"name": "File Size (in KB)", "id": "size_kb", "type": "numeric"},
-        {"name": "Is Valid✅", "id": "is_valid"},
-        {"name": "File Status", "id": "status"},
-    ]
-
-_ROSTER_REQUIRED_IDS = [c["id"] for c in _roster_columns()]
-
-# plan_detail/_common.py
-
-
-
-def _load_or_empty_bulk_files(pid: int) -> pd.DataFrame:
-    cols = [c["id"] for c in _bulkfile_columns()]
-
-    # sensible defaults for an empty grid
-    empty = pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
-    if "size_kb" in empty.columns:
-        empty["size_kb"] = empty["size_kb"].astype("float64")
-
-    try:
-        df = load_df(f"plan_{pid}_bulk_files")
-    except Exception:
-        # covers pandas.errors.EmptyDataError and any bad/corrupt payloads
-        return empty
-
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        # ensure required columns exist and types align
-        for c in cols:
-            if c not in df.columns:
-                df[c] = "" if c != "size_kb" else 0.0
-        # coerce size_kb numeric
-        if "size_kb" in df.columns:
-            df["size_kb"] = pd.to_numeric(df["size_kb"], errors="coerce").fillna(0.0)
-        return df[cols].copy()
-
-    return empty
-
-
-def _load_or_empty_notes(pid: int) -> pd.DataFrame:
-    """Notes table: always return a DF with ['when','user','note'] and handle empty payloads."""
-    cols = ["when", "user", "note"]
-
-    # canonical empty frame (preserve dtypes)
-    empty = pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
-
-    try:
-        df = load_df(f"plan_{pid}_notes")
-    except Exception:
-        # covers pandas.errors.EmptyDataError and other corrupt/empty payloads
-        return empty
-
-    if isinstance(df, pd.DataFrame) and not df.empty:
-        # ensure required columns exist
-        for c in cols:
-            if c not in df.columns:
-                df[c] = ""
-        # keep only expected columns / order
-        return df[cols].copy()
-
-    return empty
-
-
-def _enrich_roster_from_headcount(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Fill missing Team Leader and AVP (and optionally BA/SubBA/Site) from Headcount via BRID.
-    - team_leader: headcount.line_manager_full_name for the employee BRID
-    - avp:         two-hop -> the employee's manager's line_manager_full_name
-    - biz_area:    headcount.journey
-    - sub_biz_area:headcount.level_3
-    - site:        headcount.position_location_building_description
-
-    Only fills when target cells are empty/blank. Safe when headcount is empty.
-    """
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-
-    try:
-        hc = load_headcount()
-    except Exception:
-        hc = pd.DataFrame()
-    if not isinstance(hc, pd.DataFrame) or hc.empty:
-        return df
-
-    H = {str(c).strip().lower(): c for c in hc.columns}
-    def pick(name: str, *alts: str) -> str | None:
-        for n in (name, *alts):
-            c = H.get(str(n).strip().lower())
-            if c:
-                return c
-        return None
-
-    c_brid   = pick("brid")
-    c_lm_b   = pick("line_manager_brid", "manager_brid", "tl_brid")
-    c_lm_n   = pick("line_manager_full_name", "manager_name", "tl_name", "team_manager")
-    c_ba     = pick("journey", "business area", "vertical", "current_org_unit_description")
-    c_sba    = pick("level_3", "sub business area", "sub_business_area")
-    c_site   = pick("position_location_building_description", "building", "site")
-
-    if not c_brid:
-        return df
-
-    # Build maps
-    hc2 = hc[[c_brid] + [c for c in [c_lm_b, c_lm_n, c_ba, c_sba, c_site] if c]].copy()
-    for c in hc2.columns:
-        if hc2[c].dtype == object:
-            hc2[c] = hc2[c].astype(str).str.strip()
-
-    lm_brid_by_emp = dict(zip(hc2[c_brid], hc2[c_lm_b] if c_lm_b else [None]*len(hc2)))
-    lm_name_by_emp = dict(zip(hc2[c_brid], hc2[c_lm_n] if c_lm_n else [None]*len(hc2)))
-    ba_by_emp      = dict(zip(hc2[c_brid], hc2[c_ba] if c_ba else [None]*len(hc2)))
-    sba_by_emp     = dict(zip(hc2[c_brid], hc2[c_sba] if c_sba else [None]*len(hc2)))
-    site_by_emp    = dict(zip(hc2[c_brid], hc2[c_site] if c_site else [None]*len(hc2)))
-
-    def _avp_for(brid: str) -> str | None:
-        tlb = (lm_brid_by_emp.get(brid) or "").strip()
-        if not tlb:
-            return None
-        # manager's manager full name
-        return (lm_name_by_emp.get(tlb) or None)
-
-    out = df.copy()
-    L = {str(c).strip().lower(): c for c in out.columns}
-    col_brid = L.get("brid")
-    col_tl   = L.get("team_leader")
-    col_avp  = L.get("avp")
-    col_ba   = L.get("biz_area")
-    col_sba  = L.get("sub_biz_area")
-    col_site = L.get("site")
-
-    if not col_brid:
-        return out
-
-    # Normalize types
-    out[col_brid] = out[col_brid].astype(str).str.strip()
-    for c in [col_tl, col_avp, col_ba, col_sba, col_site]:
-        if c and out[c].dtype == object:
-            out[c] = out[c].astype(str)
-
-    # Fill Team Leader
-    if col_tl:
-        mask_tl = out[col_tl].astype(str).str.strip().eq("")
-        out.loc[mask_tl, col_tl] = out.loc[mask_tl, col_brid].map(lambda b: (lm_name_by_emp.get(b) or ""))
-
-    # Fill AVP (two-hop via manager's manager)
-    if col_avp:
-        mask_avp = out[col_avp].astype(str).str.strip().eq("")
-        out.loc[mask_avp, col_avp] = out.loc[mask_avp, col_brid].map(lambda b: (_avp_for(b) or ""))
-
-    # Fill hierarchy helpers if blank
-    if col_ba:
-        mask_ba = out[col_ba].astype(str).str.strip().eq("")
-        out.loc[mask_ba, col_ba] = out.loc[mask_ba, col_brid].map(lambda b: (ba_by_emp.get(b) or ""))
-    if col_sba:
-        mask_sba = out[col_sba].astype(str).str.strip().eq("")
-        out.loc[mask_sba, col_sba] = out.loc[mask_sba, col_brid].map(lambda b: (sba_by_emp.get(b) or ""))
-    if col_site:
-        mask_site = out[col_site].astype(str).str.strip().eq("")
-        out.loc[mask_site, col_site] = out.loc[mask_site, col_brid].map(lambda b: (site_by_emp.get(b) or ""))
-
-    return out
-
-
-def _parse_upload(contents: str, filename: str) -> Tuple[pd.DataFrame, dict]:
-    if not contents or not filename:
-        return pd.DataFrame(), {}
-    try:
-        header, b64 = contents.split(",", 1)
-    except ValueError:
-        return pd.DataFrame(), {"file_name": filename, "ext": "", "size_kb": 0, "is_valid": "No", "status": "Invalid format"}
-
-    raw = base64.b64decode(b64)
-    ext = filename.split(".")[-1].lower()
-    try:
-        if ext in ("csv",):
-            df = pd.read_csv(io.BytesIO(raw))
-        elif ext in ("xlsx","xls"):
-            df = pd.read_excel(io.BytesIO(raw))
-        else:
-            return pd.DataFrame(), {"file_name": filename, "ext": ext, "size_kb": round(len(raw)/1024,1),
-                                    "is_valid": "No", "status": "Unsupported"}
-    except Exception:
-        return pd.DataFrame(), {"file_name": filename, "ext": ext, "size_kb": round(len(raw)/1024,1),
-                                "is_valid": "No", "status": "Read Error"}
-
-    rename_map = {c["name"]: c["id"] for c in _roster_columns()}
-    lower_map = {k.lower(): v for k,v in rename_map.items()}
-    df = df.rename(columns={col: lower_map.get(str(col).lower(), col) for col in df.columns})
-
-    # Treat Team Leader + AVP as optional; we can enrich them from Headcount by BRID
-    optional_ids = {"team_leader", "avp"}
-    missing_all = [cid for cid in _ROSTER_REQUIRED_IDS if cid not in df.columns]
-    missing_req = [cid for cid in missing_all if cid not in optional_ids]
-
-    valid = len(missing_req) == 0
-    status_msg = "Loaded" if valid else f"Missing: {', '.join(missing_req[:3])}"
-    ledger = {"file_name": filename, "ext": ext, "size_kb": round(len(raw)/1024,1),
-              "is_valid": "Yes" if valid else "No", "status": status_msg}
-    if not valid:
-        return pd.DataFrame(), ledger
-
-    # Ensure optional columns exist even if not provided
-    for opt in optional_ids:
-        if opt not in df.columns:
-            df[opt] = ""
-
-    # Keep known columns, create any other missing ones as empty to satisfy downstream order
-    for cid in _ROSTER_REQUIRED_IDS:
-        if cid not in df.columns:
-            df[cid] = ""
-    df = df[_ROSTER_REQUIRED_IDS].copy()
-    for col in df.columns:
-        if df[col].dtype == object:
-            df[col] = df[col].astype(str).str.strip()
-
-    # Enrich missing TL/AVP (and a few hierarchy hints) from Headcount via BRID
-    df = _enrich_roster_from_headcount(df)
-    return df, ledger
-
-def _format_crumb(p: dict) -> str:
-    ba  = (p.get("business_area") or p.get("plan_ba") or p.get("ba") or p.get("vertical") or "").strip()
-    sba = (p.get("sub_business_area") or p.get("plan_sub_ba") or p.get("sub_ba") or p.get("subba") or "").strip()
-    lob = (p.get("lob") or p.get("channel") or "").strip()
-    if lob:
-        lob = lob.title()
-    site = (p.get("site") or "").strip()
-    parts = [x for x in [ba, sba, lob, site] if x]
-    return " > ".join(parts)
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW: Build BA -> Sub-BA (Level 3) and Sites from Headcount Update only
-
-def _load_hcu_df() -> pd.DataFrame:
-    try:
-        df = load_headcount()
-        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
-    except Exception:
+def parse_upload(contents, filename) -> pd.DataFrame:
+    if not contents:
         return pd.DataFrame()
-
-def _build_hierarchy_sites_from_headcount() -> tuple[dict[str, list[str]], list[str]]:
-    df = _load_hcu_df()
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return {}, []
-
-    L = {str(c).strip().lower(): c for c in df.columns}
-
-    ba_col   = L.get("journey") or L.get("business area") or L.get("vertical") \
-               or L.get("current_org_unit_description") or L.get("current org unit description") \
-               or L.get("current_org_unit") or L.get("current org unit") \
-               or L.get("level_0") or L.get("level 0")
-    sba_col  = L.get("level_3") or L.get("level 3") or L.get("sub business area") or L.get("sub_business_area")
-    site_col = L.get("position_location_building_description") or L.get("building") \
-               or L.get("building description") or L.get("site")
-
-    hmap: dict[str, set[str]] = {}
-    if ba_col:
-        for _, r in df.iterrows():
-            ba = str(r.get(ba_col, "")).strip()
-            if not ba:
-                continue
-            sba_val = str(r.get(sba_col, "")).strip() if sba_col else ""
-            hmap.setdefault(ba, set())
-            if sba_val:
-                hmap[ba].add(sba_val)
-
-    out_hmap = {ba: sorted(list(subs)) for ba, subs in hmap.items()}
-    sites: list[str] = []
-    if site_col:
-        s = (
-            df[site_col].dropna().astype(str).str.strip().replace({"": np.nan}).dropna().unique().tolist()
-        )
-        sites = sorted(set(s))
-    return out_hmap, sites
-
-def _hier_from_hcu() -> dict:
-    hmap, sites = _build_hierarchy_sites_from_headcount()  # {BA: [SubBAs]}, [sites]
-    bas = sorted(hmap.keys())
-    sub_map = {ba: sorted(list(subs or [])) for ba, subs in (hmap or {}).items()}
-
-    lob_map = {}
-    for ba, subs in sub_map.items():
-        for sba in subs:
-            lob_map[f"{ba}|{sba}"] = list(CHANNEL_DEFAULTS)
-
-    return {"ba": bas, "subba": sub_map, "lob": lob_map, "site": sorted(sites or [])}
-
-# ──────────────────────────────────────────────────────────────────────────────
-# NEW: generic weekly loaders & small parsers
-
-# def _first_non_empty_ts(scope_key: str, keys: list[str]) -> pd.DataFrame:
-#     """Return the first non-empty timeseries DF for any of the given keys."""
-#     for k in keys:
-#         try:
-#             df = load_timeseries(k, scope_key)
-#             if isinstance(df, pd.DataFrame) and not df.empty:
-#                 return df.copy()
-#         except Exception:
-#             pass
-#     return pd.DataFrame()
-
-def _first_non_empty_ts(scope_key: str, keys: list[str]) -> pd.DataFrame:
-    """Return the first non-empty timeseries DF for any of the given keys (4→3 fallback)."""
-    for k in keys:
-        df = _load_ts_with_fallback(k, scope_key)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df.copy()
-    return pd.DataFrame()
-
-def _strip_site(scope_key: str) -> str:
-    """Return the 3-part (BA|SubBA|Channel) from a 4-part key; else identity."""
-    parts = (scope_key or "").split("|")
-    return "|".join(parts[:3]) if len(parts) >= 4 else scope_key
-
-def _load_ts_with_fallback(ts_key: str, scope_key: str):
-    """
-    Try timeseries with 4-part key; if empty and key has site, retry with 3-part.
-    Why: allows reading both new (site) and legacy data seamlessly.
-    """
     try:
-        df = load_timeseries(ts_key, scope_key)
-        if isinstance(df, pd.DataFrame) and not df.empty:
-            return df
+        _, content_string = contents.split(',', 1)
+        data = base64.b64decode(content_string)
+        if filename and filename.lower().endswith(".csv"):
+            # Avoid DtypeWarning by scanning full columns
+            return pd.read_csv(io.StringIO(data.decode("utf-8")), low_memory=False)
+        if filename and filename.lower().endswith((".xls", ".xlsx", ".xlsm")):
+            return pd.read_excel(io.BytesIO(data))
     except Exception:
         pass
-    sk3 = _strip_site(scope_key)
-    if sk3 != scope_key:
-        try:
-            df = load_timeseries(ts_key, sk3)
-            if isinstance(df, pd.DataFrame) and not df.empty:
-                return df
-        except Exception:
-            pass
     return pd.DataFrame()
 
-def _weekly_reduce(df: pd.DataFrame, value_candidates=("value","hc","headcount","hours","items","volume","count","amt","amount"),
-                   how: str = "sum") -> dict:
-    if not isinstance(df, pd.DataFrame) or df.empty:
-        return {}
-    date_col = None
-    for c in ("date","dt","day","when"):
-        if c in df.columns:
-            date_col = c
-            break
-    if not date_col:
-        # try to cast an index to dates
-        if isinstance(df.index, (pd.DatetimeIndex, pd.Index)):
-            df = df.reset_index().rename(columns={df.columns[0]:"date"})
-            date_col = "date"
-        else:
-            return {}
-    val_col = None
-    for c in value_candidates:
-        if c in df.columns:
-            val_col = c
-            break
-    if not val_col:
-        # single numeric column fallback
-        nums = [c for c in df.columns if c != date_col and np.issubdtype(df[c].dtype, np.number)]
-        if nums:
-            val_col = nums[0]
-        else:
-            return {}
+# ---------------------- UI Fragments (left intact) ----------------------
+def header_bar():
+    return dbc.Navbar(
+        dbc.Container([
+            dbc.Button("☰", id="btn-burger-top", color="link", className="me-3", n_clicks=0,
+                       style={"fontSize":"24px","textDecoration":"none"}),
+            html.Span(style={"fontSize":"28px","fontWeight":800}),
+            dbc.Breadcrumb(
+                id="ws-breadcrumb",
+                items=[{"label": "Home", "href": "/", "active": True}],
+                className="mb-0 ms-3 flex-grow-1"
+            ),
+            dbc.Nav([dcc.Link(SYSTEM_NAME, href="/", className="nav-link") ], className="ms-auto"),
+        ], fluid=True),
+        className="mb-0", sticky="top", style={"backgroundColor":"white"}
+    )
 
-    d = df[[date_col, val_col]].copy()
-    d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
-    d = d.dropna(subset=[date_col])
-    d["week"] = (d[date_col] - pd.to_timedelta(d[date_col].dt.weekday, unit="D")).dt.date.astype(str)
-    d[val_col] = pd.to_numeric(d[val_col], errors="coerce").fillna(0.0)
+def tile(label: str, emoji: str, href: str):
+    return dcc.Link(
+        html.Div([html.Span(emoji, className="circle"), html.Div(label, className="label")], className="cap-tile"),
+        href=href, style={"textDecoration":"none","color":"inherit"}
+    )
 
-    if how == "mean":
-        s = d.groupby("week", as_index=False)[val_col].mean().set_index("week")[val_col]
+def left_capability_panel():
+    return html.Div([
+        html.H5("CAPACITY CONNECT"),
+        dbc.Row([
+            dbc.Col(tile("Forecasting Workspace","📈","/forecast"), width=6),
+            dbc.Col(tile("Planning Workspace","📅","/planning"), width=6),
+            dbc.Col(tile("Budget","💰","/budget"), width=6),
+            dbc.Col(tile("Operational Dashboard","📊","/ops"), width=6),
+        ], className="ghani"),
+        
+        dbc.Row([
+            dbc.Col(tile("New Hire Summary","🧑‍🎓","/newhire"), width=6),
+            dbc.Col(tile("Employee Roster","🗂️","/roster"), width=6),
+            dbc.Col(tile("Planner Dataset","🧮","/dataset"), width=6),
+            dbc.Col(tile("Default Settings","⚙️","/settings"), width=6),
+        ], className="ghani"),
+        dbc.Row([
+            dbc.Col(tile("Upload Shrinkage & Attrition","📤","/shrink"), width=6),
+            dbc.Col(tile("Help & Docs","ℹ️","/help"), width=6),
+        ], className="ghani"),
+    ], style={"padding":"12px","borderRadius":"12px","background":"#fff","boxShadow":"0 2px 8px rgba(0,0,0,.06)", "minHeight": "100%"})
+
+def center_projects_table():
+    """Render the Home table with empty data; a callback fills the data.
+    This avoids shipping a stale module-level snapshot at import time.
+    """
+    return html.Div([
+        html.H5("Capacity Plans"),
+        dash_table.DataTable(
+            id="tbl-projects",
+            data=[], # filled by router._refresh_projects_table
+            columns=[
+                {"name": "Business Area", "id": "Business Area"},
+                {"name": "Active Plans", "id": "Active Plans"},
+            ],
+            style_as_list_view=True,
+            page_size=10,
+            style_table={"overflowX": "auto", "maxWidth": "100%"},
+            style_header={"textTransform": "none"},
+        ),
+    ], style={
+        "padding": "12px",
+        "borderRadius": "12px",
+        "background": "#fff",
+        "boxShadow": "0 2px 8px rgba(0,0,0,.06)",
+        "minHeight": "90vh",
+    })
+
+def _filter_by_ba(df: pd.DataFrame, ba: str | None) -> pd.DataFrame:
+    if df is None or df.empty or not ba:
+        return df if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    d = df.copy()
+    L = {str(c).strip().lower(): c for c in d.columns}
+    for col in (L.get("program"), L.get("business area"), L.get("journey")):
+        if col:
+            return d[d[col].astype(str).str.strip().str.lower() == str(ba).strip().lower()]
+    return d
+
+def _home_kpis_for_ba(ba: str | None = None) -> dict:
+    # If no Business Area is selected, show zeros per requirement
+    if not ba:
+        return dict(
+            underst=0,
+            hire_lw=0.0, hire_tw=0.0, hire_nw=0.0,
+            shr_last4=0.0, shr_next4=0.0,
+            attr_last4=0.0, attr_next4=0.0,
+        )
+    # ---- Requirements: prefer saved Voice/BO timeseries aggregated across scopes; fallback to samples
+    def _all_names(prefix: str) -> list[str]:
+        try:
+            with _conn() as cx:
+                rows = cx.execute("SELECT name FROM datasets WHERE name LIKE ?", (f"{prefix}::%",)).fetchall()
+            return [r["name"] if isinstance(r, dict) else r[0] for r in rows]
+        except Exception:
+            return []
+
+    def _scope_matches(name: str, ba: str | None) -> bool:
+        if not ba:
+            return True
+        try:
+            sk = name.split("::",1)[1]
+            first = (sk.split("|")[0] or "").strip()
+            return first.lower() == str(ba).strip().lower()
+        except Exception:
+            return True
+
+    # Collect Voice req staff_seconds
+    voice_ss = pd.DataFrame(columns=["date","staff_seconds"])  # aggregated
+    v_names = [n for n in _all_names("voice_forecast_volume") if _scope_matches(n, ba)]
+    if v_names:
+        acc = []
+        for n in v_names:
+            try:
+                vol = load_df(n)
+                sk = n.split("::",1)[1]
+                aht = load_df(f"voice_forecast_aht::{sk}")
+                L = {str(c).strip().lower(): c for c in vol.columns}
+                dc = L.get("date"); ic = L.get("interval"); vc = L.get("volume")
+                if not (dc and ic and vc):
+                    continue
+                dff = vol[[dc,ic,vc]].rename(columns={dc:"date", ic:"interval", vc:"volume"})
+                if isinstance(aht, pd.DataFrame) and not aht.empty:
+                    LA = {str(c).strip().lower(): c for c in aht.columns}
+                    if {LA.get("date"), LA.get("interval"), LA.get("aht_sec")} <= set(aht.columns):
+                        a = aht[[LA.get("date"), LA.get("interval"), LA.get("aht_sec")]].rename(columns={LA.get("date"):"date", LA.get("interval"):"interval", LA.get("aht_sec"):"aht_sec"})
+                        dff = dff.merge(a, on=["date","interval"], how="left")
+                dff["aht_sec"] = pd.to_numeric(dff.get("aht_sec"), errors="coerce").fillna(300.0)
+                vr = voice_requirements_interval(dff, DEFAULT_SETTINGS)
+                if isinstance(vr, pd.DataFrame) and not vr.empty and "staff_seconds" in vr.columns:
+                    s = vr.groupby("date", as_index=False)["staff_seconds"].sum()
+                    acc.append(s)
+            except Exception:
+                continue
+        if acc:
+            voice_ss = pd.concat(acc, ignore_index=True).groupby("date", as_index=False)["staff_seconds"].sum()
+
+    # Collect BO staff_seconds = items * sut_sec
+    bo_ss = pd.DataFrame(columns=["date","staff_seconds"])
+    b_names = [n for n in _all_names("bo_forecast_volume") if _scope_matches(n, ba)]
+    if b_names:
+        acc = []
+        for n in b_names:
+            try:
+                vol = load_df(n)
+                sk = n.split("::",1)[1]
+                sut = load_df(f"bo_forecast_sut::{sk}")
+                if not isinstance(vol, pd.DataFrame) or vol.empty or not isinstance(sut, pd.DataFrame) or sut.empty:
+                    continue
+                LV = {str(c).strip().lower(): c for c in vol.columns}
+                LS = {str(c).strip().lower(): c for c in sut.columns}
+                if LV.get("date") and LV.get("volume") and LS.get("date") and LS.get("sut_sec"):
+                    v = vol[[LV.get("date"), LV.get("volume")]].rename(columns={LV.get("date"):"date", LV.get("volume"):"volume"})
+                    s = sut[[LS.get("date"), LS.get("sut_sec")]].rename(columns={LS.get("date"):"date", LS.get("sut_sec"):"sut_sec"})
+                    m = v.merge(s, on="date", how="inner").dropna()
+                    if not m.empty:
+                        m["staff_seconds"] = pd.to_numeric(m["volume"], errors="coerce").fillna(0) * pd.to_numeric(m["sut_sec"], errors="coerce").fillna(0)
+                        acc.append(m.groupby("date", as_index=False)["staff_seconds"].sum())
+            except Exception:
+                continue
+        if acc:
+            bo_ss = pd.concat(acc, ignore_index=True).groupby("date", as_index=False)["staff_seconds"].sum()
+
+    req_store = pd.DataFrame()
+    if not voice_ss.empty or not bo_ss.empty:
+        denom_voice = float(DEFAULT_SETTINGS.get("hours_per_fte", 8.0)) * 3600 * (1.0 - float(DEFAULT_SETTINGS.get("shrinkage_pct", 0.30)))
+        bo_hours = float(DEFAULT_SETTINGS.get("bo_hours_per_day", DEFAULT_SETTINGS.get("hours_per_fte", 8.0)))
+        bo_shr = float(DEFAULT_SETTINGS.get("bo_shrinkage_pct", DEFAULT_SETTINGS.get("shrinkage_pct", 0.0)))
+        denom_bo = bo_hours * 3600 * (1.0 - bo_shr)
+        vv = voice_ss.copy(); vv["fte"] = vv["staff_seconds"] / max(denom_voice, 1e-6)
+        bb = bo_ss.copy();    bb["fte"] = bb["staff_seconds"]   / max(denom_bo, 1e-6)
+        dfm = pd.merge(vv[["date","fte"]].rename(columns={"fte":"voice_fte"}),
+                       bb[["date","fte"]].rename(columns={"fte":"bo_fte"}), on="date", how="outer").fillna(0)
+        dfm["total_req_fte"] = dfm.get("voice_fte",0) + dfm.get("bo_fte",0)
+        dfm["program"] = (ba or "All")
+        req_store = dfm[["date","program","total_req_fte"]].copy()
+
+    if not req_store.empty:
+        req = req_store
     else:
-        s = d.groupby("week", as_index=False)[val_col].sum().set_index("week")[val_col]
-    return s.to_dict()
-
-def _parse_ratio_setting(v) -> float:
+        # For selected BA with no uploaded demand, do not fall back to demos; show 0 understaffed
+        req = pd.DataFrame(columns=["date","program","total_req_fte"])  # empty
+    # Prefer stored roster + hiring for supply; fallback to demos
     try:
-        if isinstance(v, str) and ":" in v:
-            a, b = v.split(":", 1)
-            a = float(str(a).strip()); b = float(str(b).strip())
-            return (a / b) if b else 0.0
-        return float(v)
+        r_store = load_roster()
     except Exception:
-        return 0.0
-
-# Final override: ensure the normalized roster loader is the active definition
-def _load_or_empty_roster(pid):
-    """Load roster normalized to current _roster_columns() ids (backward compatible)."""
-    cols = [c["id"] for c in _roster_columns()]
-    empty = pd.DataFrame({c: pd.Series(dtype="object") for c in cols})
+        r_store = pd.DataFrame()
     try:
-        df = load_df(f"plan_{pid}_emp")
+        h_store = load_hiring()
     except Exception:
-        return empty
+        h_store = pd.DataFrame()
 
+    # Derive Hiring from current capacity plans when store is empty for the selected BA
+    def _plan_hiring_for_ba(ba_name: str) -> pd.DataFrame:
+        try:
+            from plan_store import list_plans
+        except Exception:
+            return pd.DataFrame()
+        plans = list_plans(vertical=ba_name, status_filter="current") or []
+        if not plans:
+            return pd.DataFrame()
+        rows = []
+        for p in plans:
+            pid = p.get("id") or p.get("plan_id") or p.get("pid")
+            print(pid)
+            if not pid:
+                continue
+            try:
+                dfc = load_df(f"plan_{pid}_nh_classes")
+            except Exception:
+                dfc = None
+            if not isinstance(dfc, pd.DataFrame) or dfc.empty:
+                continue
+            d = dfc.copy()
+            # normalize production_start
+            date_col = None
+            for c in ("production_start","prod_start","to_production","go_live"):
+                if c in d.columns:
+                    date_col = c; break
+            if not date_col:
+                continue
+            d[date_col] = pd.to_datetime(d[date_col], errors="coerce")
+            d = d.dropna(subset=[date_col])
+            if d.empty:
+                continue
+            # effective FTE: prefer billable_hc else grads_needed
+            def eff(row):
+                import math
+                # Prefer explicit counts if present
+                for c in ("billable_hc","fte","grads_needed","headcount"):
+                    if c in row.index:
+                        try:
+                            v = float(row[c])
+                            if not pd.isna(v) and v > 0:
+                                return float(v)
+                        except Exception:
+                            pass
+                # If class exists without counts, treat as 1 FTE
+                return 1.0
+            d["_eff_fte"] = d.apply(eff, axis=1)
+            # Monday of week
+            dt_ser = d[date_col].dt.date
+            sow = pd.to_datetime(dt_ser).dt.normalize() - pd.to_timedelta(pd.to_datetime(dt_ser).dt.weekday, unit="D")
+            d["start_week"] = sow.dt.date.astype(str)
+            # Exclude tentative for past/current weeks similar to plan logic
+            today = pd.Timestamp.today().normalize().date()
+            status = d.get("status")
+            if status is not None:
+                try:
+                    status = status.astype(str).str.strip().str.lower()
+                    mask_future = pd.to_datetime(d["start_week"]).dt.date > today
+                    mask_past_confirmed = (~mask_future) & (status != "tentative")
+                    d = d[mask_future | mask_past_confirmed]
+                except Exception:
+                    pass
+            g = d.groupby("start_week", as_index=False)["_eff_fte"].sum().rename(columns={"_eff_fte":"fte"})
+            if not g.empty:
+                g["program"] = ba_name
+                rows.append(g)
+        if not rows:
+            return pd.DataFrame()
+        out = pd.concat(rows, ignore_index=True)
+        # ensure expected columns
+        return out[["start_week","fte","program"]]
+
+    r_use = _filter_by_ba(r_store, ba) if isinstance(r_store, pd.DataFrame) and not r_store.empty else pd.DataFrame()
+    h_use_store = _filter_by_ba(h_store, ba) if isinstance(h_store, pd.DataFrame) and not h_store.empty else pd.DataFrame()
+    h_use_plan = _plan_hiring_for_ba(ba) if ba else pd.DataFrame()
+    # Prefer store; else plan-derived
+    h_for_supply = h_use_store if not h_use_store.empty else h_use_plan
+    sup = supply_fte_daily(r_use if isinstance(r_use, pd.DataFrame) else pd.DataFrame(),
+                           h_for_supply if isinstance(h_for_supply, pd.DataFrame) else pd.DataFrame())
+    underst = understaffed_accounts_next_4w(req, sup)
+
+    # Hiring: prefer stored hiring; if BA-selected and empty after filter, show zeros
+    # Hiring KPI: prefer stored; else derive from current plans; else zeros
+    if isinstance(h_store, pd.DataFrame) and not h_store.empty:
+        hk = _filter_by_ba(h_store, ba)
+        if isinstance(hk, pd.DataFrame) and not hk.empty:
+            lw, tw, nw = kpi_hiring(hk)
+        else:
+            lw, tw, nw = kpi_hiring(h_use_plan)
+    else:
+        lw, tw, nw = kpi_hiring(h_use_plan)
+
+    # Helper: get current plan id for BA
+    def _current_plan_id_for_ba(ba_name: str | None):
+        if not ba_name:
+            return None
+        try:
+            from plan_store import list_plans
+            plans = list_plans(vertical=ba_name, status_filter="current") or []
+            if not plans:
+                return None
+            return plans[0].get("id") or plans[0].get("plan_id")
+        except Exception:
+            return None
+
+    # Helper: extract a weekly percent series from a plan table row
+    def _plan_pct_row(pid: int | str, table_suffix: str, metric_label: str, value_key: str) -> pd.DataFrame:
+        try:
+            df = load_df(f"plan_{pid}_{table_suffix}")
+        except Exception:
+            df = None
+        if not isinstance(df, pd.DataFrame) or df.empty or "metric" not in df.columns:
+            return pd.DataFrame(columns=["week", value_key])
+        try:
+            m = df["metric"].astype(str).str.strip()
+            if metric_label not in m.values:
+                return pd.DataFrame(columns=["week", value_key])
+            row = df.loc[m == metric_label].iloc[0]
+            out_rows = []
+            for col, raw in row.items():
+                if col == "metric":
+                    continue
+                # only take YYYY-MM-DD columns
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(col)):
+                    continue
+                val = raw
+                try:
+                    if isinstance(val, str) and val.strip().endswith("%"):
+                        val = float(val.strip().rstrip('%'))
+                    else:
+                        val = float(pd.to_numeric(val, errors="coerce"))
+                except Exception:
+                    val = 0.0
+                out_rows.append({"week": str(col), value_key: float(val)})
+            return pd.DataFrame(out_rows, columns=["week", value_key])
+        except Exception:
+            return pd.DataFrame(columns=["week", value_key])
+
+    # Shrinkage (prefer saved store; fallback to plan for selected BA; else 0)
+    try:
+        shr_store = load_shrinkage()
+    except Exception:
+        shr_store = pd.DataFrame()
+    if isinstance(shr_store, pd.DataFrame) and not shr_store.empty:
+        sdemo = _filter_by_ba(shr_store, ba)
+        if isinstance(sdemo, pd.DataFrame) and not sdemo.empty:
+            s_last4, s_next4 = kpi_shrinkage(sdemo)
+        else:
+            # Try to read from current plan's shrink table
+            pid = _current_plan_id_for_ba(ba)
+            if pid:
+                plan_shr = _plan_pct_row(pid, "shr", "Overall Shrinkage %", "overall_pct")
+                s_last4, s_next4 = kpi_shrinkage(plan_shr)
+            else:
+                s_last4, s_next4 = 0.0, 0.0
+    else:
+        pid = _current_plan_id_for_ba(ba)
+        if pid:
+            plan_shr = _plan_pct_row(pid, "shr", "Overall Shrinkage %", "overall_pct")
+            s_last4, s_next4 = kpi_shrinkage(plan_shr)
+        else:
+            s_last4, s_next4 = 0.0, 0.0
+
+    # Attrition (prefer saved store; fallback to demo)
+    try:
+        attr_store = load_attrition()
+    except Exception:
+        attr_store = pd.DataFrame()
+    if isinstance(attr_store, pd.DataFrame) and not attr_store.empty:
+        A = _filter_by_ba(attr_store, ba)
+        if isinstance(A, pd.DataFrame) and not A.empty:
+            alast, anext = _last_next_4(A, "week", "attrition_pct")
+        else:
+            pid = _current_plan_id_for_ba(ba)
+            if pid:
+                # Prefer Actual Attrition % row, else Attrition %
+                plan_attr = _plan_pct_row(pid, "attr", "Actual Attrition %", "attrition_pct")
+                if plan_attr.empty:
+                    plan_attr = _plan_pct_row(pid, "attr", "Attrition %", "attrition_pct")
+                alast, anext = _last_next_4(plan_attr, "week", "attrition_pct")
+            else:
+                alast, anext = 0.0, 0.0
+    else:
+        pid = _current_plan_id_for_ba(ba)
+        if pid:
+            plan_attr = _plan_pct_row(pid, "attr", "Actual Attrition %", "attrition_pct")
+            if plan_attr.empty:
+                plan_attr = _plan_pct_row(pid, "attr", "Attrition %", "attrition_pct")
+            alast, anext = _last_next_4(plan_attr, "week", "attrition_pct")
+        else:
+            alast, anext = 0.0, 0.0
+
+    return dict(
+        underst=underst,
+        hire_lw=float(lw or 0), hire_tw=float(tw or 0), hire_nw=float(nw or 0),
+        shr_last4=float(s_last4 or 0), shr_next4=float(s_next4 or 0),
+        attr_last4=float(alast or 0), attr_next4=float(anext or 0),
+    )
+
+def _kpi_cards_children(k: dict) -> list:
+    return [
+        html.Div([
+            html.Div("👥 Staffing", className="kpi-head"),
+            html.Div(className="kpi-topdash"),
+            html.Div([
+                html.Div([html.Div("0", className="num"), html.Div("Last Week", className="lbl")], className="cell"),
+                html.Div([html.Div("0", className="num"), html.Div("This Week", className="lbl")], className="cell"),
+                html.Div([html.Div(str(int(k.get("underst", k.get("underst", 0)))), className="num"), html.Div("Next Week", className="lbl")], className="cell"),
+            ], className="kpi3"),
+        ], className="kpi-card mb-3 edge-teal"),
+        html.Div([
+            html.Div("🎯 Hiring", className="kpi-head"),
+            html.Div(className="kpi-topdash"),
+            html.Div([
+                html.Div([html.Div(str(int(k.get("hire_lw", 0))), className="num"), html.Div("Last Week", className="lbl")], className="cell"),
+                html.Div([html.Div(str(int(k.get("hire_tw", 0))), className="num"), html.Div("This Week", className="lbl")], className="cell"),
+                html.Div([html.Div(str(int(k.get("hire_nw", 0))), className="num"), html.Div("Next Week", className="lbl")], className="cell"),
+            ], className="kpi3"),
+        ], className="kpi-card mb-3 edge-blue"),
+        html.Div([
+            html.Div("📉 Shrinkage", className="kpi-head"),
+            html.Div(className="kpi-topdash"),
+            html.Div([
+                html.Div([html.Div(f"{k.get('shr_last4',0):.2f}%", className="num"), html.Div("Last 4 Weeks", className="lbl")], className="cell"),
+                html.Div([html.Div(f"{k.get('shr_next4',0):.2f}%", className="num"), html.Div("This Week", className="lbl")], className="cell"),
+                html.Div([html.Div(f"{k.get('shr_next4',0):.2f}%", className="num"), html.Div("Next 4 Weeks", className="lbl")], className="cell"),
+            ], className="kpi3"),
+        ], className="kpi-card edge-orange"),
+        html.Div([
+            html.Div("🔄 Attrition", className="kpi-head"),
+            html.Div(className="kpi-topdash"),
+            html.Div([
+                html.Div([html.Div(f"{k.get('attr_last4',0):.2f}%", className="num"), html.Div("Last 4 Weeks", className="lbl")], className="cell"),
+                html.Div([html.Div(f"{k.get('attr_next4',0):.2f}%", className="num"), html.Div("This Week", className="lbl")], className="cell"),
+                html.Div([html.Div(f"{k.get('attr_next4',0):.2f}%", className="num"), html.Div("Next 4 Weeks", className="lbl")], className="cell"),
+            ], className="kpi3"),
+        ], className="kpi-card edge-red"),
+    ]
+
+def right_kpi_cards():
+    # Default view = All business areas
+    return html.Div(id="right-kpis", children=_kpi_cards_children(_home_kpis_for_ba(None)), style={"minHeight":"100%"})
+
+# ---- Activity log helpers ----
+def log_activity(user: str, action: str, path: str = "", meta: dict | None = None) -> None:
+    try:
+        df = load_df("activity_log")
+    except Exception:
+        df = None
+    if not isinstance(df, pd.DataFrame):
+        df = pd.DataFrame(columns=["ts","user","action","path","meta"])    
+    rec = {
+        "ts": pd.Timestamp.utcnow().isoformat(timespec="seconds"),
+        "user": user,
+        "action": action,
+        "path": path,
+        "meta": (meta or {}),
+    }
+    try:
+        df = pd.concat([df, pd.DataFrame([rec])], ignore_index=True)
+    except Exception:
+        pass
+    try:
+        save_df("activity_log", df)
+    except Exception:
+        pass
+
+def timeline_card() -> html.Div:
+    def svg_down():
+        return svg.Svg([
+            svg.Path(
+                d="m19 9-7 7-7-7",
+                stroke="currentColor",
+                strokeLinecap="round",
+                strokeLinejoin="round",
+                strokeWidth="2"
+            )
+        ], xmlns="http://www.w3.org/2000/svg", width=24, height=24, fill="none", viewBox="0 0 24 24"),
+    down_svg = svg_down()
+    return dbc.Card(
+        dbc.CardBody([
+            html.Div([
+                html.Span("User Timeline", className="fw-bold"),
+                html.Button(down_svg, id="timeline-toggle", title="Collapse/Expand",
+                            style={"marginLeft":"auto","border":"none","background":"transparent","cursor":"pointer"})
+            ], className="d-flex align-items-center mb-2 ritu"),
+            dbc.Collapse(
+                html.Div(id="timeline-body", className="timeline"),
+                id="timeline-collapse", is_open=False
+            )
+        ], class_name="cgdivu"),
+        className="mb-3 cg"
+    )
+
+def sidebar_component(collapsed: bool) -> html.Div:
+    items = [("📈","Forecasting Workspace","/forecast","sb-forecast"),
+        ("📅","Planning Workspace","/planning","sb-planning"),
+        ("💰","Budget","/budget","sb-budget"),
+        ("📊","Operational Dashboard","/ops","sb-ops"),
+        ("🧑‍🎓","New Hire Summary","/newhire","sb-newhire"),
+        ("🗂️","Employee Roster","/roster","sb-roster"),
+        ("🧮","Planner Dataset","/dataset","sb-dataset"),
+        ("⚙️","Default Settings","/settings","sb-settings"),
+        ("📤","Upload Shrinkage & Attrition","/shrink","sb-shrink"),
+        ("ℹ️","Help & Docs","/help","sb-help"),
+    ]
+    nav, tooltips = [], []
+    for ico,lbl,href,anchor in items:
+        nav.append(dcc.Link(
+            html.Div([html.Div(ico, className="nav-ico"), html.Div(lbl, className="nav-label")],
+                     className="nav-item", id=f"{anchor}-item"),
+            href=href, id=anchor, refresh=False
+        ))
+        tooltips.append(dbc.Tooltip(lbl, target=f"{anchor}-item", placement="right", style={"fontSize":"0.85rem"}))
+    return html.Div([
+        html.Div([
+            html.Div([ html.Img(src="/assets/barclays-wordmark.svg", alt="Barclays") ], className="logo-full"),
+            html.Img(src="/assets/barclays-eagle.svg", alt="Barclays Eagle", className="logo-eagle"),
+        ], className="brand"),
+        html.Div(nav, className="nav"),
+        *tooltips
+    ], id="sidebar")
+
+
+# ---- Schema detectors for shrinkage uploads ----
+def is_voice_shrinkage_like(df: pd.DataFrame) -> bool:
+    """Heuristic: looks like Voice shrinkage raw if it has Superstate + Hours columns."""
     if not isinstance(df, pd.DataFrame) or df.empty:
-        return empty
-    df = df.copy()
-    # Map legacy short names -> canonical
-    if "ftpt" in df.columns and "ftpt_status" not in df.columns:
-        df["ftpt_status"] = df["ftpt"]
-    if "tl" in df.columns and "team_leader" not in df.columns:
-        df["team_leader"] = df["tl"]
-    if "status" in df.columns:
-        if "work_status" not in df.columns:
-            df["work_status"] = df["status"]
-        if "current_status" not in df.columns:
-            df["current_status"] = df["status"]
-    # Legacy date fields
-    if "date_training" in df.columns and "training_start" not in df.columns:
-        df["training_start"] = df["date_training"]
-    if "date_nesting" in df.columns and "nesting_start" not in df.columns:
-        df["nesting_start"] = df["date_nesting"]
-    if "date_production" in df.columns and "production_start" not in df.columns:
-        df["production_start"] = df["date_production"]
-    if "date_loa" in df.columns and "loa_date" not in df.columns:
-        df["loa_date"] = df["date_loa"]
-    if "date_back_from_loa" in df.columns and "back_from_loa_date" not in df.columns:
-        df["back_from_loa_date"] = df["date_back_from_loa"]
+        return False
+    L = {str(c).strip().lower(): c for c in df.columns}
+    has_super = any(k in L for k in ("superstate",))
+    has_hours = any(k in L for k in ("hours",))
+    return bool(has_super and has_hours)
 
-    for c in cols:
-        if c not in df.columns:
-            df[c] = ""
-    out = df[cols].copy()
-    for c in out.columns:
-        if out[c].dtype == object:
-            out[c] = out[c].fillna("").astype(str)
-    return out
+def is_bo_shrinkage_like(df: pd.DataFrame) -> bool:
+    """Heuristic: looks like Back Office raw if it has Activity + DurationSeconds (or variants)."""
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        return False
+    L = {str(c).strip().lower(): c for c in df.columns}
+    has_act = "activity" in L
+    has_dur = any(k in L for k in ("durationseconds", "duration (sec)", "duration_seconds", "duration sec", "duration"))
+    return bool(has_act and has_dur)
