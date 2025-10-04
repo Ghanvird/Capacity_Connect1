@@ -1721,10 +1721,10 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                     ino_pct = (100.0 * ino / ttwh)    if ttwh    > 0 else 0.0
                     ov_pct  = (ooo_pct + ino_pct)
                 else:
-                    # If SC/TTW denominators are missing, do not fall back to base; use 0%.
-                    ooo_pct = 0.0
-                    ino_pct = 0.0
-                    ov_pct  = 0.0
+                    # Voice and other non-BO: fall back to base (SC_INCLUDED_TIME) as denominator
+                    ooo_pct = (100.0 * ooo / base) if base > 0 else 0.0
+                    ino_pct = (100.0 * ino / base) if base > 0 else 0.0
+                    ov_pct  = (ooo_pct + ino_pct)
 
                 # What-If: add shrink_delta to overall % display (clamped 0..100)
                 if _wf_active(w) and shrink_delta:
