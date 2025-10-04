@@ -821,18 +821,45 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     if backlog_m_local and ("backlog" in lower_opts):
         backlog_m = backlog_m_local
  
-    # Prepare map for monthly Overtime Hours; values populated later from shrinkage raw
-    
-    
-    try:
-        overtime_hours_m
-    except NameError:
-        overtime_hours_m = {}
-    if "overtime Hours (#)" in fw_rows:
-        for m in month_ids:
-            val = overtime_hours_m.get(m, None)
-            if val is not None:
-                fw.loc[fw["metric"] == "Overtime Hours (#)", m] = float(val)
+    # Voice overtime from SC_OVERTIME_DELIVERED
+    def _compute_monthly_ot_voice_from_raw() -> dict:
+        try:
+            vraw = load_df("shrinkage_raw_voice")
+        except Exception:
+            return {}
+        if not isinstance(vraw, pd.DataFrame) or vraw.empty:
+            return {}
+        df = vraw.copy()
+        L = {str(c).strip().lower(): c for c in df.columns}
+        c_date = L.get("date"); c_state = L.get("superstate") or L.get("state"); c_hours = L.get("hours") or L.get("duration_hours") or L.get("duration")
+        c_ba = L.get("business area") or L.get("ba"); c_sba = L.get("sub business area") or L.get("sub_ba"); c_ch = L.get("channel")
+        c_site = L.get("site") or L.get("location") or L.get("country") or L.get("city")
+        if not c_date or not c_state or not c_hours:
+            return {}
+        mask = pd.Series(True, index=df.index)
+        if c_ba and p.get("vertical"): mask &= df[c_ba].astype(str).str.strip().str.lower().eq(str(p.get("vertical")).strip().lower())
+        if c_sba and p.get("sub_ba"): mask &= df[c_sba].astype(str).str.strip().str.lower().eq(str(p.get("sub_ba")).strip().lower())
+        if c_ch: mask &= df[c_ch].astype(str).str.strip().str.lower().isin(["voice","telephony","calls","inbound","outbound"]) | df[c_ch].astype(str).eq("")
+        if c_site and (p.get("site") or p.get("location") or p.get("country")):
+            target = str(p.get("site") or p.get("location") or p.get("country")).strip().lower()
+            loc_l = df[c_site].astype(str).str.strip().str.lower()
+            if loc_l.eq(target).any():
+                mask &= loc_l.eq(target)
+        df = df.loc[mask]
+        if df.empty:
+            return {}
+        df[c_date] = pd.to_datetime(df[c_date], errors="coerce")
+        df = df.dropna(subset=[c_date])
+        st = df[c_state].astype(str).str.strip().str.upper()
+        df = df.loc[st.eq("SC_OVERTIME_DELIVERED")]
+        if df.empty:
+            return {}
+        hours = pd.to_numeric(df[c_hours], errors="coerce").fillna(0.0)
+        tmp = pd.DataFrame({"date": df[c_date], "hours": hours})
+        tmp["month"] = _mid(tmp["date"]) 
+        agg = tmp.groupby("month", as_index=False)["hours"].sum()
+        return {str(r["month"]): float(r["hours"]) for _, r in agg.iterrows()}
+    _ot_voice_m_raw = _compute_monthly_ot_voice_from_raw()
                 
 
     # ---- Apply Backlog carryover (Back Office only): add previous month's backlog to next month's BO forecast ----
@@ -1579,7 +1606,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         mask = pd.Series(True, index=v.index)
         if c_ba and p.get("vertical"): mask &= v[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
         if c_sba and p.get("sub_ba"): mask &= v[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
-        if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().isin(["voice","all","","back office","bo","backoffice"])  # allow voice-like BO
+        if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().isin(["voice","telephony","calls","inbound","outbound"]) | v[c_ch].astype(str).eq("")
         if c_loc and loc_first:
             loc_series = v[c_loc].astype(str).str.strip()
             loc_l = loc_series.str.lower()
@@ -1589,27 +1616,34 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         v = v.loc[mask]
         if c_date and c_state and c_hours and not v.empty:
             pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
-            def col(name): return pv[name] if name in pv.columns else 0.0
-            base = col("SC_INCLUDED_TIME")
-            # Match weekly buckets exactly
-            ooo  = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
-            ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
+            import re as _vre
+            def _sum_cols(patterns):
+                total = 0.0
+                for _c in pv.columns:
+                    cl = str(_c).strip().lower()
+                    if any(_vre.search(pat, cl) for pat in patterns):
+                        try:
+                            total += float(pv[_c])
+                        except Exception:
+                            total += float(pd.to_numeric(pv[_c], errors='coerce').fillna(0.0))
+                return total
+            base = _sum_cols([r"\bsc[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*total[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*available[_\s-]*time\b"]) 
+            ooo  = _sum_cols([r"\bsc[_\s-]*absence", r"\bsc[_\s-]*holiday", r"\bsc[_\s-]*a[_\s-]*sick", r"\bsc[_\s-]*sick"]) 
+            ino  = _sum_cols([r"\bsc[_\s-]*training", r"\bsc[_\s-]*break", r"\bsc[_\s-]*system[_\s-]*exception"]) 
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
-            # Also accumulate monthly SC denominator
             try:
                 mk = _month_key(idx_dates)
-                gsc = pd.DataFrame({"month": mk, "sc": base.astype(float)}).groupby("month", as_index=False).sum()
+                gsc = pd.DataFrame({"month": mk, "sc": pd.to_numeric(base, errors='coerce')}).groupby("month", as_index=False).sum()
                 for _, r in gsc.iterrows():
                     k = str(r["month"]) ; sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(r["sc"])
             except Exception:
                 pass
-            # Daily overall frac for voice-like: (OOO+INO)/Base
             try:
-                base_s = base.astype(float)
-                ov = (ooo.astype(float) + ino.astype(float))
-                frac = ov / base_s.replace({0.0: np.nan})
-                for t, f in zip(idx_dates, frac):
+                base_s = pd.to_numeric(base, errors='coerce')
+                ov = pd.to_numeric(ooo, errors='coerce') + pd.to_numeric(ino, errors='coerce')
+                frac = ov / base_s if np.all(base_s != 0) else 0.0
+                for t, f in zip(idx_dates, np.atleast_1d(frac)):
                     k = str(pd.to_datetime(t).date())
                     if pd.notna(f):
                         bo_shrink_frac_daily_m[k] = float(max(0.0, min(0.99, f)))
@@ -1761,7 +1795,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     # After computing shrinkage, write independent overtime (from raw) into FW grid (does not alter shrinkage)
     if "Overtime Hours (#)" in fw_rows:
         for m in month_ids:
-            val = _ot_m_raw.get(m, None)
+            val = None
+            ch_key_local = str(ch_first or '').strip().lower()
+            if ch_key_local == 'voice':
+                val = _ot_voice_m_raw.get(m, None)
+            elif ch_key_local in ("back office","bo"):
+                val = _ot_m_raw.get(m, None)
             if val is None:
                 val = overtime_m.get(m, None)
             if val is not None:
