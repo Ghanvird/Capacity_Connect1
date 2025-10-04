@@ -821,6 +821,45 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         return {str(r["week"]): float(r["hours"]) for _, r in agg.iterrows()}
 
     _ot_w_raw = _compute_weekly_ot_from_raw()
+    # Voice overtime from SC_OVERTIME_DELIVERED
+    def _compute_weekly_ot_voice_from_raw() -> dict:
+        try:
+            vraw = load_df("shrinkage_raw_voice")
+        except Exception:
+            return {}
+        if not isinstance(vraw, pd.DataFrame) or vraw.empty:
+            return {}
+        df = vraw.copy()
+        L = {str(c).strip().lower(): c for c in df.columns}
+        c_date = L.get("date"); c_state = L.get("superstate") or L.get("state"); c_hours = L.get("hours") or L.get("duration_hours") or L.get("duration")
+        c_ba = L.get("business area") or L.get("ba"); c_sba = L.get("sub business area") or L.get("sub_ba"); c_ch = L.get("channel")
+        c_site = L.get("site") or L.get("location") or L.get("country") or L.get("city")
+        if not c_date or not c_state or not c_hours:
+            return {}
+        mask = pd.Series(True, index=df.index)
+        if c_ba and p.get("vertical"): mask &= df[c_ba].astype(str).str.strip().str.lower().eq(str(p.get("vertical")).strip().lower())
+        if c_sba and p.get("sub_ba"): mask &= df[c_sba].astype(str).str.strip().str.lower().eq(str(p.get("sub_ba")).strip().lower())
+        if c_ch: mask &= df[c_ch].astype(str).str.strip().str.lower().isin(["voice","telephony","calls","inbound","outbound"]) | df[c_ch].astype(str).eq("")
+        if c_site and (p.get("site") or p.get("location") or p.get("country")):
+            target = str(p.get("site") or p.get("location") or p.get("country")).strip().lower()
+            loc_l = df[c_site].astype(str).str.strip().str.lower()
+            if loc_l.eq(target).any():
+                mask &= loc_l.eq(target)
+        df = df.loc[mask]
+        if df.empty:
+            return {}
+        df[c_date] = pd.to_datetime(df[c_date], errors="coerce")
+        df = df.dropna(subset=[c_date])
+        st = df[c_state].astype(str).str.strip().str.upper()
+        df = df.loc[st.eq("SC_OVERTIME_DELIVERED")]
+        if df.empty:
+            return {}
+        hrs = pd.to_numeric(df[c_hours], errors="coerce").fillna(0.0)
+        tmp = pd.DataFrame({"date": df[c_date], "hours": hrs})
+        tmp["week"] = (tmp["date"] - pd.to_timedelta(tmp["date"].dt.weekday, unit="D")).dt.date.astype(str)
+        agg = tmp.groupby("week", as_index=False)["hours"].sum()
+        return {str(r["week"]): float(r["hours"]) for _, r in agg.iterrows()}
+    _ot_voice_w_raw = _compute_weekly_ot_voice_from_raw()
     backlog_w  = _row_to_week_dict(fw_saved, "Backlog (Items)")
     # Prefer freshly computed backlog for carryover if user selected Backlog in this plan
     if backlog_w_local and ("backlog" in lower_opts):
@@ -1572,10 +1611,21 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             v = v.loc[mask]
             if c_date and c_state and c_hours and not v.empty:
                 pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
-                def col(name): return pv[name] if name in pv.columns else 0.0
-                base = col("SC_INCLUDED_TIME")
-                ooo  = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
-                ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
+                # Robust Voice mapping: group superstates by patterns
+                import re as _vre
+                def _sum_cols(patterns):
+                    total = 0.0
+                    for _col in pv.columns:
+                        cl = str(_col).strip().lower()
+                        if any(_vre.search(pat, cl) for pat in patterns):
+                            try:
+                                total += float(pv[_col])
+                            except Exception:
+                                total += float(pd.to_numeric(pv[_col], errors="coerce").fillna(0.0))
+                    return total
+                base = _sum_cols([r"\bsc[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*total[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*available[_\s-]*time\b"]) 
+                ooo  = _sum_cols([r"\bsc[_\s-]*absence", r"\bsc[_\s-]*holiday", r"\bsc[_\s-]*a[_\s-]*sick", r"\bsc[_\s-]*sick"]) 
+                ino  = _sum_cols([r"\bsc[_\s-]*training", r"\bsc[_\s-]*break", r"\bsc[_\s-]*system[_\s-]*exception"]) 
                 idx_dates = pd.to_datetime(pv.index, errors="coerce")
                 _agg_weekly(idx_dates, ooo, ino, base)
 
@@ -1803,9 +1853,14 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     # Write Overtime Hours (#) from shrinkage raw into FW and merged FW (independent of shrinkage logic)
     if "Overtime Hours (#)" in fw_rows:
         for w in week_ids:
-            val = _ot_w_raw.get(w, None)
+            val = None
+            ch_key_local = str(ch_first or '').strip().lower()
+            if ch_key_local == 'voice':
+                val = _ot_voice_w_raw.get(w, None)
+            elif ch_key_local in ("back office","bo"):
+                val = _ot_w_raw.get(w, None)
+            # fallback to saved/previous map if present
             if val is None:
-                # fallback to saved/previous map if present
                 val = overtime_w.get(w, None)
             if val is not None:
                 fw.loc[fw["metric"] == "Overtime Hours (#)", w] = float(val)
@@ -1861,7 +1916,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         # 'FTE Required @ Forecast Volume'.
         bud = float(req_w_forecast.get(w, 0.0))
         act = float(req_w_actual.get(w,   0.0))
-        act = act/(1 - ov_pct)
         bva.loc[bva["metric"] == "Budgeted FTE (#)", w] = bud
         bva.loc[bva["metric"] == "Actual FTE (#)",   w] = act
         bva.loc[bva["metric"] == "Variance (#)",     w] = act - bud
