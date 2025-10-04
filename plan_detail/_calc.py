@@ -1,4 +1,4 @@
-\# file: plan_detail/_calc.py
+# file: plan_detail/_calc.py
 from __future__ import annotations
 import math
 import os
@@ -733,8 +733,13 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             if "Budgeted AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = bud_aht
             elif "AHT/SUT" in fw_rows and "Forecast AHT/SUT" not in fw_rows and "Actual AHT/SUT" not in fw_rows:
-                # For schemas that only expose a single AHT/SUT row, prefer showing the forecast/budget value
-                fw.loc[fw["metric"] == "AHT/SUT", w] = bud_aht
+                # Only seed Budget into AHT/SUT if it hasn't been set by Forecast/Actual (keep non-zero)
+                try:
+                    cur = float(pd.to_numeric(fw.loc[fw["metric"] == "AHT/SUT", w], errors="coerce").fillna(0.0).iloc[0])
+                except Exception:
+                    cur = 0.0
+                if cur <= 0.0:
+                    fw.loc[fw["metric"] == "AHT/SUT", w] = bud_aht
 
 
     # Compute Backlog (Items) and Queue (Items) as selected
