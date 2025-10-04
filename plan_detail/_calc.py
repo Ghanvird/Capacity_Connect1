@@ -2145,12 +2145,13 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     handling_capacity = {}
 
     def _metric_for_capacity(actual_map, forecast_map, week):
+        # Why: Weekly capacity must honor Forecast AHT/SUT first, matching the monthly view.
         def _clean(val):
             try:
                 return max(0.0, float(val))
             except Exception:
                 return 0.0
-        act = _clean(actual_map.get(week, 0.0))
+        act  = _clean(actual_map.get(week, 0.0))
         fore = _clean(forecast_map.get(week, 0.0))
         if fore > 0.0:
             return fore
