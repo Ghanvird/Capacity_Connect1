@@ -1033,7 +1033,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 fw.loc[fw["metric"] == "Forecast AHT/SUT", w] = aht_for
             if "Budgeted AHT/SUT" in fw_rows:
                 bud = planned_aht_w.get(w, s_budget_aht)
-                fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = bud
+                fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = bud; wk_aht_sut_budget[w] = bud
     req_daily_actual   = required_fte_daily(use_voice_for_req, use_bo_for_req, oA, settings)
     req_daily_forecast = required_fte_daily(vF, bF, oF, settings)
     req_daily_tactical = required_fte_daily(vT, bT, oT, settings) if (isinstance(vT, pd.DataFrame) and not vT.empty) or (isinstance(bT, pd.DataFrame) and not bT.empty) or (isinstance(oT, pd.DataFrame) and not oT.empty) else pd.DataFrame()
@@ -2152,10 +2152,10 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 return 0.0
         act = _clean(actual_map.get(week, 0.0))
         fore = _clean(forecast_map.get(week, 0.0))
-        if act > 0.0:
-            return act
         if fore > 0.0:
             return fore
+        if act > 0.0:
+            return act
         return 0.0
 
     bo_model   = (settings.get("bo_capacity_model") or "tat").lower()
