@@ -1306,7 +1306,13 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                     if td is not None:
                         mask &= ((td.isna()) | (td >= dt0))
                     if roles is not None:
-                        mask &= roles.str.contains(r"\bagent\b", regex=True, na=False)
+                        # For Voice channel rosters, broaden the agent pattern to common synonyms
+                        ch_low_ = str(ch_first or '').strip().lower()
+                        if ch_low_ == 'voice':
+                            role_pat = r"\b(agent|csr|advisor|associate|representative|executive|specialist)\b"
+                        else:
+                            role_pat = r"\bagent\b"
+                        mask &= roles.str.contains(role_pat, regex=True, na=False)
                     hc_baseline_m[mm] = int(mask.sum())
                 except Exception:
                     pass
@@ -1831,10 +1837,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             ino_pct = (100.0 * ino / ttwm) if ttwm > 0 else 0.0
             ov_pct  = (ooo_pct + ino_pct)
         else:
-            # If SC/TTW denominators are missing, do not fall back to base; use 0%.
-            ooo_pct = 0.0
-            ino_pct = 0.0
-            ov_pct  = 0.0
+            # Voice and other non-BO channels: use Base hours as denominator
+            ooo_pct = (100.0 * ooo / base) if base > 0 else 0.0
+            ino_pct = (100.0 * ino / base) if base > 0 else 0.0
+            ov_pct  = (ooo_pct + ino_pct)
         if _wf_active_month(m) and shrink_delta:
             ov_pct = min(100.0, max(0.0, ov_pct + shrink_delta))
         planned_pct = float(saved_plan_pct.get(m, 100.0 * planned_shrink_fraction))
