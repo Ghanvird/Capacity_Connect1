@@ -760,6 +760,9 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         except Exception:
             return {}
     overtime_m = _row_to_month_dict(fw_saved, "Overtime Hours (#)")
+    # Collector for monthly overtime hours derived from raw shrinkage feeds
+    # Initialized to avoid NameError where later aggregation appends to it
+    overtime_hours_m = {}
 
     # Independent: compute Back Office Overtime Hours from shrinkage_raw_backoffice (do not touch shrinkage logic)
     def _compute_monthly_ot_from_raw() -> dict:
@@ -1317,7 +1320,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                         dt0 = pd.to_datetime(mm, errors="coerce")
                     if pd.isna(dt0):
                         continue
-                    dt0 = pd.Timestamp(dt0).to_period('M').to_timestamp().date()
+                    # Month window [begin, end]
+                    dt_begin = pd.Timestamp(dt0).to_period('M').to_timestamp().date()
+                    y = int(pd.Timestamp(dt0).year); mo = int(pd.Timestamp(dt0).month)
+                    dt_end = (pd.Timestamp(dt_begin) + pd.Timedelta(days=(calendar.monthrange(y, mo)[1]-1))).date()
                     try:
                         ps = pd.to_datetime(R[c_ps], errors="coerce", format="mixed").dt.date
                     except TypeError:
@@ -1329,10 +1335,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                             td = pd.to_datetime(R[c_td], errors="coerce").dt.date
                     else:
                         td = None
-                    # Treat missing production_start as active (like weekly average calc)
-                    mask = ps.isna() | (ps <= dt0)
+                    # Active if started by month-end and not terminated before month-begin
+                    mask = ps.isna() | (ps <= dt_end)
                     if td is not None:
-                        mask &= ((td.isna()) | (td >= dt0))
+                        mask &= ((td.isna()) | (td >= dt_begin))
                     if roles is not None:
                         # For Voice channel rosters, broaden the agent pattern to common synonyms
                         ch_low_ = str(ch_first or '').strip().lower()
