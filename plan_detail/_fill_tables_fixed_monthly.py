@@ -1371,7 +1371,14 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     #                 pass
     sme_billable_m = _monthly_hc_average_from_roster(roster_df, month_ids, r"\bsme\b")
     for m in month_ids:
-        hc.loc[hc["metric"] == "Actual Agent HC (#)", m] = hc_baseline_m.get(m, 0)
+        # Prefer baseline; fallback to daily-average snapshot if baseline is zero
+        _hc_val = int(hc_baseline_m.get(m, 0) or 0)
+        if _hc_val == 0:
+            try:
+                _hc_val = int(hc_actual_m.get(m, 0) or 0)
+            except Exception:
+                _hc_val = 0
+        hc.loc[hc["metric"] == "Actual Agent HC (#)", m] = _hc_val
         hc.loc[hc["metric"] == "SME Billable HC (#)", m] = sme_billable_m.get(m, 0)
 
     # ---- Budget vs simple Planned HC (monthly reduce) ----
@@ -1484,6 +1491,17 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             if denom_p <= 0:
                 try:
                     denom_p = float(hc_baseline_m.get(m, 0.0) or 0.0)
+                except Exception:
+                    denom_p = 0.0
+            # fallback to monthly actual snapshot if baseline is zero
+            if denom_p <= 0:
+                try:
+                    denom_p = float(hc_actual_m.get(prev_m, 0.0) or 0.0) if prev_m else 0.0
+                except Exception:
+                    denom_p = 0.0
+            if denom_p <= 0:
+                try:
+                    denom_p = float(hc_actual_m.get(m, 0.0) or 0.0)
                 except Exception:
                     denom_p = 0.0
             if denom_p <= 0:
