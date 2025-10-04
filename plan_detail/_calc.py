@@ -1611,21 +1611,27 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             v = v.loc[mask]
             if c_date and c_state and c_hours and not v.empty:
                 pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
-                # Robust Voice mapping: group superstates by patterns
+                # Robust Voice mapping: group superstates by patterns (return per-date Series)
                 import re as _vre
-                def _sum_cols(patterns):
-                    total = 0.0
-                    for _col in pv.columns:
-                        cl = str(_col).strip().lower()
+                def _sum_cols_series(patterns):
+                    cols = []
+                    for _c in pv.columns:
+                        cl = str(_c).strip().lower()
                         if any(_vre.search(pat, cl) for pat in patterns):
-                            try:
-                                total += float(pv[_col])
-                            except Exception:
-                                total += float(pd.to_numeric(pv[_col], errors="coerce").fillna(0.0))
-                    return total
-                base = _sum_cols([r"\bsc[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*total[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*available[_\s-]*time\b"]) 
-                ooo  = _sum_cols([r"\bsc[_\s-]*absence", r"\bsc[_\s-]*holiday", r"\bsc[_\s-]*a[_\s-]*sick", r"\bsc[_\s-]*sick"]) 
-                ino  = _sum_cols([r"\bsc[_\s-]*training", r"\bsc[_\s-]*break", r"\bsc[_\s-]*system[_\s-]*exception"]) 
+                            cols.append(_c)
+                    if not cols:
+                        return pd.Series(0.0, index=pv.index)
+                    sub = pv[cols]
+                    try:
+                        sub = sub.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+                    except Exception:
+                        pass
+                    if isinstance(sub, pd.Series):
+                        return pd.to_numeric(sub, errors="coerce").fillna(0.0)
+                    return sub.sum(axis=1)
+                base = _sum_cols_series([r"\bsc[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*total[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*available[_\s-]*time\b"]) 
+                ooo  = _sum_cols_series([r"\bsc[_\s-]*absence", r"\bsc[_\s-]*holiday", r"\bsc[_\s-]*a[_\s-]*sick", r"\bsc[_\s-]*sick"]) 
+                ino  = _sum_cols_series([r"\bsc[_\s-]*training", r"\bsc[_\s-]*break", r"\bsc[_\s-]*system[_\s-]*exception"]) 
                 idx_dates = pd.to_datetime(pv.index, errors="coerce")
                 _agg_weekly(idx_dates, ooo, ino, base)
 
