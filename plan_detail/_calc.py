@@ -507,10 +507,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     v_vol_col_A = _pick(vA_w, ["vol","calls","volume"]) or v_vol_col_F
     v_vol_col_T = _pick(vT_w, ["vol","calls","volume"]) or v_vol_col_F
     b_itm_col   = _pick(bF_w, ["items","txns","transactions","volume"]) or "items"
-    v_aht_col_F = _pick(vF_w, ["aht","aht_sec","avg_aht"])
-    v_aht_col_A = _pick(vA_w, ["aht","aht_sec","avg_aht"])
-    b_sut_col_F = _pick(bF_w, ["sut","sut_sec","aht_sec","avg_sut"])
-    b_sut_col_A = _pick(bA_w, ["sut","sut_sec","aht_sec","avg_sut"])
+    # Prefer explicit seconds columns first to avoid unit confusion
+    v_aht_col_F = _pick(vF_w, ["aht_sec","aht","avg_aht"])
+    v_aht_col_A = _pick(vA_w, ["aht_sec","aht","avg_aht"])
+    b_sut_col_F = _pick(bF_w, ["sut_sec","sut","aht_sec","avg_sut"])
+    b_sut_col_A = _pick(bA_w, ["sut_sec","sut","aht_sec","avg_sut"])
 
     # ---- FW grid shell ----
     spec = (lambda k: {
@@ -696,7 +697,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 aa = _get(vF_w, w, v_aht_col_F, 0.0)
                 if vv > 0 and aa > 0:
                     f_num += aa * vv; f_den += vv
-            forecast_aht_sut = (f_num / f_den) if f_den > 0 else 0.0
+            # If no forecast AHT found, fall back to planned/budgeted AHT
+            if f_den > 0:
+                forecast_aht_sut = (f_num / f_den)
+            else:
+                forecast_aht_sut = float(planned_aht_w.get(w, s_budget_aht))
             forecast_aht_sut = float(forecast_aht_sut) if pd.notna(forecast_aht_sut) else 0.0
             forecast_aht_sut = max(0.0, forecast_aht_sut)
             # What-If: reflect AHT delta in FW row so user sees impact
