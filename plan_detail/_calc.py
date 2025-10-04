@@ -699,6 +699,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 fw.loc[fw["metric"] == "Actual AHT/SUT", w] = actual_aht_sut
             elif "AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "AHT/SUT", w] = actual_aht_sut
+            wk_aht_sut_actual[w] = actual_aht_sut
 
             # Forecast AHT/SUT (Voice only; settings overrides honored)
             f_num = f_den = 0.0
@@ -727,6 +728,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 fw.loc[fw["metric"] == "Forecast AHT/SUT", w] = forecast_aht_sut
             elif "AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "AHT/SUT", w] = forecast_aht_sut
+            wk_aht_sut_forecast[w] = forecast_aht_sut
 
             # Budgeted AHT/SUT (Voice planned) – do not apply What-If AHT delta here
             bud_aht = planned_aht_w.get(w, s_budget_aht)
@@ -740,7 +742,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                     cur = 0.0
                 if cur <= 0.0:
                     fw.loc[fw["metric"] == "AHT/SUT", w] = bud_aht
-
+            wk_aht_sut_budget[w] = bud_aht
 
     # Compute Backlog (Items) and Queue (Items) as selected
     backlog_w_local = {}
@@ -1033,16 +1035,20 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 fw.loc[fw["metric"] == "Forecast AHT/SUT", w] = aht_for
             if "Budgeted AHT/SUT" in fw_rows:
                 bud = planned_aht_w.get(w, s_budget_aht)
-                fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = bud; wk_aht_sut_budget[w] = bud
+                fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = bud
+            # keep weekly maps in sync (capacity reads these)
+            wk_aht_sut_actual[w]   = float(aht_act or 0.0)
+            wk_aht_sut_forecast[w] = float(aht_for or 0.0)
+            wk_aht_sut_budget[w]   = float(planned_aht_w.get(w, s_budget_aht))
     req_daily_actual   = required_fte_daily(use_voice_for_req, use_bo_for_req, oA, settings)
     req_daily_forecast = required_fte_daily(vF, bF, oF, settings)
     req_daily_tactical = required_fte_daily(vT, bT, oT, settings) if (isinstance(vT, pd.DataFrame) and not vT.empty) or (isinstance(bT, pd.DataFrame) and not bT.empty) or (isinstance(oT, pd.DataFrame) and not oT.empty) else pd.DataFrame()
     # Add Chat FTE to daily totals
-    from capacity_core import chat_fte_daily as _chat_fte_daily
+    from capacity_core import chat_fte_daily
     for _df, chat_df in ((req_daily_actual, cA), (req_daily_forecast, cF), (req_daily_tactical, cT)):
         if isinstance(_df, pd.DataFrame) and not _df.empty and isinstance(chat_df, pd.DataFrame) and not chat_df.empty:
             try:
-                ch = _chat_fte_daily(chat_df, settings)
+                ch = chat_fte_daily(chat_df, settings)
                 m = _df.merge(ch, on=["date","program"], how="left")
                 m["chat_fte"] = pd.to_numeric(m.get("chat_fte"), errors="coerce").fillna(0.0)
                 m["total_req_fte"] = pd.to_numeric(m.get("total_req_fte"), errors="coerce").fillna(0.0) + m["chat_fte"]
