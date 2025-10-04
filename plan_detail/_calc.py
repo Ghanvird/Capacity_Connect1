@@ -1,4 +1,4 @@
-# file: plan_detail/_calc.py
+\# file: plan_detail/_calc.py
 from __future__ import annotations
 import math
 import os
@@ -697,6 +697,8 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             actual_aht_sut = max(0.0, actual_aht_sut)
             if "Actual AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "Actual AHT/SUT", w] = actual_aht_sut
+            elif "AHT/SUT" in fw_rows:
+                fw.loc[fw["metric"] == "AHT/SUT", w] = actual_aht_sut
 
             # Forecast AHT/SUT (Voice only; settings overrides honored)
             f_num = f_den = 0.0
@@ -723,11 +725,16 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 pass
             if "Forecast AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "Forecast AHT/SUT", w] = forecast_aht_sut
+            elif "AHT/SUT" in fw_rows:
+                fw.loc[fw["metric"] == "AHT/SUT", w] = forecast_aht_sut
 
             # Budgeted AHT/SUT (Voice planned) – do not apply What-If AHT delta here
             bud_aht = planned_aht_w.get(w, s_budget_aht)
             if "Budgeted AHT/SUT" in fw_rows:
                 fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = bud_aht
+            elif "AHT/SUT" in fw_rows and "Forecast AHT/SUT" not in fw_rows and "Actual AHT/SUT" not in fw_rows:
+                # For schemas that only expose a single AHT/SUT row, prefer showing the forecast/budget value
+                fw.loc[fw["metric"] == "AHT/SUT", w] = bud_aht
 
 
     # Compute Backlog (Items) and Queue (Items) as selected
