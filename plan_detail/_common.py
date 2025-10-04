@@ -786,10 +786,20 @@ def _assemble_voice(scope_key, which):
             ah["date"] = pd.to_datetime(ah["date"], errors="coerce").dt.normalize()
         # Canonicalize AHT column name(s)
         if "aht_sec" not in ah.columns:
-            for alt in ("aht","avg_aht","aht_seconds"):
-                if alt in ah.columns:
-                    ah = ah.rename(columns={alt: "aht_sec"})
-                    break
+            # Tolerant synonyms for uploaded column headers
+            cand_names = (
+                "aht_sec","aht","avg_aht","aht_seconds","aht (sec)",
+                "forecast aht","forecast_aht","forecast aht (sec)",
+                "avg_talk_sec","talk_sec"
+            )
+            low = {str(c).strip().lower(): c for c in ah.columns}
+            picked = None
+            for nm in cand_names:
+                c = low.get(nm)
+                if c:
+                    picked = c; break
+            if picked and picked != "aht_sec":
+                ah = ah.rename(columns={picked: "aht_sec"})
         # Pick best join keys available
         join_keys = [k for k in ["date","interval"] if k in df.columns and k in ah.columns]
         if not join_keys:  # fall back to date-only
@@ -1538,6 +1548,3 @@ def _load_or_empty_roster(pid):
         if out[c].dtype == object:
             out[c] = out[c].fillna("").astype(str)
     return out
-
-
-# ──────────────────────────────────────────────────────────────────────────────
