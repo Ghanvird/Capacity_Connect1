@@ -1808,6 +1808,53 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                     except Exception:
                         pass
 
+    # Ensure shrinkage table is populated even when only Voice raw exists (no BO activity feed)
+    try:
+        _debug_shr2 = bool(os.environ.get("CAP_DEBUG_SHRINK"))
+        for w in week_ids:
+            if w not in shr.columns:
+                shr[w] = np.nan
+            shr[w] = pd.to_numeric(shr[w], errors="coerce").astype("float64")
+            base = float(base_hours_w.get(w, 0.0))
+            ooo  = float(ooo_hours_w.get(w, 0.0))
+            ino  = float(io_hours_w.get(w, 0.0))
+            ch_key_local = str(ch_first or '').strip().lower()
+            sc_base = float(sc_hours_w.get(w, 0.0))
+            ttwh    = float(tt_worked_hours_w.get(w, 0.0))
+            # Prefer BO denominators when available; otherwise Voice falls back to base
+            use_bo_denoms = (sc_base > 0.0 or ttwh > 0.0) or (ch_key_local in ("back office","bo") or ("back office" in ch_key_local))
+            if use_bo_denoms:
+                ooo_pct = (100.0 * ooo / sc_base) if sc_base > 0 else 0.0
+                ino_pct = (100.0 * ino / ttwh)    if ttwh    > 0 else 0.0
+                ov_pct  = (ooo_pct + ino_pct)
+            else:
+                ooo_pct = (100.0 * ooo / base) if base > 0 else 0.0
+                ino_pct = (100.0 * ino / base) if base > 0 else 0.0
+                ov_pct  = (ooo_pct + ino_pct)
+            if _wf_active(w) and shrink_delta:
+                ov_pct = min(100.0, max(0.0, ov_pct + shrink_delta))
+            planned_pct = float(saved_plan_pct_w.get(w, 100.0 * planned_shrink_fraction))
+            try:
+                if _wf_active(w) and shrink_delta:
+                    planned_pct = min(100.0, max(0.0, planned_pct + shrink_delta))
+            except Exception:
+                pass
+            variance_pp = ov_pct - planned_pct
+            shr.loc[shr["metric"] == "OOO Shrink Hours (#)",       w] = ooo
+            shr.loc[shr["metric"] == "In-Office Shrink Hours (#)", w] = ino
+            shr.loc[shr["metric"] == "OOO Shrinkage %",            w] = ooo_pct
+            shr.loc[shr["metric"] == "In-Office Shrinkage %",       w] = ino_pct
+            shr.loc[shr["metric"] == "Overall Shrinkage %",       w] = ov_pct
+            shr.loc[shr["metric"] == "Planned Shrinkage %",       w] = planned_pct
+            shr.loc[shr["metric"] == "Variance vs Planned",        w] = variance_pp
+            if _debug_shr2:
+                try:
+                    print(f"[SHR2][week={w}] ch={ch_key_local} OOO={ooo:.2f} SC={sc_base:.2f} TTW={ttwh:.2f} base={base:.2f} branch={'bo' if use_bo_denoms else 'non-bo'} OOO%={ooo_pct:.2f} INO%={ino_pct:.2f} OV%={ov_pct:.2f}")
+                except Exception:
+                    pass
+    except Exception:
+        pass
+
     # --- Adjust BO daily FTE using actual shrink when available; else planned ---
     def _adjust_bo_fte_daily(df: pd.DataFrame, use_actual: bool) -> pd.DataFrame:
         if not isinstance(df, pd.DataFrame) or df.empty:
