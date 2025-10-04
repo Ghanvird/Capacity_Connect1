@@ -341,8 +341,6 @@ def dl_bo_ac_tmpl(_n): return dcc.send_data_frame(bo_actual_template_df().to_csv
 
 # ---------------------- Upload previews (clubbed) ----------------------
 
-@app.callback(Output("tbl-voice-forecast","data"), Output("tbl-voice-forecast","columns"), Output("voice-forecast-msg","children", allow_duplicate=True),
-          Input("up-voice-forecast","contents"), State("up-voice-forecast","filename"), prevent_initial_call=True)
 @app.callback(Output("dl-chat-forecast-tmpl","data"), Input("btn-dl-chat-forecast-tmpl","n_clicks"), prevent_initial_call=True)
 def dl_chat_fc_tmpl(_n):
     df = pd.DataFrame({"date":[], "items":[], "aht_sec":[]})
@@ -362,6 +360,8 @@ def dl_ob_fc_tmpl(_n):
 def dl_ob_ac_tmpl(_n):
     df = pd.DataFrame({"date":[], "opc":[], "connect_rate":[], "rpc_rate":[], "aht_sec":[]})
     return dcc.send_data_frame(df.to_csv, "outbound_actual_template.csv", index=False)
+@app.callback(Output("tbl-voice-forecast","data"), Output("tbl-voice-forecast","columns"), Output("voice-forecast-msg","children", allow_duplicate=True),
+          Input("up-voice-forecast","contents"), State("up-voice-forecast","filename"), prevent_initial_call=True)
 def up_voice_forecast(contents, filename):
     df = parse_upload(contents, filename)
     if df.empty: return [], [], "Could not read file"
