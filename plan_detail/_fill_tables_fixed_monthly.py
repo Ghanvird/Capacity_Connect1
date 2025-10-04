@@ -1617,24 +1617,31 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         if c_date and c_state and c_hours and not v.empty:
             pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
             import re as _vre
-            def _sum_cols(patterns):
-                total = 0.0
+            def _sum_cols_series(patterns):
+                cols = []
                 for _c in pv.columns:
                     cl = str(_c).strip().lower()
                     if any(_vre.search(pat, cl) for pat in patterns):
-                        try:
-                            total += float(pv[_c])
-                        except Exception:
-                            total += float(pd.to_numeric(pv[_c], errors='coerce').fillna(0.0))
-                return total
-            base = _sum_cols([r"\bsc[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*total[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*available[_\s-]*time\b"]) 
-            ooo  = _sum_cols([r"\bsc[_\s-]*absence", r"\bsc[_\s-]*holiday", r"\bsc[_\s-]*a[_\s-]*sick", r"\bsc[_\s-]*sick"]) 
-            ino  = _sum_cols([r"\bsc[_\s-]*training", r"\bsc[_\s-]*break", r"\bsc[_\s-]*system[_\s-]*exception"]) 
+                        cols.append(_c)
+                if not cols:
+                    return pd.Series(0.0, index=pv.index)
+                sub = pv[cols]
+                try:
+                    sub = sub.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+                except Exception:
+                    pass
+                if isinstance(sub, pd.Series):
+                    return pd.to_numeric(sub, errors='coerce').fillna(0.0)
+                return sub.sum(axis=1)
+            base = _sum_cols_series([r"\bsc[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*total[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*available[_\s-]*time\b"]) 
+            ooo  = _sum_cols_series([r"\bsc[_\s-]*absence", r"\bsc[_\s-]*holiday", r"\bsc[_\s-]*a[_\s-]*sick", r"\bsc[_\s-]*sick"]) 
+            ino  = _sum_cols_series([r"\bsc[_\s-]*training", r"\bsc[_\s-]*break", r"\bsc[_\s-]*system[_\s-]*exception"]) 
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
             try:
                 mk = _month_key(idx_dates)
-                gsc = pd.DataFrame({"month": mk, "sc": pd.to_numeric(base, errors='coerce')}).groupby("month", as_index=False).sum()
+                gsc = pd.DataFrame({"month": mk, "sc": pd.to_numeric(base, errors='coerce')})\
+                        .groupby("month", as_index=False).sum()
                 for _, r in gsc.iterrows():
                     k = str(r["month"]) ; sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(r["sc"])
             except Exception:
@@ -1642,8 +1649,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             try:
                 base_s = pd.to_numeric(base, errors='coerce')
                 ov = pd.to_numeric(ooo, errors='coerce') + pd.to_numeric(ino, errors='coerce')
-                frac = ov / base_s if np.all(base_s != 0) else 0.0
-                for t, f in zip(idx_dates, np.atleast_1d(frac)):
+                frac = (ov / base_s.replace({0.0: np.nan})).fillna(0.0)
+                for t, f in zip(idx_dates, frac):
                     k = str(pd.to_datetime(t).date())
                     if pd.notna(f):
                         bo_shrink_frac_daily_m[k] = float(max(0.0, min(0.99, f)))
