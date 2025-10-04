@@ -1329,7 +1329,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                             td = pd.to_datetime(R[c_td], errors="coerce").dt.date
                     else:
                         td = None
-                    mask = ps <= dt0
+                    # Treat missing production_start as active (like weekly average calc)
+                    mask = ps.isna() | (ps <= dt0)
                     if td is not None:
                         mask &= ((td.isna()) | (td >= dt0))
                     if roles is not None:
