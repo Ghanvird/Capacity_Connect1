@@ -2188,6 +2188,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 prev = float(hc_plan_row.get(m, 0) or 0.0)
                 if prev <= 0:
                     prev = float(hc_actual_row.get(m, 0) or 0.0)
+                # As a last resort, seed from Budgeted HC for the month
+                if prev <= 0:
+                    try:
+                        prev = float(budget_m.get(m, 0.0) or 0.0)
+                    except Exception:
+                        prev = 0.0
             next_val = max(prev - float(att_use_row.get(m, 0)) + float(nh_add_row.get(m, 0)), 0.0)
             projected_supply[m] = next_val
             prev = next_val
@@ -2275,6 +2281,16 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             else:
                 calls_per_ivl = _erlang_calls_capacity(agents_eff, aht, sl_seconds, ivl_sec, sl_target_pct)
                 handling_capacity[m] = calls_per_ivl * intervals
+            # Optional debug for Voice monthly
+            import os as _os
+            if _os.environ.get("CAP_DEBUG_VOICE"):
+                try:
+                    print(
+                        f"[VOICE-MONTH][{m}] vol(F/A/T)={vF_vol.get(m,0)}/{vA_vol.get(m,0)}/{vT_vol.get(m,0)} aht={aht:.1f} occ={occ_frac_m.get(m,0):.2f} "
+                        f"agents_eff={agents_eff:.2f} intervals={intervals} cap={handling_capacity[m]:.1f}"
+                    )
+                except Exception:
+                    pass
         else:
             # Backoffice
             # Only use SUT if an Actual or Forecast value exists; otherwise 0 (no capacity)
@@ -2309,9 +2325,13 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 eff_shr = min(0.99, max(0.0, bo_shr_base + shr_add))
                 base_prod_hours = wd * bo_hpd * (1.0 - eff_shr) * util_bo
                 try:
-                    ot = float(overtime_m.get(m, 0.0) or 0.0)
+                    # Prefer saved FW overtime; fallback to raw-derived monthly OT when not present
+                    ot = float(overtime_m.get(m, _ot_m_raw.get(m, 0.0)) or 0.0)
                 except Exception:
-                    ot = 0.0
+                    try:
+                        ot = float(_ot_m_raw.get(m, 0.0) or 0.0)
+                    except Exception:
+                        ot = 0.0
                 if sut <= 0.0 or agents_eff <= 0.0:
                     handling_capacity[m] = 0.0
                 else:
@@ -2342,7 +2362,18 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                     monthly_load = fv
                 else:
                     monthly_load = float(vT_vol.get(m, 0.0) or 0.0)
-            aht_sut = (vA_aht.get(m) if not np.isnan(vA_aht.get(m, np.nan)) else vF_aht.get(m, s_target_aht))
+            # Robust AHT pick: prefer Actual > Forecast > Target, handling None/NaN safely
+            _aa = vA_aht.get(m, None)
+            _fa = vF_aht.get(m, None)
+            try:
+                av = float(_aa) if _aa is not None and not pd.isna(_aa) else None
+            except Exception:
+                av = None
+            try:
+                fv = float(_fa) if _fa is not None and not pd.isna(_fa) else None
+            except Exception:
+                fv = None
+            aht_sut = av if (av is not None and av > 0) else (fv if (fv is not None and fv > 0) else float(s_target_aht))
             try:
                 if _wf_active_month(m) and aht_delta:
                     aht_sut = max(1.0, float(aht_sut) * (1.0 + aht_delta / 100.0))
@@ -2373,6 +2404,14 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             agents_eff = max(1.0, (float(projected_supply.get(m, 0.0)) + nest_eff + sda_eff) * occ_frac_m[m] * (1.0 - v_eff_shr))
             sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
             proj_sl[m] = 100.0 * sl_frac
+            import os as _os2
+            if _os2.environ.get("CAP_DEBUG_VOICE"):
+                try:
+                    print(
+                        f"[VOICE-MONTH-SL][{m}] load={monthly_load:.1f} aht={aht_sut:.1f} intervals={intervals} agents_eff={agents_eff:.2f} sl={proj_sl[m]:.1f}"
+                    )
+                except Exception:
+                    pass
         else:
             # Back Office and others: Actual > Forecast > Tactical items
             try:
