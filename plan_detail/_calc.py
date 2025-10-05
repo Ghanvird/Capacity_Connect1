@@ -352,7 +352,8 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             return None
 
     # ---- scope, plan, settings ----
-    ch_first = (p.get("channel") or "" or p.get("lob")).split(",")[0].strip()
+    # Prefer explicit channel; fallback to legacy LOB field if channel is missing
+    ch_first = (p.get("channel") or p.get("lob") or "").split(",")[0].strip()
     sk = _canon_scope(
         p.get("vertical"),
         p.get("sub_ba"),
@@ -2729,4 +2730,3 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         bulk_df.to_dict("records")  if isinstance(bulk_df,  pd.DataFrame) else [],
         notes_df.to_dict("records") if isinstance(notes_df, pd.DataFrame) else [],
     )
-
