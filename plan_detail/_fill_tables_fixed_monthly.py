@@ -1842,6 +1842,12 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 ]) 
                 idx_dates = pd.to_datetime(pv.index, errors="coerce")
                 _agg_monthly(idx_dates, ooo, ino, base)
+                # Persist monthly denominators for Voice so they flow into capacity plan
+                for t, bval, oval, ival in zip(idx_dates, base, ooo, ino):
+                    m = _month_key([t])[0]
+                    base_hours_m[m] = base_hours_m.get(m, 0.0) + float(bval)
+                    ooo_hours_m[m]  = ooo_hours_m.get(m, 0.0)  + float(oval)
+                    io_hours_m[m]   = io_hours_m.get(m, 0.0)   + float(ival)
                 # Do not populate SC denominators from Voice raw; keep Voice on base-hours formula
                 # (weekly behavior avoids SC/TTW for Voice so monthly should match)
                 try:
