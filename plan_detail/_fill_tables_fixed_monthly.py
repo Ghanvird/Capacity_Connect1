@@ -1728,14 +1728,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             ino  = _sum_cols_series([r"\bsc[_\s-]*training", r"\bsc[_\s-]*break", r"\bsc[_\s-]*system[_\s-]*exception"]) 
             idx_dates = pd.to_datetime(pv.index, errors="coerce")
             _agg_monthly(idx_dates, ooo, ino, base)
-            try:
-                mk = _month_key(idx_dates)
-                gsc = pd.DataFrame({"month": mk, "sc": pd.to_numeric(base, errors='coerce')})\
-                        .groupby("month", as_index=False).sum()
-                for _, r in gsc.iterrows():
-                    k = str(r["month"]) ; sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(r["sc"])
-            except Exception:
-                pass
+            # Do not populate SC denominators from Voice raw; keep Voice on base-hours formula
+            # (weekly behavior avoids SC/TTW for Voice so monthly should match)
             try:
                 base_s = pd.to_numeric(base, errors='coerce')
                 ov = pd.to_numeric(ooo, errors='coerce') + pd.to_numeric(ino, errors='coerce')
@@ -1966,7 +1960,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         # Pick formula by channel/denominators EXACTLY like weekly
         ch_lower = str(ch_first or "").strip().lower()
         is_bo_ch = (ch_lower in ("back office","bo")) or ("back office" in ch_lower)
-        use_bo_denoms = (scm > 0.0 or ttwm > 0.0) or is_bo_ch
+        # Match weekly behavior: use BO denominators only for Back Office channel
+        use_bo_denoms = is_bo_ch
         if use_bo_denoms:
             # Back Office rule: OOO% = Downtime/SC, In-Office% = Divert/TTW
             ooo_pct = (100.0 * ooo / scm) if scm > 0 else 0.0
