@@ -2486,7 +2486,11 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             sda_eff  = eff_from_buckets(sda_buckets,  lc["sda_prod_pct"],     lc["sda_aht_uplift_pct"])
             v_shr_add = (shrink_delta / 100.0) if (_wf_active_month(m) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
-            agents_eff = max(1.0, (float(projected_supply.get(m, 0.0)) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
+            # Use schedule-based average supply when available (align with capacity calc); fallback to projected HC
+            agents_prod = schedule_supply_avg_m.get(m, None)
+            if agents_prod is None or agents_prod <= 0:
+                agents_prod = float(projected_supply.get(m, 0.0))
+            agents_eff = max(1.0, (float(agents_prod) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
             sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
             proj_sl[m] = 100.0 * sl_frac
             import os as _os2
