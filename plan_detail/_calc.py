@@ -2499,7 +2499,26 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             # For SL projection, use effective agents without applying occupancy cap to N
             v_shr_add = (shrink_delta / 100.0) if (_wf_active(w) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
-            agents_eff = max(1.0, (float(projected_supply.get(w, 0.0)) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
+            # Align SL agent base with capacity logic: prefer schedule-based avg supply, then projected HC
+            agents_prod = schedule_supply_avg.get(w, None)
+            if agents_prod is None or agents_prod <= 0:
+                agents_prod = float(projected_supply.get(w, 0.0))
+            # Robust fallback: derive agents from forecast FTE when no supply is available
+            if (agents_prod is None or agents_prod <= 0) and (float(req_w_forecast.get(w, 0.0) or 0.0) > 0.0):
+                try:
+                    hrs_per_fte = float(settings.get("hours_per_fte", 8.0) or 8.0)
+                except Exception:
+                    hrs_per_fte = 8.0
+                try:
+                    occ_f = float(occ_frac_w.get(w, 0.85))
+                except Exception:
+                    occ_f = 0.85
+                daily_intervals = int((24 * 3600) // max(60, ivl_sec))
+                staff_sec_per_day = float(req_w_forecast.get(w, 0.0) or 0.0) * hrs_per_fte * 3600.0 * max(0.01, 1.0 - v_eff_shr) * max(0.01, occ_f)
+                agents_eff_fb = staff_sec_per_day / float(max(1, daily_intervals) * max(60, ivl_sec))
+                # Invert shrink to get pre-shrink agent base for consistent application below
+                agents_prod = agents_eff_fb / max(0.01, 1.0 - v_eff_shr)
+            agents_eff = max(1.0, (float(agents_prod) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
             sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
             proj_sl[w] = 100.0 * sl_frac
             if os.environ.get("CAP_DEBUG_VOICE"):
