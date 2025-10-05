@@ -110,7 +110,15 @@ def _merge_metric_tables(dfs: List[pd.DataFrame], ids: List[str], weighted: dict
                     ser = d.loc[d["metric"].astype(str) == m, col]
                     if ser.empty:
                         continue
-                    v = float(pd.to_numeric(ser.iloc[0], errors="coerce"))
+                    raw_val = ser.iloc[0]
+                    # Robust parse: allow percent-like strings (e.g., "33.3%")
+                    if isinstance(raw_val, str) and raw_val.strip().endswith('%'):
+                        try:
+                            v = float(raw_val.strip().rstrip('%'))
+                        except Exception:
+                            v = float('nan')
+                    else:
+                        v = float(pd.to_numeric(raw_val, errors="coerce"))
                     if m in weighted:
                         lk = weighted[m]
                         lkdf = lookups[i] if i < len(lookups) and isinstance(lookups[i], pd.DataFrame) else d
