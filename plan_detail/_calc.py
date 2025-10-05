@@ -2199,14 +2199,26 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 
     # ---- Handling capacity & Projected SL ----
     def _erlang_c(A: float, N: int) -> float:
-        if N <= 0: return 1.0
-        if A <= 0: return 0.0
-        if A >= N: return 1.0
-        s = 0.0
-        for k in range(N):
-            s += (A**k) / math.factorial(k)
-        last = (A**N) / math.factorial(N) * (N / (N - A))
-        p0 = 1.0 / (s + last)
+        # Numerically stable Erlang C using recursive terms, avoiding large factorials
+        if N <= 0:
+            return 1.0
+        if A <= 0:
+            return 0.0
+        if A >= N:
+            return 1.0
+        # sum_{k=0}^{N-1} A^k/k! via recursion
+        term = 1.0
+        s = term
+        for k in range(1, N):
+            term *= A / k
+            s += term
+        # last term = (A^N / N!) * (N/(N-A)) computed via recursion
+        term *= A / N  # now term == A^N / N!
+        last = term * (N / (N - A))
+        denom = s + last
+        if denom <= 0:
+            return 1.0
+        p0 = 1.0 / denom
         return last * p0
 
     def _erlang_sl(calls_per_ivl: float, aht_sec: float, agents: float, asa_sec: int, ivl_sec: int) -> float:
@@ -2217,18 +2229,29 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (asa_sec / max(1.0, aht_sec)))))
 
     def _erlang_calls_capacity(agents: float, aht_sec: float, asa_sec: int, ivl_sec: int, target_pct: float) -> float:
+        # Find max calls/interval meeting target SL; if unattainable at max throughput, fall back to throughput cap
         if agents <= 0 or aht_sec <= 0 or ivl_sec <= 0:
             return 0.0
         target = float(target_pct) / 100.0
+        def sl_for(x: int) -> float:
+            return _erlang_sl(x, aht_sec, agents, asa_sec, ivl_sec)
+        # Upper bound based on 100% occupancy throughput
         hi = max(1, int((agents * ivl_sec) / aht_sec))
-        def sl_for(x): return _erlang_sl(x, aht_sec, agents, asa_sec, ivl_sec)
+        # If even at hi the target cannot be met, return hi instead of zero
+        if sl_for(hi) < target:
+            return float(hi)
         lo = 0
+        # Exponential search to bracket
         while sl_for(hi) >= target and hi < 10_000_000:
-            lo = hi; hi *= 2
+            lo = hi
+            hi *= 2
+        # Binary search within [lo, hi]
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if sl_for(mid) >= target: lo = mid
-            else: hi = mid - 1
+            if sl_for(mid) >= target:
+                lo = mid
+            else:
+                hi = mid - 1
         return float(lo)
 
     handling_capacity = {}
