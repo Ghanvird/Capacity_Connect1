@@ -126,6 +126,40 @@ def _get_fw_value(fw_df, metric, col_id, default=0.0):
         return float(ser.iloc[0]) if not ser.empty else default
     except Exception:
         return default
+    
+def build_idx(*series_list, base_dates=None):
+    """
+    Build a unified datetime index from multiple grouped series,
+    trimmed to the min/max of the actual uploaded dataset.
+    
+    Parameters
+    ----------
+    *series_list : pd.Series
+        Any number of grouped series with datetime-like indices.
+    base_dates : pd.Series or pd.Index, optional
+        The authoritative date column from the uploaded dataset.
+        If provided, min/max will be taken from here.
+    
+    Returns
+    -------
+    pd.DatetimeIndex
+        Sorted index restricted to the dataset's true date range.
+    """
+    # Union of all indices
+    idx = pd.to_datetime(
+        pd.Index(set().union(*[s.index for s in series_list])),
+        errors="coerce"
+    ).dropna().sort_values()
+
+    # Establish min/max bounds
+    if base_dates is not None and len(base_dates) > 0:
+        dmin, dmax = base_dates.min(), base_dates.max()
+    else:
+        # fallback: use min/max from the union itself
+        dmin, dmax = idx.min(), idx.max()
+
+    # Trim to dataset window
+    return idx[(idx >= dmin) & (idx <= dmax)]
 
 def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     # ---- guards ----
@@ -1715,150 +1749,189 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             base_hours_m[k] = base_hours_m.get(k, 0.0) + float(r["base"])
 
     # Tolerant: process both raw sources so BO BAs using voice raw still compute shrinkage
-    try:
-        vraw = load_df("shrinkage_raw_voice")
-    except Exception:
-        vraw = None
-    if isinstance(vraw, pd.DataFrame) and not vraw.empty:
-        v = vraw.copy()
-        L = {str(c).strip().lower(): c for c in v.columns}
-        c_date = L.get("date"); c_hours = L.get("hours") or L.get("duration_hours") or L.get("duration")
-        c_state= L.get("superstate") or L.get("state")
-        c_ba   = L.get("business area") or L.get("ba")
-        c_sba  = L.get("sub business area") or L.get("sub_ba")
-        c_ch   = L.get("channel")
-        c_loc  = L.get("country") or L.get("location") or L.get("site") or L.get("city")
-        mask = pd.Series(True, index=v.index)
-        if c_ba and p.get("vertical"): mask &= v[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
-        if c_sba and p.get("sub_ba"): mask &= v[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
-        if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().isin(["voice","telephony","calls","inbound","outbound"]) | v[c_ch].astype(str).eq("")
-        if c_loc and loc_first:
-            loc_l = v[c_loc].astype(str).str.strip().str.lower()
-            target = loc_first.strip().lower()
-            # Align with weekly logic: only filter when an exact match exists
-            if loc_l.eq(target).any():
-                mask &= loc_l.eq(target)
-        v = v.loc[mask]
-        if c_date and c_state and c_hours and not v.empty:
-            pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
-            import re as _vre
-            def _sum_cols_series(patterns):
-                cols = []
-                for _c in pv.columns:
-                    cl = str(_c).strip().lower()
-                    if any(_vre.search(pat, cl) for pat in patterns):
-                        cols.append(_c)
-                if not cols:
-                    return pd.Series(0.0, index=pv.index)
-                sub = pv[cols]
+    if True:
+        try:
+            vraw = load_df("shrinkage_raw_voice")
+        except Exception:
+            vraw = None
+        if isinstance(vraw, pd.DataFrame) and not vraw.empty:
+            v = vraw.copy()
+            L = {str(c).strip().lower(): c for c in v.columns}
+            c_date = L.get("date"); c_hours = L.get("hours") or L.get("duration_hours") or L.get("duration")
+            c_state= L.get("superstate") or L.get("state")
+            c_ba   = L.get("business area") or L.get("ba")
+            c_sba  = L.get("sub business area") or L.get("sub_ba")
+            c_ch   = L.get("channel")
+            # Prefer matching the plan's specificity: site > location > country > city
+            c_site = L.get("site")
+            c_location = L.get("location")
+            c_country = L.get("country")
+            c_city = L.get("city")
+
+            mask = pd.Series(True, index=v.index)
+            if c_ba and p.get("vertical"): mask &= v[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
+            if c_sba and p.get("sub_ba"): mask &= v[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
+            if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().eq("voice")
+            if loc_first:
+                target = loc_first.strip().lower()
+                matched = False
+                for col in [c_site, c_location, c_country, c_city]:
+                    if col and col in v.columns:
+                        loc_l = v[col].astype(str).str.strip().str.lower()
+                        if loc_l.eq(target).any():
+                            mask &= loc_l.eq(target)
+                            matched = True
+                            break
+
+            v = v.loc[mask]
+            if c_date and c_state and c_hours and not v.empty:
+                pv = v.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
+                # Robust Voice mapping: group superstates by patterns (return per-date Series)
+                import re as _vre
+                def _sum_cols_series(patterns):
+                    cols = []
+                    for _c in pv.columns:
+                        cl = str(_c).strip().lower()
+                        if any(_vre.search(pat, cl) for pat in patterns):
+                            cols.append(_c)
+                    if not cols:
+                        return pd.Series(0.0, index=pv.index)
+                    sub = pv[cols]
+                    try:
+                        sub = sub.apply(pd.to_numeric, errors="coerce").fillna(0.0)
+                    except Exception:
+                        pass
+                    if isinstance(sub, pd.Series):
+                        return pd.to_numeric(sub, errors="coerce").fillna(0.0)
+                    return sub.sum(axis=1)
+                base = _sum_cols_series([r"\bsc[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*total[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*available[_\s-]*time\b"]) 
+                # Align monthly Voice groupings with weekly summarize_shrinkage_voice
+                ooo  = _sum_cols_series([
+                    r"\bsc[_\s-]*absence",
+                    r"\bsc[_\s-]*holiday",
+                    r"\bsc[_\s-]*a[_\s-]*sick",
+                    r"\bsc[_\s-]*sick",
+                    r"\bsc[_\s-]*vacation",
+                    r"\bsc[_\s-]*leave",
+                    r"\bsc[_\s-]*unpaid",
+                ]) 
+                ino  = _sum_cols_series([
+                    r"\bsc[_\s-]*training",
+                    r"\bsc[_\s-]*break",
+                    r"\bsc[_\s-]*system[_\s-]*exception",
+                    r"\bsc[_\s-]*meeting",
+                    r"\bsc[_\s-]*coaching",
+                ]) 
+                idx_dates = pd.to_datetime(pv.index, errors="coerce")
+                _agg_monthly(idx_dates, ooo, ino, base)
+                # Do not populate SC denominators from Voice raw; keep Voice on base-hours formula
+                # (weekly behavior avoids SC/TTW for Voice so monthly should match)
                 try:
-                    sub = sub.apply(pd.to_numeric, errors='coerce').fillna(0.0)
+                    base_s = pd.to_numeric(base, errors='coerce')
+                    ov = pd.to_numeric(ooo, errors='coerce') + pd.to_numeric(ino, errors='coerce')
+                    frac = (ov / base_s.replace({0.0: np.nan})).fillna(0.0)
+                    for t, f in zip(idx_dates, frac):
+                        k = str(pd.to_datetime(t).date())
+                        if pd.notna(f):
+                            bo_shrink_frac_daily_m[k] = float(max(0.0, min(0.99, f)))
                 except Exception:
                     pass
-                if isinstance(sub, pd.Series):
-                    return pd.to_numeric(sub, errors='coerce').fillna(0.0)
-                return sub.sum(axis=1)
-            base = _sum_cols_series([r"\bsc[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*total[_\s-]*included[_\s-]*time\b", r"\bsc[_\s-]*available[_\s-]*time\b"]) 
-            ooo  = _sum_cols_series([r"\bsc[_\s-]*absence", r"\bsc[_\s-]*holiday", r"\bsc[_\s-]*a[_\s-]*sick", r"\bsc[_\s-]*sick"]) 
-            ino  = _sum_cols_series([r"\bsc[_\s-]*training", r"\bsc[_\s-]*break", r"\bsc[_\s-]*system[_\s-]*exception"]) 
-            idx_dates = pd.to_datetime(pv.index, errors="coerce")
-            _agg_monthly(idx_dates, ooo, ino, base)
-            # Do not populate SC denominators from Voice raw; keep Voice on base-hours formula
-            # (weekly behavior avoids SC/TTW for Voice so monthly should match)
-            try:
-                base_s = pd.to_numeric(base, errors='coerce')
-                ov = pd.to_numeric(ooo, errors='coerce') + pd.to_numeric(ino, errors='coerce')
-                frac = (ov / base_s.replace({0.0: np.nan})).fillna(0.0)
-                for t, f in zip(idx_dates, frac):
-                    k = str(pd.to_datetime(t).date())
-                    if pd.notna(f):
-                        bo_shrink_frac_daily_m[k] = float(max(0.0, min(0.99, f)))
-            except Exception:
-                pass
+    
+    if True:
+        try:
+            braw = load_df("shrinkage_raw_backoffice")
+        except Exception:
+            braw = None
+        if isinstance(braw, pd.DataFrame) and not braw.empty:
+            b = braw.copy()
+            L = {str(c).strip().lower(): c for c in b.columns}
+            c_date = L.get("date")
+            c_act = L.get("activity")
+            c_sec  = L.get("duration_seconds") or L.get("seconds") or L.get("duration")
+            c_ba   = L.get("journey") or L.get("business area") or L.get("ba") or L.get("vertical")
+            c_sba  = L.get("sub_business_area") or L.get("sub business area") or L.get("sub_ba")  or L.get("subba")
+            c_ch   = L.get("channel") or L.get("lob")
+            mask = pd.Series(True, index=b.index)
+            if c_ba and p.get("vertical"): mask &= b[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
+            if c_sba and p.get("sub_ba"): mask &= b[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
+            if c_ch:
+                mask &= b[c_ch].astype(str).str.strip().str.lower().isin(["back office","bo","backoffice"]) 
+            # Voice-like BO payload (Superstate/Hours) saved in backoffice store
+            c_state = L.get("superstate") or L.get("state")
+            c_hours = L.get("hours") or L.get("duration_hours")
+            if c_date and c_state and c_hours and not b.empty and (not c_act or b[c_act].isna().all()):
+                d2 = b[[c_date, c_state, c_hours]].copy()
+                d2[c_hours] = pd.to_numeric(d2[c_hours], errors="coerce").fillna(0.0)
+                d2[c_date]  = pd.to_datetime(d2[c_date], errors="coerce").dt.date
+                pv = d2.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
+                def col(name): return pv[name] if name in pv.columns else 0.0
+                base = col("SC_INCLUDED_TIME")
+                # Match weekly buckets exactly (extend OOO and In-Office)
+                ooo  = (
+                    col("SC_ABSENCE_TOTAL")
+                    + col("SC_HOLIDAY")
+                    + col("SC_A_Sick_Long_Term")
+                    + (pv["SC_VACATION"] if "SC_VACATION" in pv.columns else 0.0)
+                    + (pv["SC_LEAVE"] if "SC_LEAVE" in pv.columns else 0.0)
+                    + (pv["SC_UNPAID"] if "SC_UNPAID" in pv.columns else 0.0)
+                )
+                ino  = (
+                    col("SC_TRAINING_TOTAL")
+                    + col("SC_BREAKS")
+                    + col("SC_SYSTEM_EXCEPTION")
+                    + (pv["SC_MEETING"] if "SC_MEETING" in pv.columns else 0.0)
+                    + (pv["SC_COACHING"] if "SC_COACHING" in pv.columns else 0.0)
+                )
+                idx_dates = pd.to_datetime(pv.index, errors="coerce")
+                _agg_monthly(idx_dates, ooo, ino, base)
+            elif c_date and c_act and (c_sec or (L.get("hours") or L.get("duration_hours"))) and not b.empty:
+                d = b[[c_date, c_act, c_sec]].copy()
+                d[c_act] = d[c_act].astype(str).str.strip().str.lower()
+                d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
+                d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                act = d[c_act] 
+                # Broaden classifiers similar to weekly
+                m_div  = act.str.contains(r"\bdivert(?:ed)?\b", regex=True, na=False) | act.eq("diverted")
+                m_dow  = act.str.contains(r"\bdowntime\b|\bdown\b", regex=True, na=False) | act.eq("downtime")
+                m_sc   = act.str.contains(r"\bstaff\s*complement\b|\bsc[_\s-]*included[_\s-]*time\b|\bincluded\s*time\b|\bstaffed\s*hours\b", regex=True, na=False) | act.eq("staff complement")
+                m_fx   = act.str.contains(r"\bflexi?time\b|\bflex\b", regex=True, na=False) | act.eq("flexitime")
+                m_ot   = act.str.contains(r"\bover\s*time\b|\bovertime\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
+                m_lend = act.str.contains(r"\blend(?:ed)?\b|\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
+                m_borr = act.str.contains(r"\bborrow(?:ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
+                sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
+                sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
+                sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
+                sec_fx   = d.loc[m_fx,   c_sec].groupby(d[c_date]).sum()
+                sec_ot   = d.loc[m_ot,   c_sec].groupby(d[c_date]).sum()
+                sec_lend = d.loc[m_lend, c_sec].groupby(d[c_date]).sum()
+                sec_borr = d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
+                idx = build_idx(sec_div, sec_dow, sec_sc, sec_fx, sec_ot, sec_lend, sec_borr,
+                base_dates=d[c_date])
+                def get(s): return s.reindex(idx, fill_value=0.0)
+                # Seconds -> Hours
+                s_div = get(sec_div).astype(float); h_div = s_div / 3600.0
+                s_dow = get(sec_dow).astype(float); h_dow = s_dow / 3600.0
+                s_sc  = get(sec_sc).astype(float);  h_sc  = s_sc  / 3600.0
+                s_fx  = get(sec_fx).astype(float);  h_fx  = s_fx  / 3600.0
+                s_ot  = get(sec_ot).astype(float);  h_ot  = s_ot  / 3600.0
+                s_len = get(sec_lend).astype(float);h_len = s_len / 3600.0
+                s_bor = get(sec_borr).astype(float);h_bor = s_bor / 3600.0
 
-    try:
-        braw = load_df("shrinkage_raw_backoffice")
-    except Exception:
-        braw = None
-    if isinstance(braw, pd.DataFrame) and not braw.empty:
-        b = braw.copy()
-        L = {str(c).strip().lower(): c for c in b.columns}
-        c_date = L.get("date")
-        c_act = L.get("activity")
-        c_sec  = L.get("duration_seconds") or L.get("seconds") or L.get("duration")
-        c_ba   = L.get("journey") or L.get("business area") or L.get("ba") or L.get("vertical")
-        c_sba  = L.get("sub_business_area") or L.get("sub business area") or L.get("sub_ba")  or L.get("subba")
-        c_ch   = L.get("channel") or L.get("lob")
-        mask = pd.Series(True, index=b.index)
-        if c_ba and p.get("vertical"): mask &= b[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
-        if c_sba and p.get("sub_ba"): mask &= b[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
-        if c_ch:
-            mask &= b[c_ch].astype(str).str.strip().str.lower().isin(["back office","bo","backoffice"]) 
-        # Voice-like BO payload (Superstate/Hours) saved in backoffice store
-        c_state = L.get("superstate") or L.get("state")
-        c_hours = L.get("hours") or L.get("duration_hours")
-        if c_date and c_state and c_hours and not b.empty and (not c_act or b[c_act].isna().all()):
-            d2 = b[[c_date, c_state, c_hours]].copy()
-            d2[c_hours] = pd.to_numeric(d2[c_hours], errors="coerce").fillna(0.0)
-            d2[c_date]  = pd.to_datetime(d2[c_date], errors="coerce").dt.date
-            pv = d2.pivot_table(index=c_date, columns=c_state, values=c_hours, aggfunc="sum", fill_value=0.0)
-            def col(name): return pv[name] if name in pv.columns else 0.0
-            base = col("SC_INCLUDED_TIME")
-            # Match weekly buckets exactly
-            ooo  = col("SC_ABSENCE_TOTAL") + col("SC_HOLIDAY") + col("SC_A_Sick_Long_Term")
-            ino  = col("SC_TRAINING_TOTAL") + col("SC_BREAKS") + col("SC_SYSTEM_EXCEPTION")
-            idx_dates = pd.to_datetime(pv.index, errors="coerce")
-            _agg_monthly(idx_dates, ooo, ino, base)
-        elif c_date and c_act and (c_sec or (L.get("hours") or L.get("duration_hours"))) and not b.empty:
-            d = b[[c_date, c_act, c_sec]].copy()
-            d[c_act] = d[c_act].astype(str).str.strip().str.lower()
-            d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
-            d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
-            act = d[c_act] 
-            # Broaden classifiers similar to weekly
-            m_div  = act.str.contains(r"\bdivert(?:ed)?\b", regex=True, na=False) | act.eq("diverted")
-            m_dow  = act.str.contains(r"\bdowntime\b|\bdown\b", regex=True, na=False) | act.eq("downtime")
-            m_sc   = act.str.contains(r"\bstaff\s*complement\b|\bsc[_\s-]*included[_\s-]*time\b|\bincluded\s*time\b|\bstaffed\s*hours\b", regex=True, na=False) | act.eq("staff complement")
-            m_fx   = act.str.contains(r"\bflexi?time\b|\bflex\b", regex=True, na=False) | act.eq("flexitime")
-            m_ot   = act.str.contains(r"\bover\s*time\b|\bovertime\b|\bot\b|\bot\s*hours\b|\bot\s*hrs\b", regex=True, na=False) | act.eq("overtime")
-            m_lend = act.str.contains(r"\blend(?:ed)?\b|\blend\s*staff\b", regex=True, na=False) | act.eq("lend staff")
-            m_borr = act.str.contains(r"\bborrow(?:ed)?\b|\bborrow\s*staff\b", regex=True, na=False) | act.eq("borrowed staff")
-            sec_div  = d.loc[m_div,  c_sec].groupby(d[c_date]).sum()
-            sec_dow  = d.loc[m_dow,  c_sec].groupby(d[c_date]).sum()
-            sec_sc   = d.loc[m_sc,   c_sec].groupby(d[c_date]).sum()
-            sec_fx   = d.loc[m_fx,   c_sec].groupby(d[c_date]).sum()
-            sec_ot   = d.loc[m_ot,   c_sec].groupby(d[c_date]).sum()
-            sec_lend = d.loc[m_lend, c_sec].groupby(d[c_date]).sum()
-            sec_borr = d.loc[m_borr, c_sec].groupby(d[c_date]).sum()
-            idx = pd.to_datetime(pd.Index(
-                set(sec_div.index) | set(sec_dow.index) | set(sec_sc.index) | set(sec_fx.index) |
-                set(sec_ot.index)  | set(sec_lend.index)| set(sec_borr.index)
-            ), errors="coerce").sort_values()
-            def get(s): return s.reindex(idx, fill_value=0.0)
-            # Seconds -> Hours
-            s_div = get(sec_div).astype(float); h_div = s_div / 3600.0
-            s_dow = get(sec_dow).astype(float); h_dow = s_dow / 3600.0
-            s_sc  = get(sec_sc).astype(float);  h_sc  = s_sc  / 3600.0
-            s_fx  = get(sec_fx).astype(float);  h_fx  = s_fx  / 3600.0
-            s_ot  = get(sec_ot).astype(float);  h_ot  = s_ot  / 3600.0
-            s_len = get(sec_lend).astype(float);h_len = s_len / 3600.0
-            s_bor = get(sec_borr).astype(float);h_bor = s_bor / 3600.0
-
-            # Denominators per business rule
-            total_time_worked_h = (h_sc - h_dow + h_fx + h_ot + h_bor - h_len).clip(lower=0)
-            non_dow_base_h      = (h_sc + h_fx + h_ot + h_bor - h_len).clip(lower=0)
-            # Aggregate OOO (Downtime) and In-Office (Divert) hours; base as non-dow base
-            _agg_monthly(idx, h_dow, h_div, non_dow_base_h)
-            # Daily overall fraction (activity): (Downtime/SC) + (Diverted/TTW)
-            try:
-                for t, dhrs, scv, ttwv in zip(idx, h_div, h_sc, total_time_worked_h):
-                    k = str(pd.to_datetime(t).date())
-                    ooo_f = (float(h_dow.loc[t]) / float(scv)) if (t in h_dow.index and scv > 0) else 0.0
-                    ino_f = (float(dhrs) / float(ttwv)) if ttwv > 0 else 0.0
-                    bo_shrink_frac_daily_m[k] = max(0.0, min(0.99, ooo_f + ino_f))
-            except Exception:
-                pass
-            # Track denominators for BO shrink formulas (month key)
+                # Denominators per business rule
+                total_time_worked_h = (h_sc - h_dow + h_fx + h_ot + h_bor - h_len).clip(lower=0)
+                non_dow_base_h      = (h_sc + h_fx + h_ot + h_bor - h_len).clip(lower=0)
+                # Aggregate OOO (Downtime) and In-Office (Divert) hours; base as non-dow base
+                _agg_monthly(idx, h_dow, h_div, non_dow_base_h)
+                # Daily overall fraction (activity): (Downtime/SC) + (Diverted/TTW)
+                try:
+                    for t, dhrs, scv, ttwv in zip(idx, h_div, h_sc, total_time_worked_h):
+                        k = str(pd.to_datetime(t).date())
+                        ooo_f = (float(h_dow.loc[t]) / float(scv)) if (t in h_dow.index and scv > 0) else 0.0
+                        ino_f = (float(dhrs) / float(ttwv)) if ttwv > 0 else 0.0
+                        bo_shrink_frac_daily_m[k] = max(0.0, min(0.99, ooo_f + ino_f))
+                except Exception:
+                    pass
+                # Track denominators for BO shrink formulas (month key)
             # mk = _month_key(idx)
             # for t, scv, ttwh in zip(mk, h_sc, total_time_worked_h):
             #     k = str(pd.to_datetime(t).to_period('M').to_timestamp().date())
