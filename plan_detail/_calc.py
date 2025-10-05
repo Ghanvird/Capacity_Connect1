@@ -1235,14 +1235,19 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         for_user = _row_to_week_dict(fw_to_use, "Forecast AHT/SUT")
         for w in week_ids:
             new_f = for_user.get(w)
-            if new_f and wk_aht_sut_forecast.get(w, 0) and wk_aht_sut_forecast[w] > 0:
-                factor = float(new_f) / wk_aht_sut_forecast[w]
-                req_w_forecast[w] = float(req_w_forecast.get(w, 0.0)) * factor
+            if new_f is not None and str(new_f) != "" and not pd.isna(new_f):
+                base_f = float(wk_aht_sut_forecast.get(w, 0.0) or 0.0)
+                # Scale forecast requirements only when a positive base exists
+                if base_f > 0.0:
+                    factor = float(new_f) / base_f
+                    req_w_forecast[w] = float(req_w_forecast.get(w, 0.0)) * factor
                 wk_aht_sut_forecast[w] = float(new_f)
             new_b = bud_user.get(w)
-            if new_b and wk_aht_sut_budget.get(w, 0) and wk_aht_sut_budget[w] > 0:
-                factor = float(new_b) / wk_aht_sut_budget[w]
-                req_w_budgeted[w] = float(req_w_budgeted.get(w, 0.0)) * factor
+            if new_b is not None and str(new_b) != "" and not pd.isna(new_b):
+                base_b = float(wk_aht_sut_budget.get(w, 0.0) or 0.0)
+                if base_b > 0.0:
+                    factor = float(new_b) / base_b
+                    req_w_budgeted[w] = float(req_w_budgeted.get(w, 0.0)) * factor
                 wk_aht_sut_budget[w] = float(new_b)
     except Exception:
         pass
@@ -2151,7 +2156,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     handling_capacity = {}
 
     def _metric_for_capacity(actual_map, forecast_map, week):
-        # Why: Weekly capacity must honor Forecast AHT/SUT first, matching the monthly view.
+        # Prefer Forecast (weekly plan) like the monthly view; fall back to Actual.
         def _clean(val):
             try:
                 return max(0.0, float(val))
