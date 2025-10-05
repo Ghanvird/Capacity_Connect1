@@ -1047,8 +1047,26 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     # ---- Interval supply from global roster_long (monthly avg per interval) ----
     ivl_min = int(float(settings.get("interval_minutes", 30)) or 30)
     ivl_sec = 60 * ivl_min
-    monthly_voice_intervals = {}
+    # Estimate per-month interval coverage. Prefer actual interval coverage from voice
+    # forecast/actual (counts of interval rows), fall back to 24x7 if unavailable.
+    monthly_voice_intervals = {m: 0 for m in month_ids}
+    try:
+        _v_src = vF if (isinstance(vF, pd.DataFrame) and not vF.empty) else vA
+        if isinstance(_v_src, pd.DataFrame) and not _v_src.empty and {"date","interval_start"}.issubset(_v_src.columns):
+            tmp = _v_src.copy()
+            tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce").dt.normalize()
+            tmp = tmp.dropna(subset=["date"])
+            tmp["month"] = tmp["date"].dt.to_period("M").dt.to_timestamp().dt.normalize().dt.date.astype(str)
+            cov = tmp.groupby("month", as_index=False)["interval_start"].count()
+            cov_map = dict(zip(cov["month"], cov["interval_start"]))
+            for m in month_ids:
+                monthly_voice_intervals[m] = int(cov_map.get(m, 0))
+    except Exception:
+        pass
+    # Fallback to 24x7 effective-day coverage when no interval rows found
     for m in month_ids:
+        if int(monthly_voice_intervals.get(m, 0) or 0) > 0:
+            continue
         try:
             y = int(m[:4]); mo = int(m[5:7])
             days = calendar.monthrange(y, mo)[1]
