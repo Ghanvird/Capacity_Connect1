@@ -561,12 +561,32 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     ivl_sec = 60 * ivl_min
 
     weekly_voice_intervals = {}
+    def _week_cov(df: pd.DataFrame) -> dict:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {}
+        tmp = df.copy()
+        # Pick an interval column flexibly
+        ivl_col = None
+        for c in ("interval_start", "interval", "time"):
+            if c in tmp.columns:
+                ivl_col = c
+                break
+        if ivl_col is None or "date" not in tmp.columns:
+            return {}
+        tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce")
+        tmp = tmp.dropna(subset=["date"])  
+        if tmp.empty:
+            return {}
+        tmp["week"] = (tmp["date"] - pd.to_timedelta(tmp["date"].dt.weekday, unit="D")).dt.date.astype(str)
+        # Count interval rows per week (consistent with previous behavior)
+        g = tmp.groupby("week", as_index=False)[ivl_col].count()
+        return dict(zip(g["week"], g[ivl_col]))
     try:
-        if isinstance(vF, pd.DataFrame) and not vF.empty and {"date","interval_start"}.issubset(vF.columns):
-            tmp = vF.copy()
-            dts = pd.to_datetime(tmp["date"], errors="coerce")
-            tmp["week"] = (dts - pd.to_timedelta(dts.dt.weekday, unit="D")).dt.date.astype(str)
-            weekly_voice_intervals = tmp.groupby("week", as_index=False)["interval_start"].count().set_index("week")["interval_start"].to_dict()
+        cov_f = _week_cov(vF)
+        cov_a = _week_cov(vA)
+        weekly_voice_intervals = cov_f if (isinstance(cov_f, dict) and len(cov_f) > 0) else cov_a
+        if not isinstance(weekly_voice_intervals, dict):
+            weekly_voice_intervals = {}
     except Exception:
         weekly_voice_intervals = {}
     intervals_per_week_default = 7 * (24 * 3600 // ivl_sec)
