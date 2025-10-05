@@ -75,7 +75,7 @@ SECTIONS = [
          search="duplicate overwrite upsert append",
          body=html.Ul([
              html.Li("Headcount: upsert by BRID (last wins)."),
-             html.Li("Timeseries: overwrite per scope (last upload wins)."),
+             html.Li("Timeseries: append by date/week; overlapping dates are replaced."),
              html.Li("Roster snapshots: overwrite; long dedupes by (BRID,date)."),
              html.Li("Plan bulk roster: upsert per BRID within a plan."),
              html.Li("Shrinkage weekly: merged; Attrition weekly: overwrite."),
@@ -167,6 +167,3 @@ def _toggle_search(n, is_open):
 def _set_search_class(open_now):
     base = "help-search d-flex align-items-center ms-auto"
     return f"{base} open" if open_now else base
-
-
-
