@@ -2175,26 +2175,18 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
 
     projected_supply = {}
     prev = None
-    for m in month_ids:
-        if m <= today_m:
-            # Display the snapshot for the month, but carry forward end-of-month supply
-            # so that attrition/NH within this month reduces the next month.
-            actual_snap = float(hc_actual_row.get(m, 0))
-            eom = max(actual_snap - att_use_row[m] + nh_add_row[m], 0)
-            projected_supply[m] = eom
-            prev = eom
+    _month_ids_cf = sorted(month_ids, key=lambda x: pd.to_datetime(x, errors="coerce"))
+    for m in _month_ids_cf:
+        if m <= today_m and float(hc_actual_row.get(m, 0) or 0.0) > 0.0:
+            # Weekly-consistent behavior: use the actual snapshot for current/past months
+            projected_supply[m] = float(hc_actual_row.get(m, 0) or 0.0)
+            prev = projected_supply[m]
         else:
-            # First future month: seed from plan; subsequent months: carry forward prev.
+            # First future month: seed from Plan/Tactical HC; fallback to actual snapshot (no budget fallback in weekly)
             if prev is None:
                 prev = float(hc_plan_row.get(m, 0) or 0.0)
                 if prev <= 0:
                     prev = float(hc_actual_row.get(m, 0) or 0.0)
-                # As a last resort, seed from Budgeted HC for the month
-                if prev <= 0:
-                    try:
-                        prev = float(budget_m.get(m, 0.0) or 0.0)
-                    except Exception:
-                        prev = 0.0
             next_val = max(prev - float(att_use_row.get(m, 0)) + float(nh_add_row.get(m, 0)), 0.0)
             projected_supply[m] = next_val
             prev = next_val
