@@ -2303,10 +2303,10 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 
             nest_eff = eff_from_buckets(nest_buckets, lc["nesting_prod_pct"], lc["nesting_aht_uplift_pct"])
             sda_eff  = eff_from_buckets(sda_buckets,  lc["sda_prod_pct"],     lc["sda_aht_uplift_pct"])
-            # Apply shrink to Voice effective agents as well (in addition to occupancy)
+            # Apply shrink to Voice effective agents (do NOT apply occupancy here; use it as a cap on load)
             v_shr_add = (shrink_delta / 100.0) if (_wf_active(w) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
-            agents_eff = max(1.0, (agents_prod + nest_eff + sda_eff) * occ_frac_w[w] * (1.0 - v_eff_shr))
+            eff_agents = max(1.0, (agents_prod + nest_eff + sda_eff) * (1.0 - v_eff_shr))
             # Overtime: treat as equivalent agents based on hours per FTE and workdays/week
             try:
                 ot = float(overtime_w.get(w, 0.0) or 0.0)
@@ -2315,7 +2315,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             if ot:
                 wd_voice = int(settings.get("workdays_per_week", 7) or 7)
                 hpd      = float(settings.get("hours_per_fte", 8.0) or 8.0)
-                agents_eff += max(0.0, ot) / max(1.0, wd_voice * hpd)
+                eff_agents += max(0.0, ot) / max(1.0, wd_voice * hpd)
 
             base_aht = _metric_for_capacity(wk_aht_sut_actual, wk_aht_sut_forecast, w)
             # What-If AHT applies to future-only when no explicit window set
@@ -2326,7 +2326,13 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 aht = max(1.0, aht)
             n = weekly_voice_intervals.get(w)
             intervals = int(n) if isinstance(n, (int, np.integer)) and n > 0 else intervals_per_week_default
-            calls_per_ivl = _erlang_calls_capacity(agents_eff, aht, sl_seconds, ivl_sec, sl_target_pct)
+            # Compute unconstrained capacity at SL target
+            calls_per_ivl = _erlang_calls_capacity(eff_agents, aht, sl_seconds, ivl_sec, sl_target_pct)
+            # Enforce occupancy cap as a limit on offered load (erlangs <= occ * agents)
+            occ_cap_erlangs = float(occ_frac_w.get(w, 0.85)) * eff_agents
+            # convert occupancy-capped erlangs to calls/interval
+            occ_calls_cap = (occ_cap_erlangs * ivl_sec) / max(1.0, aht)
+            calls_per_ivl = min(calls_per_ivl, occ_calls_cap)
             handling_capacity[w] = calls_per_ivl * intervals
             # Optional debug for Voice only (does not alter logic)
             if os.environ.get("CAP_DEBUG_VOICE"):
@@ -2488,12 +2494,10 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 
             nest_eff = eff_from_buckets(nest_buckets, lc["nesting_prod_pct"], lc["nesting_aht_uplift_pct"])
             sda_eff  = eff_from_buckets(sda_buckets,  lc["sda_prod_pct"],     lc["sda_aht_uplift_pct"])
-
-            # Apply shrink to Voice effective agents in SL too
+            # For SL projection, use effective agents without applying occupancy cap to N
             v_shr_add = (shrink_delta / 100.0) if (_wf_active(w) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
-            agents_eff = max(1.0, (float(projected_supply.get(w, 0.0)) + nest_eff + sda_eff) * occ_frac_w[w] * (1.0 - v_eff_shr)
-)
+            agents_eff = max(1.0, (float(projected_supply.get(w, 0.0)) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
             sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
             proj_sl[w] = 100.0 * sl_frac
             if os.environ.get("CAP_DEBUG_VOICE"):
