@@ -381,7 +381,31 @@ def up_voice_forecast(contents, filename):
         "volume": pd.to_numeric(df[vol_c], errors="coerce").fillna(0.0),
     })
     if aht_c:
-        dff["aht_sec"] = pd.to_numeric(df[aht_c], errors="coerce").apply(_minutes_to_seconds)
+        # Smart seconds coercion: treat numbers as seconds; convert only time-like strings or explicit minutes
+        def _smart_to_seconds(x):
+            s = str(x).strip().lower()
+            if not s:
+                return None
+            if ":" in s:
+                # Try MM:SS first; fallback to HH:MM as minutes if second part >= 60
+                try:
+                    a, b = s.split(":", 1)
+                    a = float(a); b = float(b)
+                    return a*60.0 + b if b < 60 else (a*60.0 + b) * 60.0
+                except Exception:
+                    return None
+            if s.endswith("m") or "min" in s:
+                try:
+                    return float(s.rstrip("m").replace("min","")) * 60.0
+                except Exception:
+                    return None
+            try:
+                v = float(s)
+                # Heuristic: small numbers are minutes; otherwise seconds
+                return v*60.0 if v <= 20 else v
+            except Exception:
+                return None
+        dff["aht_sec"] = df[aht_c].apply(_smart_to_seconds)
     else:
         dff["aht_sec"] = 300.0  # sensible default
 
@@ -414,7 +438,31 @@ def up_voice_actual(contents, filename):
         "interval": df[ivl_c].map(_coerce_time),
         "volume": pd.to_numeric(df[vol_c], errors="coerce").fillna(0.0),
     })
-    dff["aht_sec"] = pd.to_numeric(df[aht_c], errors="coerce").apply(_minutes_to_seconds) if aht_c else 300.0
+    if aht_c:
+        def _smart_to_seconds(x):
+            s = str(x).strip().lower()
+            if not s:
+                return None
+            if ":" in s:
+                try:
+                    a, b = s.split(":", 1)
+                    a = float(a); b = float(b)
+                    return a*60.0 + b if b < 60 else (a*60.0 + b) * 60.0
+                except Exception:
+                    return None
+            if s.endswith("m") or "min" in s:
+                try:
+                    return float(s.rstrip("m").replace("min","")) * 60.0
+                except Exception:
+                    return None
+            try:
+                v = float(s)
+                return v*60.0 if v <= 20 else v
+            except Exception:
+                return None
+        dff["aht_sec"] = df[aht_c].apply(_smart_to_seconds)
+    else:
+        dff["aht_sec"] = 300.0
 
     for extra in ["Business Area","Sub Business Area","Channel"]:
         if extra in df.columns:
