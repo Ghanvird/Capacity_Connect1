@@ -39,9 +39,9 @@ def _bo_bucket(activity: str) -> str:
     if "work out" in s or "workout" in s: return "work_out"
     return "other"
 
-
-def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
-    """Daily BO summary in hours with buckets needed for new shrinkage formula.
+def summarize_shrinkage_bo(dff: pd.DataFrame, shift_week_commencing: bool = True) -> pd.DataFrame:
+    """
+    Daily BO summary in hours with buckets needed for new shrinkage formula.
     Buckets come from `_bo_bucket` applied to the free-text `activity` field.
     Returns per-day rows including:
       - "OOO Hours"      := Downtime
@@ -51,8 +51,15 @@ def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
     """
     if dff is None or dff.empty:
         return pd.DataFrame()
+
     d = dff.copy()
-    d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
+
+    # Keep as datetime64[ns] for safe comparisons
+    d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.normalize()
+
+    # Optional: shift week-commencing Mondays into mid-week (so 30 Jun → 3 Jul)
+    if shift_week_commencing:
+        d["date"] = d["date"] + pd.offsets.Day(3)
 
     # Derive explicit buckets
     d["bucket"] = d.get("activity", "").map(_bo_bucket)
@@ -71,19 +78,25 @@ def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
         val_col = "duration_seconds"
         factor = 1.0 / 3600.0
 
+    # Aggregate by keys + bucket
     agg = (
         d.groupby(keys + ["bucket"], dropna=False)[val_col]
          .sum()
          .reset_index()
     )
-    pivot = agg.pivot_table(index=keys, columns="bucket", values=val_col, fill_value=0.0).reset_index()
+
+    # Pivot buckets into columns
+    pivot = agg.pivot_table(
+        index=keys, columns="bucket", values=val_col, fill_value=0.0
+    ).reset_index()
 
     def _col(frame: pd.DataFrame, names: list[str]) -> pd.Series:
         for nm in names:
             if nm in frame.columns:
-                return frame[nm]
+                return frame[nm].copy()
         return pd.Series(0.0, index=frame.index)
 
+    # Extract buckets
     sc  = _col(pivot, ["staff_complement"]) * factor
     dwn = _col(pivot, ["downtime"]) * factor
     flx = _col(pivot, ["flextime"]) * factor
@@ -92,13 +105,16 @@ def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
     lnd = _col(pivot, ["lend_staff", "lend"]) * factor
     div = _col(pivot, ["diverted"]) * factor
 
+    # TTW formula
     ttw = sc - dwn + flx + ot + bor - lnd
 
-    pivot["OOO Hours"] = dwn
+    # Add shrinkage buckets
+    pivot["OOO Hours"]       = dwn
     pivot["In Office Hours"] = div
-    pivot["Base Hours"] = sc
-    pivot["TTW Hours"] = ttw
+    pivot["Base Hours"]      = sc
+    pivot["TTW Hours"]       = ttw
 
+    # Rename keys for consistency
     pivot = pivot.rename(columns={
         "journey": "Business Area",
         "sub_business_area": "Sub Business Area",
@@ -109,6 +125,7 @@ def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
 
     keep_keys = [c for c in ["date", "Business Area", "Sub Business Area", "Channel", "Country", "Site"] if c in pivot.columns]
     keep = keep_keys + ["OOO Hours", "In Office Hours", "Base Hours", "TTW Hours"]
+
     return pivot[keep].sort_values(keep_keys)
 
 def _get_fw_value(fw_df, metric, col_id, default=0.0):
@@ -1888,7 +1905,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 d = b[[c_date, c_act, c_sec]].copy()
                 d[c_act] = d[c_act].astype(str).str.strip().str.lower()
                 d[c_sec] = pd.to_numeric(d[c_sec], errors="coerce").fillna(0.0)
-                d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                d[c_date] = pd.to_datetime(d[c_date], errors="coerce")
                 act = d[c_act] 
                 # Broaden classifiers similar to weekly
                 m_div  = act.str.contains(r"\bdivert(?:ed)?\b", regex=True, na=False) | act.eq("diverted")
@@ -1981,7 +1998,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                                 m &= sl.eq(tgt)
                 d2 = d2.loc[m]
                 if not d2.empty:
-                    d2['month'] = _mid(d2['date'])
+                    d2['month'] = pd.to_datetime(d2['date'], errors="coerce") + pd.offsets.Day(3)
+                    d2['month'] = d2['month'].dt.to_period("M").dt.to_timestamp().dt.date
                     agg = d2.groupby('month', as_index=False)[['OOO Hours','In Office Hours','Base Hours','TTW Hours']].sum()
                     for _, r3 in agg.iterrows():
                         k = str(r3['month'])
