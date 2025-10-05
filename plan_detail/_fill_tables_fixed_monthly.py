@@ -206,7 +206,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
 
     # ---- scope, plan, settings ----
     p = get_plan(pid) or {}
-    ch_first = (p.get("channel") or "").split(",")[0].strip()
+    # Prefer explicit Channel; fallback to LOB if missing, keep first of CSV
+    ch_first = (p.get("channel") or p.get("lob") or "").split(",")[0].strip()
     sk = _canon_scope(
         p.get("vertical"),
         p.get("sub_ba"),
@@ -2264,17 +2265,25 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             v_shr_add = (shrink_delta / 100.0) if (_wf_active_month(m) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
             agents_eff = max(1.0, (agents_prod + nest_eff + sda_eff) * occ_frac_m[m] * (1.0 - v_eff_shr))
-            # Only use AHT if an Actual or Forecast value exists; otherwise treat as 0 (no capacity)
+            # Pick AHT: prefer Actual > Forecast; fallback to Planned/Target to avoid zero capacity
             _a = vA_aht.get(m, np.nan)
             _f = vF_aht.get(m, np.nan)
-            if (pd.isna(_a) or _a <= 0) and (pd.isna(_f) or _f <= 0):
-                aht = 0.0
-            else:
-                aht = float(_a) if (not pd.isna(_a) and _a > 0) else float(_f)
+            try:
+                av = float(_a) if (not pd.isna(_a) and _a > 0) else None
+            except Exception:
+                av = None
+            try:
+                fv = float(_f) if (not pd.isna(_f) and _f > 0) else None
+            except Exception:
+                fv = None
+            aht = av if (av is not None) else (fv if (fv is not None) else float(planned_aht_m_voice.get(m, s_target_aht)))
+            try:
                 if _wf_active_month(m) and aht_delta:
-                    aht = max(1.0, aht * (1.0 + aht_delta / 100.0))
+                    aht = max(1.0, float(aht) * (1.0 + aht_delta / 100.0))
                 else:
-                    aht = max(1.0, aht)
+                    aht = max(1.0, float(aht))
+            except Exception:
+                aht = max(1.0, float(aht))
             intervals = monthly_voice_intervals.get(m, 0)
             if agents_eff <= 0.0 or intervals <= 0:
                 handling_capacity[m] = 0.0
