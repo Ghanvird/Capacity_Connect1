@@ -1303,6 +1303,70 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             out[mid] = int(round(float(np.mean(counts)))) if counts else 0
         return out
     
+    def _monthly_hc_step_from_roster(roster_df, mids, role_regex=r"\bagent\b"):
+        """Monthly snapshot step function similar to weekly _weekly_hc_step_from_roster.
+        Computes headcount as of the first day of each month label in mids.
+        """
+        if not isinstance(roster_df, pd.DataFrame) or roster_df.empty:
+            return {m: 0 for m in mids}
+        R = roster_df.copy()
+        # column maps
+        L = {str(c).strip().lower(): c for c in R.columns}
+        c_role = L.get("role") or L.get("position group") or L.get("position description")
+        c_cur  = L.get("current status") or L.get("current_status") or L.get("status")
+        c_work = L.get("work status")    or L.get("work_status")
+        c_ps   = L.get("production start") or L.get("production_start") or L.get("prod start") or L.get("prod_start") or L.get("to_production") or L.get("go_live")
+        c_td   = L.get("terminate date")   or L.get("terminate_date")   or L.get("termination date") or L.get("term_date")
+        if not c_role:
+            return {m: 0 for m in mids}
+        # status mask similar to weekly helper
+        eff_series = R[c_cur] if c_cur in R else R.get(c_work, pd.Series("", index=R.index))
+        status_norm = eff_series.astype(str).str.strip().str.lower()
+        def _status_allows(val: str) -> bool:
+            s = (val or "").strip().lower()
+            if not s:
+                return False
+            if "term" in s:
+                return True
+            return s in {"production", "prod", "in production", "active"}
+        status_mask = status_norm.apply(_status_allows)
+        # role mask
+        role = R[c_role].astype(str).str.strip().str.lower()
+        role_mask = role.str.contains(role_regex, na=False, regex=True)
+        X = R[role_mask & status_mask].copy()
+        if X.empty:
+            return {m: 0 for m in mids}
+        # convert dates to month ids
+        def _to_month_id(s):
+            t = pd.to_datetime(s, errors="coerce")
+            if pd.isna(t):
+                return None
+            return pd.Timestamp(t).to_period("M").to_timestamp().date().isoformat()
+        X["_psm"] = X[c_ps].apply(_to_month_id) if c_ps in X else None
+        X["_tm"]  = X[c_td].apply(_to_month_id) if c_td in X else None
+        # step build
+        diffs = {m: 0 for m in mids}
+        # Ensure chronological order
+        mids_sorted = sorted(mids, key=lambda x: pd.to_datetime(x, errors="coerce"))
+        first_m = mids_sorted[0]
+        base = 0
+        for _, r in X.iterrows():
+            psm = r.get("_psm"); tm = r.get("_tm")
+            started_before = (psm is None) or (psm < first_m)
+            terminated_before_or_on = (tm is not None) and (tm <= first_m)
+            if started_before and not terminated_before_or_on:
+                base += 1
+            if psm is not None and psm in diffs and psm >= first_m:
+                diffs[psm] += 1
+            if tm is not None and tm in diffs and tm >= first_m:
+                diffs[tm] -= 1
+        out = {}
+        running = base
+        for m in mids_sorted:
+            running += diffs.get(m, 0)
+            out[m] = int(max(0, running))
+        # keep original order keys too
+        return {m: out.get(m, 0) for m in mids}
     hc_actual_m = _monthly_hc_average_from_roster(roster_df, month_ids, r"\bagent\b")
     hc_baseline_m = {m:0 for m in month_ids}
     if isinstance(roster_df, pd.DataFrame) and not roster_df.empty:
@@ -1376,16 +1440,16 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     #                 hc_baseline_m[mm] = int(mask.sum())
     #             except Exception:
     #                 pass
+    # Monthly step snapshot to mimic weekly behavior
+    hc_step_m = _monthly_hc_step_from_roster(roster_df, month_ids, r"\bagent\b")
+    try:
+        if sum(hc_step_m.values()) == 0:
+            hc_step_m = _monthly_hc_step_from_roster(roster_df, month_ids, r".*")
+    except Exception:
+        pass
     sme_billable_m = _monthly_hc_average_from_roster(roster_df, month_ids, r"\bsme\b")
     for m in month_ids:
-        # Prefer baseline; fallback to daily-average snapshot if baseline is zero
-        _hc_val = int(hc_baseline_m.get(m, 0) or 0)
-        if _hc_val == 0:
-            try:
-                _hc_val = int(hc_actual_m.get(m, 0) or 0)
-            except Exception:
-                _hc_val = 0
-        hc.loc[hc["metric"] == "Actual Agent HC (#)", m] = _hc_val
+        hc.loc[hc["metric"] == "Actual Agent HC (#)", m] = int(hc_step_m.get(m, 0) or 0)
         hc.loc[hc["metric"] == "SME Billable HC (#)", m] = sme_billable_m.get(m, 0)
 
     # ---- Budget vs simple Planned HC (monthly reduce) ----
@@ -2061,7 +2125,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         return {mm: float(pd.to_numeric(row.get(mm), errors="coerce")) for mm in month_ids}
 
     hc_plan_row   = _row_as_dict(hc,  "Planned/Tactical HC (#)")
-    hc_actual_row = {m: float(hc_baseline_m.get(m, 0)) for m in month_ids}
+    # Use monthly step snapshot (weekly-like) for actuals to align carry-forward with weekly view
+    hc_actual_row = {m: float((_v if _v is not None else 0)) for m, _v in (hc_step_m.items() if 'hc_step_m' in locals() else {mm:0 for mm in month_ids}.items())}
     att_plan_row  = _row_as_dict(att, "Planned Attrition HC (#)")
     att_act_row   = _row_as_dict(att, "Actual Attrition HC (#)")
     att_plan_pct_row  = _row_as_dict(att, "Planned Attrition %")
