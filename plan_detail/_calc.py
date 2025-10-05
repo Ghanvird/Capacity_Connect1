@@ -1072,7 +1072,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     req_daily_budgeted = required_fte_daily(vB, bB, oB, settings)
     if isinstance(req_daily_budgeted, pd.DataFrame) and not req_daily_budgeted.empty and isinstance(cB, pd.DataFrame) and not cB.empty:
         try:
-            chb = _chat_fte_daily(cB, settings)
+            chb = chat_fte_daily(cB, settings)
             m = req_daily_budgeted.merge(chb, on=["date","program"], how="left")
             m["chat_fte"] = pd.to_numeric(m.get("chat_fte"), errors="coerce").fillna(0.0)
             m["total_req_fte"] = pd.to_numeric(m.get("total_req_fte"), errors="coerce").fillna(0.0) + m["chat_fte"]
@@ -1237,7 +1237,6 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             new_f = for_user.get(w)
             if new_f is not None and str(new_f) != "" and not pd.isna(new_f):
                 base_f = float(wk_aht_sut_forecast.get(w, 0.0) or 0.0)
-                # Scale forecast requirements only when a positive base exists
                 if base_f > 0.0:
                     factor = float(new_f) / base_f
                     req_w_forecast[w] = float(req_w_forecast.get(w, 0.0)) * factor
