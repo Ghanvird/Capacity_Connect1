@@ -1022,8 +1022,16 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 fw.loc[fw["metric"] == "Actual Volume", w] = at
             # AHT/SUT rows
             aht_act = float(a_aht.get(w, 0.0) or 0.0)
-            aht_for = float((planned_aht_w.get(w, f_aht.get(w, 0.0)) if ch_key != 'bo' else planned_sut_w.get(w, f_aht.get(w, 0.0))) or 0.0)
-            # Apply What-If AHT/SUT to Forecast row for future weeks so user sees uplift
+            # Prefer uploaded Forecast AHT/SUT; fall back to planned/budgeted when missing
+            base_for = f_aht.get(w, None)
+            if base_for in (None, "") or (isinstance(base_for, (int, float)) and base_for <= 0):
+                # Chat uses planned AHT; Outbound also uses AHT (talk_sec) when available
+                base_for = planned_aht_w.get(w, s_budget_aht)
+            try:
+                aht_for = float(base_for) if base_for is not None else 0.0
+            except Exception:
+                aht_for = 0.0
+            # Apply What-If AHT/SUT to Forecast row for active weeks so user sees uplift
             try:
                 if _wf_active(w) and aht_delta:
                     aht_for = max(0.0, aht_for * (1.0 + aht_delta / 100.0))
