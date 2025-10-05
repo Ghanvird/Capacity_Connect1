@@ -1634,10 +1634,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         if c_sba and p.get("sub_ba"): mask &= v[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
         if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().isin(["voice","telephony","calls","inbound","outbound"]) | v[c_ch].astype(str).eq("")
         if c_loc and loc_first:
-            loc_series = v[c_loc].astype(str).str.strip()
-            loc_l = loc_series.str.lower()
+            loc_l = v[c_loc].astype(str).str.strip().str.lower()
             target = loc_first.strip().lower()
-            if loc_l.ne("").any() and loc_l.ne("all").any() and loc_l.eq(target).any():
+            # Align with weekly logic: only filter when an exact match exists
+            if loc_l.eq(target).any():
                 mask &= loc_l.eq(target)
         v = v.loc[mask]
         if c_date and c_state and c_hours and not v.empty:
@@ -2201,14 +2201,24 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
 
     # ---- Handling capacity & Projected SL (monthly) ----
     def _erlang_c(A: float, N: int) -> float:
-        if N <= 0: return 1.0
-        if A <= 0: return 0.0
-        if A >= N: return 1.0
-        s = 0.0
-        for k in range(N):
-            s += (A**k) / math.factorial(k)
-        last = (A**N) / math.factorial(N) * (N / (N - A))
-        p0 = 1.0 / (s + last)
+        # Numerically stable Erlang C using recursive terms
+        if N <= 0:
+            return 1.0
+        if A <= 0:
+            return 0.0
+        if A >= N:
+            return 1.0
+        term = 1.0
+        s = term
+        for k in range(1, N):
+            term *= A / k
+            s += term
+        term *= A / N  # A^N / N!
+        last = term * (N / (N - A))
+        denom = s + last
+        if denom <= 0:
+            return 1.0
+        p0 = 1.0 / denom
         return last * p0
 
     def _erlang_sl(calls_per_ivl: float, aht_sec: float, agents: float, asa_sec: int, ivl_sec: int) -> float:
@@ -2219,18 +2229,25 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (asa_sec / max(1.0, aht_sec)))))
 
     def _erlang_calls_capacity(agents: float, aht_sec: float, asa_sec: int, ivl_sec: int, target_pct: float) -> float:
+        # If target SL is unattainable at max throughput, return throughput cap instead of zero
         if agents <= 0 or aht_sec <= 0 or ivl_sec <= 0:
             return 0.0
         target = float(target_pct) / 100.0
+        def sl_for(x: int) -> float:
+            return _erlang_sl(x, aht_sec, agents, asa_sec, ivl_sec)
         hi = max(1, int((agents * ivl_sec) / aht_sec))
-        def sl_for(x): return _erlang_sl(x, aht_sec, agents, asa_sec, ivl_sec)
+        if sl_for(hi) < target:
+            return float(hi)
         lo = 0
         while sl_for(hi) >= target and hi < 10_000_000:
-            lo = hi; hi *= 2
+            lo = hi
+            hi *= 2
         while lo < hi:
             mid = (lo + hi + 1) // 2
-            if sl_for(mid) >= target: lo = mid
-            else: hi = mid - 1
+            if sl_for(mid) >= target:
+                lo = mid
+            else:
+                hi = mid - 1
         return float(lo)
 
     handling_capacity = {}
