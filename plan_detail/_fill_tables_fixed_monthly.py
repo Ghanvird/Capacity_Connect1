@@ -39,31 +39,9 @@ def _bo_bucket(activity: str) -> str:
     if "work out" in s or "workout" in s: return "work_out"
     return "other"
 
-def normalize_dates(df: pd.DataFrame, date_col: str, week_commencing: bool = True) -> pd.Series:
-    """
-    Normalize dates safely for any uploaded dataset.
-    
-    - Keeps datetime64[ns] dtype
-    - If week_commencing=True, shifts Mondays into mid-week
-      but clamps back into the dataset's min/max month
-    """
-    dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
 
-    if week_commencing:
-        # Shift into mid-week (Mon -> Thu)
-        shifted = dates + pd.offsets.Day(3)
-
-        # Clamp to dataset's min/max month
-        dmin, dmax = dates.min(), dates.max()
-        shifted = shifted.clip(lower=dmin, upper=dmax)
-
-        return shifted
-    else:
-        return dates
-
-def summarize_shrinkage_bo(dff: pd.DataFrame, shift_week_commencing: bool = True) -> pd.DataFrame:
-    """
-    Daily BO summary in hours with buckets needed for new shrinkage formula.
+def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
+    """Daily BO summary in hours with buckets needed for new shrinkage formula.
     Buckets come from `_bo_bucket` applied to the free-text `activity` field.
     Returns per-day rows including:
       - "OOO Hours"      := Downtime
@@ -73,15 +51,8 @@ def summarize_shrinkage_bo(dff: pd.DataFrame, shift_week_commencing: bool = True
     """
     if dff is None or dff.empty:
         return pd.DataFrame()
-
     d = dff.copy()
-
-    # Keep as datetime64[ns] for safe comparisons
-    d["date"] = normalize_dates(d, "date", week_commencing=True)
-
-    # Optional: shift week-commencing Mondays into mid-week (so 30 Jun → 3 Jul)
-    if shift_week_commencing:
-        d["date"] = d["date"] + pd.offsets.Day(3)
+    d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
 
     # Derive explicit buckets
     d["bucket"] = d.get("activity", "").map(_bo_bucket)
@@ -100,25 +71,19 @@ def summarize_shrinkage_bo(dff: pd.DataFrame, shift_week_commencing: bool = True
         val_col = "duration_seconds"
         factor = 1.0 / 3600.0
 
-    # Aggregate by keys + bucket
     agg = (
         d.groupby(keys + ["bucket"], dropna=False)[val_col]
          .sum()
          .reset_index()
     )
-
-    # Pivot buckets into columns
-    pivot = agg.pivot_table(
-        index=keys, columns="bucket", values=val_col, fill_value=0.0
-    ).reset_index()
+    pivot = agg.pivot_table(index=keys, columns="bucket", values=val_col, fill_value=0.0).reset_index()
 
     def _col(frame: pd.DataFrame, names: list[str]) -> pd.Series:
         for nm in names:
             if nm in frame.columns:
-                return frame[nm].copy()
+                return frame[nm]
         return pd.Series(0.0, index=frame.index)
 
-    # Extract buckets
     sc  = _col(pivot, ["staff_complement"]) * factor
     dwn = _col(pivot, ["downtime"]) * factor
     flx = _col(pivot, ["flextime"]) * factor
@@ -127,16 +92,13 @@ def summarize_shrinkage_bo(dff: pd.DataFrame, shift_week_commencing: bool = True
     lnd = _col(pivot, ["lend_staff", "lend"]) * factor
     div = _col(pivot, ["diverted"]) * factor
 
-    # TTW formula
     ttw = sc - dwn + flx + ot + bor - lnd
 
-    # Add shrinkage buckets
-    pivot["OOO Hours"]       = dwn
+    pivot["OOO Hours"] = dwn
     pivot["In Office Hours"] = div
-    pivot["Base Hours"]      = sc
-    pivot["TTW Hours"]       = ttw
+    pivot["Base Hours"] = sc
+    pivot["TTW Hours"] = ttw
 
-    # Rename keys for consistency
     pivot = pivot.rename(columns={
         "journey": "Business Area",
         "sub_business_area": "Sub Business Area",
@@ -147,7 +109,6 @@ def summarize_shrinkage_bo(dff: pd.DataFrame, shift_week_commencing: bool = True
 
     keep_keys = [c for c in ["date", "Business Area", "Sub Business Area", "Channel", "Country", "Site"] if c in pivot.columns]
     keep = keep_keys + ["OOO Hours", "In Office Hours", "Base Hours", "TTW Hours"]
-
     return pivot[keep].sort_values(keep_keys)
 
 def _get_fw_value(fw_df, metric, col_id, default=0.0):
@@ -199,6 +160,11 @@ def build_idx(*series_list, base_dates=None):
 
     # Trim to dataset window
     return idx[(idx >= dmin) & (idx <= dmax)]
+
+def clip_to_dataset_range(df: pd.DataFrame, date_col: str) -> pd.DataFrame:
+    """Trim any rows outside the true min/max of the uploaded dataset."""
+    dmin, dmax = df[date_col].min(), df[date_col].max()
+    return df[(df[date_col] >= dmin) & (df[date_col] <= dmax)]
 
 def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     # ---- guards ----
@@ -1981,9 +1947,17 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             #     sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(scv)
             #     tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
             # Capture overtime hours (monthly) from shrinkage raw (Back Office)
+            # Establish dataset month range
+            dataset_months = pd.to_datetime(b[c_date], errors="coerce").dt.to_period("M")
+            month_min, month_max = dataset_months.min(), dataset_months.max()
+
+            def clip_months(df, col="month"):
+                df[col] = pd.to_datetime(df[col], errors="coerce").dt.to_period("M")
+                return df[(df[col] >= month_min) & (df[col] <= month_max)]
             try:
                 mk = _month_key(sec_ot.index)
                 g_ot = pd.DataFrame({"month": mk, "ot": (sec_ot.astype(float) / 3600)}).groupby("month", as_index=False).sum()
+                g_ot = clip_months(g_ot, "month")
                 for _, r2 in g_ot.iterrows():
                     k2 = str(r2["month"])
                     overtime_hours_m[k2] = overtime_hours_m.get(k2, 0.0) + float(r2["ot"])
@@ -1992,6 +1966,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         # As a robustness fallback (and to match weekly behavior), also derive monthly OOO/SC/TTW via common.summarize_shrinkage_bo
         try:
             dsum = summarize_shrinkage_bo(b)
+            if not dsum.empty:
+                dsum = clip_to_dataset_range(dsum, "date")
             if isinstance(dsum, pd.DataFrame) and not dsum.empty:
                 d2 = dsum.copy()
                 # Filter to current plan scope
@@ -2020,9 +1996,9 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                                 m &= sl.eq(tgt)
                 d2 = d2.loc[m]
                 if not d2.empty:
-                    d2['month'] = pd.to_datetime(d2['date'], errors="coerce") + pd.offsets.Day(3)
-                    d2['month'] = d2['month'].dt.to_period("M").dt.to_timestamp().dt.date
+                    d2['month'] = _mid(d2['date'])
                     agg = d2.groupby('month', as_index=False)[['OOO Hours','In Office Hours','Base Hours','TTW Hours']].sum()
+                    agg  = clip_months(agg, "month")
                     for _, r3 in agg.iterrows():
                         k = str(r3['month'])
                         ooo_hours_m[k] = ooo_hours_m.get(k, 0.0) + float(r3['OOO Hours'])
