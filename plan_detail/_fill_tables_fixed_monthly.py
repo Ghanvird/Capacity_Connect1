@@ -330,6 +330,16 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             dt = pd.to_datetime(label, errors="coerce")
             if pd.isna(dt):
                 return None
+            # If the label looks like a weekly column (YYYY-MM-DD Monday),
+            # map it to the month that contains the majority of that ISO week
+            # by shifting to mid-week (Thursday).
+            try:
+                lbl = str(label)
+                if len(lbl) >= 10 and lbl[4] == '-' and lbl[7] == '-':
+                    if pd.Timestamp(dt).weekday() == 0:  # Monday-based week labels in grid
+                        dt = pd.Timestamp(dt) + pd.Timedelta(days=3)
+            except Exception:
+                pass
             return pd.Timestamp(dt).to_period("M").to_timestamp().date().isoformat()
         except Exception:
             return None
@@ -1947,17 +1957,9 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             #     sc_hours_m[k] = sc_hours_m.get(k, 0.0) + float(scv)
             #     tt_worked_hours_m[k] = tt_worked_hours_m.get(k, 0.0) + float(ttwh)
             # Capture overtime hours (monthly) from shrinkage raw (Back Office)
-            # Establish dataset month range
-            dataset_months = pd.to_datetime(b[c_date], errors="coerce").dt.to_period("M")
-            month_min, month_max = dataset_months.min(), dataset_months.max()
-
-            def clip_months(df, col="month"):
-                df[col] = pd.to_datetime(df[col], errors="coerce").dt.to_period("M")
-                return df[(df[col] >= month_min) & (df[col] <= month_max)]
             try:
                 mk = _month_key(sec_ot.index)
                 g_ot = pd.DataFrame({"month": mk, "ot": (sec_ot.astype(float) / 3600)}).groupby("month", as_index=False).sum()
-                g_ot = clip_months(g_ot, "month")
                 for _, r2 in g_ot.iterrows():
                     k2 = str(r2["month"])
                     overtime_hours_m[k2] = overtime_hours_m.get(k2, 0.0) + float(r2["ot"])
@@ -1998,7 +2000,6 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                 if not d2.empty:
                     d2['month'] = _mid(d2['date'])
                     agg = d2.groupby('month', as_index=False)[['OOO Hours','In Office Hours','Base Hours','TTW Hours']].sum()
-                    agg  = clip_months(agg, "month")
                     for _, r3 in agg.iterrows():
                         k = str(r3['month'])
                         ooo_hours_m[k] = ooo_hours_m.get(k, 0.0) + float(r3['OOO Hours'])
