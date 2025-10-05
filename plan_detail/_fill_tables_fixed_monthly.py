@@ -1050,17 +1050,34 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     # Estimate per-month interval coverage. Prefer actual interval coverage from voice
     # forecast/actual (counts of interval rows), fall back to 24x7 if unavailable.
     monthly_voice_intervals = {m: 0 for m in month_ids}
+    def _cov_counts(df: pd.DataFrame) -> dict:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {}
+        cols = set(df.columns)
+        if "date" not in cols:
+            return {}
+        ivl_col = None
+        for c in ("interval_start", "interval", "time"):
+            if c in cols:
+                ivl_col = c
+                break
+        if ivl_col is None:
+            return {}
+        t = df.copy()
+        t["date"] = pd.to_datetime(t["date"], errors="coerce").dt.normalize()
+        t = t.dropna(subset=["date"])  
+        if t.empty:
+            return {}
+        t["month"] = t["date"].dt.to_period("M").dt.to_timestamp().dt.normalize().dt.date.astype(str)
+        g = t.groupby("month", as_index=False)[ivl_col].count()
+        return dict(zip(g["month"], g[ivl_col]))
     try:
-        _v_src = vF if (isinstance(vF, pd.DataFrame) and not vF.empty) else vA
-        if isinstance(_v_src, pd.DataFrame) and not _v_src.empty and {"date","interval_start"}.issubset(_v_src.columns):
-            tmp = _v_src.copy()
-            tmp["date"] = pd.to_datetime(tmp["date"], errors="coerce").dt.normalize()
-            tmp = tmp.dropna(subset=["date"])
-            tmp["month"] = tmp["date"].dt.to_period("M").dt.to_timestamp().dt.normalize().dt.date.astype(str)
-            cov = tmp.groupby("month", as_index=False)["interval_start"].count()
-            cov_map = dict(zip(cov["month"], cov["interval_start"]))
-            for m in month_ids:
-                monthly_voice_intervals[m] = int(cov_map.get(m, 0))
+        cov_f = _cov_counts(vF)
+        cov_a = _cov_counts(vA)
+        # Prefer forecast coverage when present, otherwise fall back to actual
+        cov_map = cov_f if (isinstance(cov_f, dict) and sum(cov_f.values()) > 0) else cov_a
+        for m in month_ids:
+            monthly_voice_intervals[m] = int((cov_map or {}).get(m, 0))
     except Exception:
         pass
     # Fallback to 24x7 effective-day coverage when no interval rows found
