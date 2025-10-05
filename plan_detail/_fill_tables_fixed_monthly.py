@@ -1995,8 +1995,9 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
         # Pick formula by channel/denominators EXACTLY like weekly
         ch_lower = str(ch_first or "").strip().lower()
         is_bo_ch = (ch_lower in ("back office","bo")) or ("back office" in ch_lower)
-        # Match weekly behavior: use BO denominators only for Back Office channel
-        use_bo_denoms = is_bo_ch
+        # Match weekly behavior: prefer BO denominators when available; otherwise fall back to base
+        # This mirrors weekly logic where Voice can leverage BO SC/TTW if present
+        use_bo_denoms = (scm > 0.0 or ttwm > 0.0) or is_bo_ch
         if use_bo_denoms:
             # Back Office rule: OOO% = Downtime/SC, In-Office% = Divert/TTW
             ooo_pct = (100.0 * ooo / scm) if scm > 0 else 0.0
