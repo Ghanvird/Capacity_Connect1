@@ -538,7 +538,7 @@ def _canon_scope_key(sk: str) -> str:
     
 
 
-def save_timeseries(kind: str, scope_key: str, df: pd.DataFrame):
+def _save_timeseries_impl(kind: str, scope_key: str, df: pd.DataFrame):
     """
     kind ∈ {
       'voice_forecast_volume','voice_actual_volume','voice_forecast_aht','voice_actual_aht',
@@ -1156,3 +1156,6 @@ def save_timeseries(kind: str, scope_key: str, df: pd.DataFrame):
         pass
 
     save_df(name, out)
+
+# Bind public name to merged implementation (overrides earlier stub)
+save_timeseries = _save_timeseries_impl
