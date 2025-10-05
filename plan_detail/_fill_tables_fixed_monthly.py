@@ -1786,7 +1786,10 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             mask = pd.Series(True, index=v.index)
             if c_ba and p.get("vertical"): mask &= v[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
             if c_sba and p.get("sub_ba"): mask &= v[c_sba].astype(str).str.strip().str.lower().eq(p["sub_ba"].strip().lower())
-            if c_ch: mask &= v[c_ch].astype(str).str.strip().str.lower().eq("voice")
+            # Be tolerant like weekly: accept Voice synonyms and blanks
+            if c_ch:
+                ch_l = v[c_ch].astype(str).str.strip().str.lower()
+                mask &= ch_l.isin(["voice","telephony","calls","inbound","outbound"]) | ch_l.eq("")
             if loc_first:
                 target = loc_first.strip().lower()
                 matched = False
