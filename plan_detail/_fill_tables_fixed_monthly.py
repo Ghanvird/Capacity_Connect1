@@ -2333,7 +2333,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             sda_eff  = eff_from_buckets(sda_buckets,  lc["sda_prod_pct"],     lc["sda_aht_uplift_pct"])
             v_shr_add = (shrink_delta / 100.0) if (_wf_active_month(m) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
-            agents_eff = max(1.0, (agents_prod + nest_eff + sda_eff) * occ_frac_m[m] * (1.0 - v_eff_shr))
+            eff_agents = max(1.0, (agents_prod + nest_eff + sda_eff) * (1.0 - v_eff_shr))
             # Pick AHT: prefer Actual > Forecast; fallback to Planned/Target to avoid zero capacity
             _a = vA_aht.get(m, np.nan)
             _f = vF_aht.get(m, np.nan)
@@ -2354,10 +2354,15 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             except Exception:
                 aht = max(1.0, float(aht))
             intervals = monthly_voice_intervals.get(m, 0)
-            if agents_eff <= 0.0 or intervals <= 0:
+            if eff_agents <= 0.0 or intervals <= 0:
                 handling_capacity[m] = 0.0
             else:
-                calls_per_ivl = _erlang_calls_capacity(agents_eff, aht, sl_seconds, ivl_sec, sl_target_pct)
+                calls_per_ivl = _erlang_calls_capacity(eff_agents, aht, sl_seconds, ivl_sec, sl_target_pct)
+                # Occupancy cap as a limit on erlangs (not on agents)
+                occ_cap_erlangs = float(occ_m.get(m, 85))
+                occ_cap_erlangs = (occ_cap_erlangs/100.0) * eff_agents
+                occ_calls_cap = (occ_cap_erlangs * ivl_sec) / max(1.0, aht)
+                calls_per_ivl = min(calls_per_ivl, occ_calls_cap)
                 handling_capacity[m] = calls_per_ivl * intervals
             # Optional debug for Voice monthly
             import os as _os
@@ -2479,7 +2484,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             sda_eff  = eff_from_buckets(sda_buckets,  lc["sda_prod_pct"],     lc["sda_aht_uplift_pct"])
             v_shr_add = (shrink_delta / 100.0) if (_wf_active_month(m) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
-            agents_eff = max(1.0, (float(projected_supply.get(m, 0.0)) + nest_eff + sda_eff) * occ_frac_m[m] * (1.0 - v_eff_shr))
+            agents_eff = max(1.0, (float(projected_supply.get(m, 0.0)) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
             sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
             proj_sl[m] = 100.0 * sl_frac
             import os as _os2
