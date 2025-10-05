@@ -39,6 +39,28 @@ def _bo_bucket(activity: str) -> str:
     if "work out" in s or "workout" in s: return "work_out"
     return "other"
 
+def normalize_dates(df: pd.DataFrame, date_col: str, week_commencing: bool = True) -> pd.Series:
+    """
+    Normalize dates safely for any uploaded dataset.
+    
+    - Keeps datetime64[ns] dtype
+    - If week_commencing=True, shifts Mondays into mid-week
+      but clamps back into the dataset's min/max month
+    """
+    dates = pd.to_datetime(df[date_col], errors="coerce").dt.normalize()
+
+    if week_commencing:
+        # Shift into mid-week (Mon -> Thu)
+        shifted = dates + pd.offsets.Day(3)
+
+        # Clamp to dataset's min/max month
+        dmin, dmax = dates.min(), dates.max()
+        shifted = shifted.clip(lower=dmin, upper=dmax)
+
+        return shifted
+    else:
+        return dates
+
 def summarize_shrinkage_bo(dff: pd.DataFrame, shift_week_commencing: bool = True) -> pd.DataFrame:
     """
     Daily BO summary in hours with buckets needed for new shrinkage formula.
@@ -55,7 +77,7 @@ def summarize_shrinkage_bo(dff: pd.DataFrame, shift_week_commencing: bool = True
     d = dff.copy()
 
     # Keep as datetime64[ns] for safe comparisons
-    d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.normalize()
+    d["date"] = normalize_dates(d, "date", week_commencing=True)
 
     # Optional: shift week-commencing Mondays into mid-week (so 30 Jun → 3 Jul)
     if shift_week_commencing:
