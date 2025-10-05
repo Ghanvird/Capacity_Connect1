@@ -1076,3 +1076,83 @@ def _monday(d) -> str:
         t = pd.Timestamp.today().normalize()
     m = (t - pd.Timedelta(days=int(t.weekday()))).date().isoformat()
     return m
+
+# ---------------------------------------------------------------------------
+# Override: timeseries saving should append by date/week and replace overlaps
+# ---------------------------------------------------------------------------
+
+def save_timeseries(kind: str, scope_key: str, df: pd.DataFrame):
+    """
+    Save a time series for a scope, merging by date/week:
+      - Appends new dates/weeks
+      - Replaces existing rows for overlapping dates/weeks
+
+    Applies to all channels/series, e.g. Voice/BO/Chat/Outbound forecast/actual/tactical.
+    """
+    sk = _canon_scope_key(scope_key)
+    name = f"{kind}::{sk}"
+
+    new = df.copy() if isinstance(df, pd.DataFrame) else pd.DataFrame()
+    if not isinstance(new, pd.DataFrame):
+        new = pd.DataFrame()
+
+    def _norm_date_cols(_df: pd.DataFrame) -> tuple[pd.DataFrame, str | None, str | None]:
+        if not isinstance(_df, pd.DataFrame) or _df.empty:
+            return _df, None, None
+        d = _df.copy()
+        low = {str(c).strip().lower(): c for c in d.columns}
+        c_date = low.get("date")
+        c_week = low.get("week")
+        if c_date and c_date in d.columns:
+            d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date.astype(str)
+        if (not c_date) and c_week and c_week in d.columns:
+            d[c_week] = pd.to_datetime(d[c_week], errors="coerce").dt.date.astype(str)
+        return d, c_date, c_week
+
+    new, new_date, new_week = _norm_date_cols(new)
+
+    # Load existing
+    existing = load_df(name)
+    if not isinstance(existing, pd.DataFrame) or existing.empty:
+        save_df(name, new)
+        return
+
+    old, old_date, old_week = _norm_date_cols(existing)
+
+    # Choose merge key: prefer date, else week. If incompatible, fallback to overwrite.
+    if new_date and old_date:
+        kn, ko = new_date, old_date
+    elif (not new_date) and (not old_date) and new_week and old_week:
+        kn, ko = new_week, old_week
+    else:
+        # Different schemas (no common date/week); overwrite as legacy behavior
+        save_df(name, new)
+        return
+
+    # Align columns (union), keep order stable
+    all_cols = list(dict.fromkeys(list(old.columns) + list(new.columns)))
+    old = old.reindex(columns=all_cols)
+    new = new.reindex(columns=all_cols)
+
+    # Remove overlapping keys from old, then append new
+    try:
+        new_keys = set(pd.Series(new[kn]).dropna().astype(str).unique().tolist())
+    except Exception:
+        new_keys = set()
+    base = old if not new_keys else old[~old[ko].astype(str).isin(new_keys)].copy()
+    out = pd.concat([base, new], ignore_index=True)
+
+    # Sort by key and by interval if available for readability
+    low_out = {str(c).strip().lower(): c for c in out.columns}
+    sort_cols = [ko]
+    for cand in ("interval", "interval_start"):
+        c = low_out.get(cand)
+        if c:
+            sort_cols.append(c)
+            break
+    try:
+        out = out.sort_values(sort_cols)
+    except Exception:
+        pass
+
+    save_df(name, out)
