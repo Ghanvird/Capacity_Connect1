@@ -2222,8 +2222,10 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
         return last * p0
 
     def _erlang_sl(calls_per_ivl: float, aht_sec: float, agents: float, asa_sec: int, ivl_sec: int) -> float:
-        if aht_sec <= 0 or ivl_sec <= 0 or agents <= 0 or calls_per_ivl <= 0:
+        if aht_sec <= 0 or ivl_sec <= 0 or agents <= 0:
             return 0.0
+        if calls_per_ivl <= 0:
+            return 1.0
         A = (calls_per_ivl * aht_sec) / ivl_sec
         pw = _erlang_c(A, int(math.floor(agents)))
         return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (asa_sec / max(1.0, aht_sec)))))
