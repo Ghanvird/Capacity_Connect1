@@ -668,7 +668,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             fw.loc[fw["metric"] == "Forecast AHT/SUT", w] = forecast_aht_sut
         wk_aht_sut_budget[w] = budget_aht_sut
 
-    # Override FW grid for Voice channel to be Voice-only (no BO included)
+    # Override FW grid for Voice/BO channels to be channel-only
     ch_key = str(ch_first or '').strip().lower()
     if ch_key == 'voice':
         for w in week_ids:
@@ -743,6 +743,76 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 if cur <= 0.0:
                     fw.loc[fw["metric"] == "AHT/SUT", w] = bud_aht
             wk_aht_sut_budget[w] = bud_aht
+    elif ch_key in ('back office','bo'):
+        for w in week_ids:
+            # Volumes (BO only -> items)
+            f_bo = _get(bF_w, w, b_itm_col, 0.0) if b_itm_col else 0.0
+            a_bo = _get(bA_w, w, b_itm_col, 0.0) if b_itm_col else 0.0
+            t_bo = _get(bT_w, w, b_itm_col, 0.0) if b_itm_col else 0.0
+            if _wf_active(w) and vol_delta:
+                f_bo *= (1.0 + vol_delta / 100.0)
+            if "Forecast" in fw_rows:
+                fw.loc[fw["metric"] == "Forecast", w] = f_bo
+            if "Tactical Forecast" in fw_rows:
+                fw.loc[fw["metric"] == "Tactical Forecast", w] = t_bo
+            if "Actual Volume" in fw_rows:
+                fw.loc[fw["metric"] == "Actual Volume", w] = a_bo
+
+            # Actual SUT (BO only weighted)
+            a_num = a_den = 0.0
+            if b_sut_col_A:
+                ii = _get(bA_w, w, b_itm_col, 0.0)
+                ss = _get(bA_w, w, b_sut_col_A, 0.0)
+                if ii > 0 and ss > 0:
+                    a_num += ss * ii; a_den += ii
+            actual_sut = (a_num / a_den) if a_den > 0 else 0.0
+            actual_sut = float(actual_sut) if pd.notna(actual_sut) else 0.0
+            actual_sut = max(0.0, actual_sut)
+            if "Actual AHT/SUT" in fw_rows:
+                fw.loc[fw["metric"] == "Actual AHT/SUT", w] = actual_sut
+            elif "AHT/SUT" in fw_rows:
+                fw.loc[fw["metric"] == "AHT/SUT", w] = actual_sut
+            wk_aht_sut_actual[w] = actual_sut
+
+            # Forecast SUT (BO only; settings overrides honored)
+            f_num = f_den = 0.0
+            ovr_sut_bo = bo_ovr["aht_or_sut_w"].get(w)
+            if ovr_sut_bo is not None and f_bo > 0:
+                f_num += ovr_sut_bo * f_bo; f_den += f_bo
+            elif b_sut_col_F:
+                ii = _get(bF_w, w, b_itm_col, 0.0)
+                ss = _get(bF_w, w, b_sut_col_F, 0.0)
+                if ii > 0 and ss > 0:
+                    f_num += ss * ii; f_den += ii
+            if f_den > 0:
+                forecast_sut = (f_num / f_den)
+            else:
+                forecast_sut = float(planned_sut_w.get(w, s_budget_sut))
+            forecast_sut = float(forecast_sut) if pd.notna(forecast_sut) else 0.0
+            forecast_sut = max(0.0, forecast_sut)
+            try:
+                if _wf_active(w) and aht_delta:
+                    forecast_sut = max(0.0, forecast_sut * (1.0 + aht_delta / 100.0))
+            except Exception:
+                pass
+            if "Forecast AHT/SUT" in fw_rows:
+                fw.loc[fw["metric"] == "Forecast AHT/SUT", w] = forecast_sut
+            elif "AHT/SUT" in fw_rows:
+                fw.loc[fw["metric"] == "AHT/SUT", w] = forecast_sut
+            wk_aht_sut_forecast[w] = forecast_sut
+
+            # Budgeted SUT (BO planned)
+            bud_sut = planned_sut_w.get(w, s_budget_sut)
+            if "Budgeted AHT/SUT" in fw_rows:
+                fw.loc[fw["metric"] == "Budgeted AHT/SUT", w] = bud_sut
+            elif "AHT/SUT" in fw_rows and "Forecast AHT/SUT" not in fw_rows and "Actual AHT/SUT" not in fw_rows:
+                try:
+                    cur = float(pd.to_numeric(fw.loc[fw["metric"] == "AHT/SUT", w], errors="coerce").fillna(0.0).iloc[0])
+                except Exception:
+                    cur = 0.0
+                if cur <= 0.0:
+                    fw.loc[fw["metric"] == "AHT/SUT", w] = bud_sut
+            wk_aht_sut_budget[w] = bud_sut
 
     # Compute Backlog (Items) and Queue (Items) as selected
     backlog_w_local = {}
