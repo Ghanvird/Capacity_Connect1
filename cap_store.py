@@ -576,13 +576,54 @@ def load_timeseries(kind: str, scope_key: str) -> pd.DataFrame:
 
 
 def load_timeseries_any(kind: str, scopes: list[str]) -> pd.DataFrame:
-    frames = []
+    """
+    Load time series for any of the provided scope keys.
+    Supports both 3-part (BA|SBA|LOB) and 4-part (BA|SBA|LOB|SITE) keys by:
+      1) Trying exact 3-part/4-part canonical fetch via load_timeseries
+      2) If empty and a 3-part key is provided, merging all datasets whose stored key
+         starts with that 3-part prefix (i.e., all sites under that scope)
+    The returned frames will preserve the stored raw scope key in 'scope_key' when using
+    prefix-based fallback, so downstream site mapping remains accurate.
+    """
+    frames: list[pd.DataFrame] = []
     for sk in scopes or []:
-        d = load_timeseries(kind, _canon_scope_key(sk))
+        canon = _canon_scope_key(sk)
+        # Try exact
+        d = load_timeseries(kind, canon)
         if isinstance(d, pd.DataFrame) and not d.empty:
-            d = d.copy()
-            d["scope_key"] = _canon_scope_key(sk)
-            frames.append(d)
+            tmp = d.copy()
+            tmp["scope_key"] = canon
+            frames.append(tmp)
+            continue
+
+        # Try prefix match for 3-part keys (aggregate all matching 4-part stored keys)
+        parts = canon.split("|")
+        prefix3 = "|".join(parts[:3])
+        # If caller already passed 4-part, also try its first 3-part prefix
+        with _conn() as cx:
+            # Fast path: direct LIKE lookup for names starting with the prefix + '|'
+            like_pat = f"{kind}::{prefix3}|%"
+            rows = cx.execute("SELECT name FROM datasets WHERE name LIKE ?", (like_pat,)).fetchall()
+        for r in rows or []:
+            name = (r["name"] if isinstance(r, dict) else r[0]) if r else ""
+            if not name or "::" not in name:
+                continue
+            _, raw_sk = name.split("::", 1)
+            df = _ensure_df(load_df(name))
+            if isinstance(df, pd.DataFrame) and not df.empty:
+                tmp = df.copy()
+                # Preserve the stored key (includes site) for downstream mapping
+                tmp["scope_key"] = _canon_scope_key(raw_sk)
+                frames.append(tmp)
+
+        # As a final lenient fallback, also check for an exact 3-part key name
+        if not rows:
+            df3 = _ensure_df(load_df(f"{kind}::{prefix3}"))
+            if isinstance(df3, pd.DataFrame) and not df3.empty:
+                tmp = df3.copy()
+                tmp["scope_key"] = prefix3
+                frames.append(tmp)
+
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
