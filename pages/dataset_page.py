@@ -132,7 +132,8 @@ def page_dataset():
     opts_sba = sorted([x for x in dims["Sub Business Area"].unique().tolist() if x])
     # Location list should mimic the Settings page (Position Location Country)
     opts_loc = _all_locations()
-    opts_ch = sorted([x for x in (dims["Channel"].unique().tolist() if "Channel" in dims.columns else []) if x]) or list(CHANNEL_LIST)
+    # Channels should always use the fixed default list (not inferred from Headcount)
+    opts_ch = list(CHANNEL_LIST)
     opts_site = sorted([x for x in (dims["Site"].unique().tolist() if "Site" in dims.columns else []) if x])
 
     start, end = _today_range(56)
@@ -180,15 +181,11 @@ def _ds_dep_sba(ba_vals, sba_curr):
     Input("ds-ba", "value"), Input("ds-sba", "value"), State("ds-ch", "value"), prevent_initial_call=False
 )
 def _ds_dep_channel(ba_vals, sba_vals, ch_curr):
-    m = _hc_dim_df(); df = m.copy()
-    if ba_vals:
-        df = df[df["Business Area"].astype(str).str.strip().str.lower().isin({str(x).strip().lower() for x in (ba_vals if isinstance(ba_vals, list) else [ba_vals])})]
-    if sba_vals:
-        df = df[df["Sub Business Area"].astype(str).str.strip().str.lower().isin({str(x).strip().lower() for x in (sba_vals if isinstance(sba_vals, list) else [sba_vals])})]
-    ch_list = sorted([x for x in df["Channel"].astype(str).dropna().unique().tolist() if x]) or list(CHANNEL_LIST)
-    opts = [{"label":x, "value":x} for x in ch_list]
+    # Always offer the fixed default channel list; selection filtering is applied downstream
+    ch_list = list(CHANNEL_LIST)
+    opts = [{"label": x, "value": x} for x in ch_list]
     curr = ch_curr if isinstance(ch_curr, list) else ([ch_curr] if ch_curr else [])
-    # If nothing picked yet, default to all available channels (mimic defaults)
+    # If nothing picked yet, default to all channels
     if not curr:
         return opts, ch_list
     return opts, [x for x in curr if x in ch_list]
