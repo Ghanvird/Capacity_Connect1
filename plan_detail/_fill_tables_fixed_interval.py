@@ -188,6 +188,26 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 if k in upper_i.columns:
                     upper_i.loc[upper_i["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
             upper_tbl = _make_upper_table(_round_one_decimal(upper_i), ivl_cols)
+            # Also fill FW rows from native interval series for this day
+            def _fill_fw_from_voice(df, row_name, col_name):
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    return
+                d = df.copy(); d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.date
+                d = d[d["date"].eq(monday)]
+                if "interval" not in d.columns:
+                    return
+                labs = d["interval"].astype(str).str.slice(0,5)
+                vals = pd.to_numeric(d.get(col_name), errors="coerce").fillna(0.0).tolist()
+                mapping = dict(zip(labs, vals))
+                m = fw_i["metric"].astype(str).str.strip()
+                if row_name in m.values:
+                    for slot in ivl_ids:
+                        if slot in fw_i.columns and slot in mapping:
+                            fw_i.loc[m == row_name, slot] = float(mapping[slot])
+            _fill_fw_from_voice(vF, "Forecast", "volume")
+            _fill_fw_from_voice(vA, "Actual Volume", "volume")
+            _fill_fw_from_voice(vF, "Forecast AHT/SUT", "aht_sec")
+            _fill_fw_from_voice(vA, "Actual AHT/SUT", "aht_sec")
         elif ch0 == "chat":
             sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
             s = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch0)
@@ -275,6 +295,37 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 if k in upper_i.columns:
                     upper_i.loc[upper_i["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
             upper_tbl = _make_upper_table(_round_one_decimal(upper_i), ivl_cols)
+            # Fill FW rows from native interval series if present; fallback to uniform already set
+            def _fill_fw_from_chat(vol_df, aht_df, row_name_vol, row_name_aht):
+                if not isinstance(vol_df, pd.DataFrame) or vol_df.empty:
+                    return
+                d = vol_df.copy(); d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
+                d = d[d["date"].eq(monday)]
+                if "interval" not in d.columns:
+                    return
+                labs = d["interval"].astype(str).str.slice(0,5)
+                vol = pd.to_numeric(d.get("items"), errors="coerce").fillna(0.0).tolist()
+                mapping_vol = dict(zip(labs, vol))
+                m = fw_i["metric"].astype(str).str.strip()
+                if row_name_vol in m.values:
+                    for slot in ivl_ids:
+                        if slot in mapping_vol and slot in fw_i.columns:
+                            fw_i.loc[m == row_name_vol, slot] = float(mapping_vol[slot])
+                if isinstance(aht_df, pd.DataFrame) and not aht_df.empty:
+                    ah = aht_df.copy(); ah["date"] = pd.to_datetime(ah.get("date"), errors="coerce").dt.date
+                    ah = ah[ah["date"].eq(monday)]
+                    if "interval" in ah.columns:
+                        labs2 = ah["interval"].astype(str).str.slice(0,5)
+                        ahts  = pd.to_numeric(ah.filter(regex="aht", axis=1).iloc[:, -1], errors="coerce").fillna(0.0).tolist()
+                        mapping_aht = dict(zip(labs2, ahts))
+                        if row_name_aht in m.values:
+                            for slot in ivl_ids:
+                                if slot in mapping_aht and slot in fw_i.columns:
+                                    fw_i.loc[m == row_name_aht, slot] = float(mapping_aht[slot])
+            _fill_fw_from_chat(volF, ahtF, "Forecast", "Forecast AHT/SUT")
+            _fill_fw_from_chat(volA if isinstance(volA, pd.DataFrame) and not volA.empty else volF,
+                               ahtA if isinstance(ahtA, pd.DataFrame) and not ahtA.empty else ahtF,
+                               "Actual Volume", "Actual AHT/SUT")
         elif ch0 in ("outbound", "ob"):
             sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
             s = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch0)
@@ -412,6 +463,28 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 if k in upper_i.columns:
                     upper_i.loc[upper_i["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
             upper_tbl = _make_upper_table(_round_one_decimal(upper_i), ivl_cols)
+            # Fill FW rows from native interval series if present
+            def _fill_fw_from_ob(df, row_name_vol, row_name_aht):
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    return
+                d = df.copy(); d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
+                d = d[d["date"].eq(monday)]
+                if "interval" in d.columns and d["interval"].notna().any():
+                    labs = d["interval"].astype(str).str.slice(0,5)
+                    vol = pd.to_numeric(d.get("opc") if "opc" in d.columns else d.get("calls"), errors="coerce").fillna(0.0).tolist()
+                    aht = pd.to_numeric(d.get("aht"), errors="coerce").fillna(0.0).tolist()
+                    mapping_vol = dict(zip(labs, vol)); mapping_aht = dict(zip(labs, aht))
+                    m = fw_i["metric"].astype(str).str.strip()
+                    if row_name_vol in m.values:
+                        for slot in ivl_ids:
+                            if slot in mapping_vol and slot in fw_i.columns:
+                                fw_i.loc[m == row_name_vol, slot] = float(mapping_vol[slot])
+                    if row_name_aht in m.values:
+                        for slot in ivl_ids:
+                            if slot in mapping_aht and slot in fw_i.columns:
+                                fw_i.loc[m == row_name_aht, slot] = float(mapping_aht[slot])
+            _fill_fw_from_ob(F, "Forecast", "Forecast AHT/SUT")
+            _fill_fw_from_ob(A if isinstance(A, pd.DataFrame) and not A.empty else F, "Actual Volume", "Actual AHT/SUT")
         else:
             upper_tbl = _make_upper_table(_round_one_decimal(_broadcast_daily_to_intervals(upper_d, ivl_ids)), ivl_cols)
     except Exception:
