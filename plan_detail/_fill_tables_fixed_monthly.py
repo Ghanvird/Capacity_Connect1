@@ -247,6 +247,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     p = get_plan(pid) or {}
     # Prefer explicit Channel; fallback to LOB if missing, keep first of CSV
     ch_first = (p.get("channel") or p.get("lob") or "").split(",")[0].strip()
+    # Cache plan fields to avoid reusing 'p' later in the function
+    _plan_BA = p.get("vertical"); _plan_SBA = p.get("sub_ba"); _plan_SITE = (p.get("site") or p.get("location") or p.get("country"))
     sk = _canon_scope(
         p.get("vertical"),
         p.get("sub_ba"),
@@ -2582,7 +2584,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                     monthly_load = fv
                 else:
                     monthly_load = float(vT_vol.get(m, 0.0) or 0.0)
-            # Robust AHT pick: prefer Actual > Forecast > Target, handling None/NaN safely
+            # Robust AHT pick: prefer Actual > Forecast > Target
             _aa = vA_aht.get(m, None)
             _fa = vF_aht.get(m, None)
             try:
@@ -2601,10 +2603,8 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
                     aht_sut = max(1.0, float(aht_sut))
             except Exception:
                 aht_sut = max(1.0, float(aht_sut))
-            intervals = monthly_voice_intervals.get(m, 1)
-            calls_per_ivl = monthly_load / float(max(1, intervals))
-            lc = _learning_curve_for_month(settings, lc_ovr_df, m)
 
+            lc = _learning_curve_for_month(settings, lc_ovr_df, m)
             def eff_from_buckets(buckets, prod_pct_list, uplift_pct_list):
                 total = 0.0
                 login_f = _ovr_login_frac_m(m)
@@ -2621,19 +2621,155 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             sda_eff  = eff_from_buckets(sda_buckets,  lc["sda_prod_pct"],     lc["sda_aht_uplift_pct"])
             v_shr_add = (shrink_delta / 100.0) if (_wf_active_month(m) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
-            # Use schedule-based average supply when available (align with capacity calc); fallback to projected HC
             agents_prod = schedule_supply_avg_m.get(m, None)
             if agents_prod is None or agents_prod <= 0:
                 agents_prod = float(projected_supply.get(m, 0.0))
-            agents_eff = max(1.0, (float(agents_prod) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
-            sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
-            proj_sl[m] = 100.0 * sl_frac
+            agents_eff_avg = max(1.0, (float(agents_prod) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
+
+            # Arrival + staffing pattern across the month
+            def _slot_index_from_interval(val: str, ivl_min_local: int) -> int | None:
+                try:
+                    s = str(val or "").strip()
+                    mmm = re.search(r"(\d{1,2}):(\d{2})", s)
+                    if not mmm:
+                        return None
+                    hh = int(mmm.group(1)); mm = int(mmm.group(2))
+                    hh = min(23, max(0, hh)); mm = min(59, max(0, mm))
+                    start_min = hh * 60 + mm
+                    return int(start_min // max(1, ivl_min_local))
+                except Exception:
+                    return None
+
+            def _arrival_counts_month(src: pd.DataFrame, month_id: str, ivl_min_local: int) -> dict[int, float]:
+                if not isinstance(src, pd.DataFrame) or src.empty:
+                    return {}
+                d = src.copy()
+                if "date" not in d.columns or "interval" not in d.columns:
+                    return {}
+                d["date"] = pd.to_datetime(d["date"], errors="coerce")
+                d = d.dropna(subset=["date"]).copy()
+                start = pd.to_datetime(month_id, errors="coerce")
+                if pd.isna(start):
+                    return {}
+                # end of month
+                try:
+                    days_in_month = calendar.monthrange(start.year, start.month)[1]
+                except Exception:
+                    days_in_month = 30
+                end = start + pd.to_timedelta(days_in_month - 1, unit="D")
+                d = d[(d["date"] >= start) & (d["date"] <= end)]
+                if d.empty:
+                    return {}
+                d["_slot"] = d["interval"].map(lambda s: _slot_index_from_interval(s, ivl_min_local))
+                d["_vol"] = pd.to_numeric(d.get("volume", 0.0), errors="coerce").fillna(0.0)
+                d = d.dropna(subset=["_slot"]).astype({"_slot": int})
+                g = d.groupby("_slot", as_index=False)["_vol"].sum()
+                return dict(zip(g["_slot"], g["_vol"]))
+
+            def _staff_counts_month(ivl_min_local: int, month_id: str) -> dict[int, float]:
+                try:
+                    rl = load_roster_long()
+                except Exception:
+                    return {}
+                if not isinstance(rl, pd.DataFrame) or rl.empty:
+                    return {}
+                df = rl.copy()
+                # Scope filters
+                def _col(df, opts):
+                    for c in opts:
+                        if c in df.columns:
+                            return c
+                    return None
+                c_ba  = _col(df, ["Business Area","business area","vertical"])
+                c_sba = _col(df, ["Sub Business Area","sub business area","sub_ba"])
+                c_lob = _col(df, ["LOB","lob","Channel","channel"])
+                c_site= _col(df, ["Site","site","Location","location","Country","country"])
+                BA  = _plan_BA; SBA = _plan_SBA; LOB = ch_first
+                SITE= _plan_SITE
+                def _match(series, val):
+                    if not val or not isinstance(series, pd.Series):
+                        return pd.Series([True]*len(series))
+                    s = series.astype(str).str.strip().str.lower()
+                    return s.eq(str(val).strip().lower())
+                msk = pd.Series([True]*len(df))
+                if c_ba:  msk &= _match(df[c_ba], BA)
+                if c_sba and (SBA not in (None, "")): msk &= _match(df[c_sba], SBA)
+                if c_lob: msk &= _match(df[c_lob], LOB)
+                if c_site and (SITE not in (None, "")): msk &= _match(df[c_site], SITE)
+                df = df[msk]
+                if "is_leave" in df.columns:
+                    df = df[~df["is_leave"].astype(bool)]
+                if "date" not in df.columns or "entry" not in df.columns:
+                    return {}
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                df = df.dropna(subset=["date"]).copy()
+                start = pd.to_datetime(month_id, errors="coerce")
+                if pd.isna(start):
+                    return {}
+                try:
+                    days_in_month = calendar.monthrange(start.year, start.month)[1]
+                except Exception:
+                    days_in_month = 30
+                end = start + pd.to_timedelta(days_in_month - 1, unit="D")
+                df = df[(df["date"] >= start) & (df["date"] <= end)]
+                if df.empty:
+                    return {}
+                counts: dict[int, float] = {}
+                for _, r in df.iterrows():
+                    try:
+                        s = str(r.get("entry", "")).strip()
+                        mmm = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", s)
+                        if not mmm:
+                            continue
+                        sh, sm, eh, em = map(int, mmm.groups())
+                        sh = min(23, max(0, sh)); eh = min(24, max(0, eh))
+                        start_min = sh*60 + sm
+                        end_min   = eh*60 + em
+                        if end_min <= start_min:
+                            end_min += 24*60
+                        span = end_min - start_min
+                        slots = int(max(0, (span + (ivl_min-1)) // ivl_min))
+                        for k in range(slots):
+                            abs_min = start_min + k*ivl_min
+                            slot = int((abs_min % (24*60)) // ivl_min)
+                            counts[slot] = counts.get(slot, 0.0) + 1.0
+                    except Exception:
+                        continue
+                return counts
+
+            src = vA if (isinstance(vA, pd.DataFrame) and not vA.empty) else (vF if (isinstance(vF, pd.DataFrame) and not vF.empty) else vT)
+            arrival_counts = _arrival_counts_month(src, m, ivl_min)
+            if (not arrival_counts) or monthly_load <= 0:
+                # Fallback to legacy equal distribution when no pattern
+                intervals = monthly_voice_intervals.get(m, 1)
+                calls_per_ivl = monthly_load / float(max(1, intervals))
+                sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff_avg, sl_seconds, ivl_sec)
+                proj_sl[m] = 100.0 * sl_frac
+            else:
+                staff_counts = _staff_counts_month(ivl_min, m)
+                total_calls = sum(float(v or 0.0) for v in arrival_counts.values())
+                if total_calls <= 0:
+                    proj_sl[m] = 0.0
+                else:
+                    agents_by_slot: dict[int, float] = {}
+                    if staff_counts:
+                        vals = np.array(list(staff_counts.values()), dtype=float)
+                        mean_v = float(np.mean(vals)) if vals.size > 0 else 0.0
+                        for slot, _ in arrival_counts.items():
+                            w_s = float(staff_counts.get(slot, mean_v)) if mean_v > 0 else 1.0
+                            agents_by_slot[slot] = max(0.1, agents_eff_avg * (w_s / mean_v if mean_v > 0 else 1.0))
+                    num = 0.0
+                    for slot, c in arrival_counts.items():
+                        weight = float(c) / total_calls
+                        calls_i = monthly_load * weight
+                        N_i = agents_by_slot.get(slot, agents_eff_avg)
+                        sl_i = _erlang_sl(calls_i, max(1.0, float(aht_sut)), N_i, sl_seconds, ivl_sec)
+                        num += calls_i * sl_i
+                    proj_sl[m] = (100.0 * num / monthly_load) if monthly_load > 0 else 0.0
             import os as _os2
             if _os2.environ.get("CAP_DEBUG_VOICE"):
                 try:
-                    print(
-                        f"[VOICE-MONTH-SL][{m}] load={monthly_load:.1f} aht={aht_sut:.1f} intervals={intervals} agents_eff={agents_eff:.2f} sl={proj_sl[m]:.1f}"
-                    )
+                    print(f"[VOICE-MONTH-SL][{m}] load={monthly_load:.1f} aht={aht_sut:.1f} sl={proj_sl[m]:.1f}")
                 except Exception:
                     pass
         else:
@@ -2659,6 +2795,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     # FTE = ((Monthly Items * SUT_sec) / 3600) / MonthlyHoursPerFTE / (1 - Shrink)
     # Use planned shrink for consistency with examples; can be toggled later if needed.
     is_bo_monthly = str(ch_first or '').strip().lower() in ("back office", "bo")
+    bo_model = str(settings.get("bo_capacity_model", "tat")).lower()
     weekly_hours = float(settings.get("weekly_hours", settings.get("weekly_hours_per_fte", 40.0)) or 40.0)
     monthly_hours = weekly_hours * (52.0/12.0)
     # Read monthly shrink rows (numeric, pre-formatting)
@@ -2670,7 +2807,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
     shr_planned_pct_m = _row_as_dict_safe(shr, "Planned Shrinkage %")
     shr_actual_pct_m  = _row_as_dict_safe(shr, "Overall Shrinkage %")
 
-    if ("FTE Required @ Forecast Volume" in spec["upper"]) and is_bo_monthly:
+    if ("FTE Required @ Forecast Volume" in spec["upper"]) and is_bo_monthly and (bo_model != "erlang"):
         for mm in month_ids:
             vol = float(bF_itm.get(mm, 0.0))
             sut = float(bF_sut.get(mm, s_target_sut))
@@ -2699,7 +2836,7 @@ def _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, whatif=None):
             base_req = float(req_m_forecast.get(m, 0.0))
             reqq = (base_req * (qval / fval)) if fval > 0 else 0.0
             upper_df.loc[upper_df["metric"] == "FTE Required @ Queue", m] = reqq
-    if ("FTE Required @ Actual Volume" in spec["upper"]) and is_bo_monthly:
+    if ("FTE Required @ Actual Volume" in spec["upper"]) and is_bo_monthly and (bo_model != "erlang"):
         for mm in month_ids:
             vol = float(bA_itm.get(mm, 0.0))
             # Prefer actual SUT; fallback to forecast/target
