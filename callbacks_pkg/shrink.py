@@ -477,7 +477,7 @@ def up_shr_bo(contents, filename):
         summ = summarize_shrinkage_voice(dff)
     else:
         dff = normalize_shrinkage_bo(df)
-    summ = summarize_shrinkage_bo(dff)
+        summ = summarize_shrinkage_bo(dff)
     if dff.empty:
         return [], [], [], [], None
     return (
