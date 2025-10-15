@@ -6,9 +6,11 @@ from typing import List, Tuple
 from dash import dash_table
 
 from plan_store import get_plan
-from ._common import _week_span
+from cap_store import resolve_settings
+from ._common import _week_span, _scope_key, _assemble_voice
 from ._calc import _fill_tables_fixed
 from ._grain_cols import interval_cols_for_day
+from capacity_core import voice_requirements_interval
 
 
 def _broadcast_daily_to_intervals(df: pd.DataFrame, interval_ids: List[str]) -> pd.DataFrame:
@@ -155,7 +157,41 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     bva_i  = _round_one_decimal(_broadcast_daily_to_intervals(bva_d,  ivl_ids))
     nh_i   = _round_one_decimal(_broadcast_daily_to_intervals(nh_d,   ivl_ids))
 
-    upper_tbl = _make_upper_table(_round_one_decimal(_broadcast_daily_to_intervals(upper_d, ivl_ids)), ivl_cols)
+    # Upper (interval): for Voice, compute agents per interval for the representative day; fallback to broadcast
+    try:
+        p = get_plan(pid) or {}
+        ch0 = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
+        if ch0 == "voice":
+            sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
+            settings = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch0)
+            vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual")
+            def _agents(df):
+                try:
+                    iv = voice_requirements_interval(df, settings)
+                    iv = iv.copy(); iv["date"] = pd.to_datetime(iv["date"], errors="coerce").dt.date
+                    iv = iv[iv["date"].eq(monday)]
+                    lab = iv.get("interval")
+                    if lab is None: return {}
+                    s = lab.astype(str).str.slice(0,5)
+                    return dict(zip(s, pd.to_numeric(iv.get("agents_req"), errors="coerce").fillna(0.0)))
+                except Exception:
+                    return {}
+            mF = _agents(vF)
+            mA = _agents(vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF)
+            upper_i = pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]})
+            for slot in ivl_ids:
+                upper_i[slot] = 0.0
+            for k, v in mF.items():
+                if k in upper_i.columns:
+                    upper_i.loc[upper_i["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
+            for k, v in mA.items():
+                if k in upper_i.columns:
+                    upper_i.loc[upper_i["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
+            upper_tbl = _make_upper_table(_round_one_decimal(upper_i), ivl_cols)
+        else:
+            upper_tbl = _make_upper_table(_round_one_decimal(_broadcast_daily_to_intervals(upper_d, ivl_ids)), ivl_cols)
+    except Exception:
+        upper_tbl = _make_upper_table(_round_one_decimal(_broadcast_daily_to_intervals(upper_d, ivl_ids)), ivl_cols)
 
     return (
         upper_tbl,
