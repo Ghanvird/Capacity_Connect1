@@ -1,8 +1,4 @@
 # file: plan_detail/_callbacks_core.py
-
-
-# file: plan_detail/_callbacks_core.py
-# file: plan_detail/_callbacks_core.py
 from __future__ import annotations
 from dash import dcc, html, dash_table, Input, Output, State, ctx, no_update
 import dash
@@ -29,6 +25,9 @@ from ._common import (  # noqa
 
 from ._calc import _fill_tables_fixed
 from ._fill_tables_fixed_monthly import _fill_tables_fixed_monthly
+from ._fill_tables_fixed_daily import _fill_tables_fixed_daily
+from ._fill_tables_fixed_interval import _fill_tables_fixed_interval
+from ._grain_cols import day_cols_for_weeks, interval_cols_for_day
 
 
 def _verify_storage(pid: str | int, when: str) -> list[str]:
@@ -718,8 +717,21 @@ def register_plan_detail_core(app: dash.Dash):
             if isinstance(pid, str) and pid.startswith("ba::"):
                 from ba_rollup_plan import month_cols_for_ba, week_cols_for_ba
                 ba = pid.split("ba::", 1)[-1]
-                if str(grain or 'week').lower() == 'month':
+                g = str(grain or 'week').lower()
+                if g == 'month':
                     cols, ids = month_cols_for_ba(ba, status_filter="current")
+                elif g == 'day':
+                    wcols, wids = week_cols_for_ba(ba, status_filter="current")
+                    _weeks = [c["id"] for c in wcols if c.get("id") != "metric"]
+                    cols, ids = day_cols_for_weeks(_weeks)
+                elif g == 'interval':
+                    # Use first week Monday for header date to match interval calculations
+                    try:
+                        first_week = next((c["id"] for c in wcols if c.get("id") != "metric"), None)
+                        _monday = pd.to_datetime(first_week).date() if first_week else None
+                    except Exception:
+                        _monday = None
+                    cols, ids = interval_cols_for_day(_monday)
                 else:
                     cols, ids = week_cols_for_ba(ba, status_filter="current")
                 # Name and type
@@ -740,8 +752,19 @@ def register_plan_detail_core(app: dash.Dash):
             ptype = p.get("plan_type")  or "Volume Based"
 
             weeks = _week_span(p.get("start_week"), p.get("end_week"))
-            if str(grain or 'week').lower() == 'month':
+            g = str(grain or 'week').lower()
+            if g == 'month':
                 cols, week_ids = _month_cols(weeks)
+            elif g == 'day':
+                cols, week_ids = day_cols_for_weeks(weeks)
+            elif g == 'interval':
+                # Match the header date to the representative Monday used in calculations
+                try:
+                    _monday = pd.to_datetime(weeks[0]).date() if weeks else None
+                except Exception:
+                    _monday = None
+                cols, ivl_ids = interval_cols_for_day(_monday)
+                week_ids = ivl_ids
             else:
                 cols, week_ids = _week_cols(weeks)
 
@@ -792,6 +815,10 @@ def register_plan_detail_core(app: dash.Dash):
 
             if g == 'month':
                 results = _fill_tables_fixed_monthly(ptype, pid, fw_cols, _tick, w)
+            elif g == 'day':
+                results = _fill_tables_fixed_daily(ptype, pid, fw_cols, _tick, w)
+            elif g == 'interval':
+                results = _fill_tables_fixed_interval(ptype, pid, fw_cols, _tick, w)
             else:
                 results = _fill_tables_fixed(ptype, pid, fw_cols, _tick, w, grain='week')
 
@@ -869,15 +896,36 @@ def register_plan_detail_core(app: dash.Dash):
 
         # Toggle Week/Month via the UI switch
         @app.callback(
-            Output("plan-grain", "data"),
+            Output("plan-grain", "data", allow_duplicate=True),
             Input("toggle-switch", "value"),
-            prevent_initial_call=False
+            prevent_initial_call=True
         )
         def _set_grain(val):
             try:
                 return 'month' if bool(val) else 'week'
             except Exception:
                 return 'week'
+
+        # Explicit view buttons for Day / Interval (options panel)
+        @app.callback(
+            Output("plan-grain", "data", allow_duplicate=True),
+            Input("opt-view-day", "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def _set_day_view(n):
+            if not n:
+                raise dash.exceptions.PreventUpdate
+            return 'day'
+
+        @app.callback(
+            Output("plan-grain", "data", allow_duplicate=True),
+            Input("opt-view-interval", "n_clicks"),
+            prevent_initial_call=True,
+        )
+        def _set_interval_view(n):
+            if not n:
+                raise dash.exceptions.PreventUpdate
+            return 'interval'
 
 
         # Save all tabs
