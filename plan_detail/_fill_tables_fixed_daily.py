@@ -240,15 +240,23 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                 ino = d.groupby("date")["In Office Hours"].sum().to_dict()
                 base= d.groupby("date")["Base Hours"].sum().to_dict()
                 ttw = d.get("TTW Hours"); ttw = ttw.groupby(d["date"]).sum().to_dict() if isinstance(ttw, pd.Series) else {}
-                for k in day_ids:
-                    b = float(base.get(k, 0.0)); i = float(ino.get(k, 0.0)); o = float(ooo.get(k, 0.0)); t = float(ttw.get(k, b))
-                    shr_daily.loc[shr_daily["metric"].eq("OOO Shrink Hours (#)"),       k] = o
-                    shr_daily.loc[shr_daily["metric"].eq("In-Office Shrink Hours (#)"), k] = i
-                    ooo_pct = (100.0 * o / b) if b > 0 else 0.0
-                    ino_pct = (100.0 * i / t) if t > 0 else 0.0
-                    shr_daily.loc[shr_daily["metric"].eq("OOO Shrinkage %"),            k] = ooo_pct
-                    shr_daily.loc[shr_daily["metric"].eq("In-Office Shrinkage %"),       k] = ino_pct
-                    shr_daily.loc[shr_daily["metric"].eq("Overall Shrinkage %"),         k] = (ooo_pct + ino_pct)
+                arr_ooo  = [float(ooo.get(k, 0.0))  for k in day_ids]
+                arr_ino  = [float(ino.get(k, 0.0))  for k in day_ids]
+                arr_base = [float(base.get(k, 0.0)) for k in day_ids]
+                arr_ttw  = [float(ttw.get(k, arr_base[i])) for i, k in enumerate(day_ids)]
+                arr_ooo_pct = [(100.0 * o / b) if b > 0 else 0.0 for o, b in zip(arr_ooo, arr_base)]
+                arr_ino_pct = [(100.0 * i / t) if t > 0 else 0.0 for i, t in zip(arr_ino, arr_ttw)]
+                arr_ovr_pct = [o + i for o, i in zip(arr_ooo_pct, arr_ino_pct)]
+                mask = shr_daily["metric"].eq("OOO Shrink Hours (#)")
+                shr_daily.loc[mask, day_ids] = [arr_ooo]
+                mask = shr_daily["metric"].eq("In-Office Shrink Hours (#)")
+                shr_daily.loc[mask, day_ids] = [arr_ino]
+                mask = shr_daily["metric"].eq("OOO Shrinkage %")
+                shr_daily.loc[mask, day_ids] = [arr_ooo_pct]
+                mask = shr_daily["metric"].eq("In-Office Shrinkage %")
+                shr_daily.loc[mask, day_ids] = [arr_ino_pct]
+                mask = shr_daily["metric"].eq("Overall Shrinkage %")
+                shr_daily.loc[mask, day_ids] = [arr_ovr_pct]
         elif ch_key == "voice":
             dfraw = _safe_filter(load_df("shrinkage_raw_voice"), p)
             daily = summarize_shrinkage_voice(dfraw)
@@ -257,19 +265,25 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                 ooo = d.groupby("date")["OOO Hours"].sum().to_dict()
                 ino = d.groupby("date")["In Office Hours"].sum().to_dict()
                 base= d.groupby("date")["Base Hours"].sum().to_dict()
-                for k in day_ids:
-                    b = float(base.get(k, 0.0)); i = float(ino.get(k, 0.0)); o = float(ooo.get(k, 0.0))
-                    shr_daily.loc[shr_daily["metric"].eq("OOO Shrink Hours (#)"),       k] = o
-                    shr_daily.loc[shr_daily["metric"].eq("In-Office Shrink Hours (#)"), k] = i
-                    ooo_pct = (100.0 * o / b) if b > 0 else 0.0
-                    ino_pct = (100.0 * i / b) if b > 0 else 0.0
-                    shr_daily.loc[shr_daily["metric"].eq("OOO Shrinkage %"),            k] = ooo_pct
-                    shr_daily.loc[shr_daily["metric"].eq("In-Office Shrinkage %"),       k] = ino_pct
-                    shr_daily.loc[shr_daily["metric"].eq("Overall Shrinkage %"),         k] = (ooo_pct + ino_pct)
+                arr_ooo  = [float(ooo.get(k, 0.0))  for k in day_ids]
+                arr_ino  = [float(ino.get(k, 0.0))  for k in day_ids]
+                arr_base = [float(base.get(k, 0.0)) for k in day_ids]
+                arr_ooo_pct = [(100.0 * o / b) if b > 0 else 0.0 for o, b in zip(arr_ooo, arr_base)]
+                arr_ino_pct = [(100.0 * i / b) if b > 0 else 0.0 for i, b in zip(arr_ino, arr_base)]
+                arr_ovr_pct = [o + i for o, i in zip(arr_ooo_pct, arr_ino_pct)]
+                mask = shr_daily["metric"].eq("OOO Shrink Hours (#)")
+                shr_daily.loc[mask, day_ids] = [arr_ooo]
+                mask = shr_daily["metric"].eq("In-Office Shrink Hours (#)")
+                shr_daily.loc[mask, day_ids] = [arr_ino]
+                mask = shr_daily["metric"].eq("OOO Shrinkage %")
+                shr_daily.loc[mask, day_ids] = [arr_ooo_pct]
+                mask = shr_daily["metric"].eq("In-Office Shrinkage %")
+                shr_daily.loc[mask, day_ids] = [arr_ino_pct]
+                mask = shr_daily["metric"].eq("Overall Shrinkage %")
+                shr_daily.loc[mask, day_ids] = [arr_ovr_pct]
         # Planned shrink row (same for both)
         plan_pct = _planned_shr_pct(settings, ch_key)
-        for k in day_ids:
-            shr_daily.loc[shr_daily["metric"].eq("Planned Shrinkage %"), k] = plan_pct
+        shr_daily.loc[shr_daily["metric"].eq("Planned Shrinkage %"), day_ids] = [[plan_pct for _ in day_ids]]
     except Exception:
         pass
     shr_d = _round_one_decimal(shr_daily)
@@ -308,11 +322,11 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         mser = df["metric"].astype(str).str.strip()
         if row_name not in mser.values:
             return df
-        for dcol in day_ids:
-            if dcol in df.columns:
-                val = mapping.get(dcol)
-                if val is not None:
-                    df.loc[mser == row_name, dcol] = float(val)
+        # Vectorized assignment to avoid fragmentation: set only columns present in mapping
+        target_cols = [d for d in day_ids if (d in df.columns) and (d in mapping) and (mapping.get(d) is not None)]
+        if target_cols:
+            values = [[float(mapping[d]) for d in target_cols]]
+            df.loc[mser == row_name, target_cols] = values
         return df
 
     # Fill per channel
