@@ -1287,7 +1287,62 @@ def register_plan_detail_core(app: dash.Dash):
         )
         def _download_template(_n):
             cols = [c["name"] for c in _roster_columns()]
-            df = pd.DataFrame(columns=cols)
+            # Provide two example rows to guide users
+            ex1 = {
+                "BRID": "IN0001",
+                "Name": "Asha Rao",
+                "Class Reference": "NH-2024-11-01",
+                "Work Status": "Production",
+                "Role": "Agent",
+                "FT/PT Status": "Full-time",
+                "FT/PT Hours": 40,
+                "Current Status": "Production",
+                "Training Start": "2024-11-01",
+                "Training End": "2024-11-07",
+                "Nesting Start": "2024-11-08",
+                "Nesting End": "2024-11-15",
+                "Production Start": "2024-11-18",
+                "Terminate Date": "",
+                "Team Leader": "Priyanka Menon",
+                "AVP": "Anil Sharma",
+                "Business Area": "Bereavement and Delegated Authority",
+                "Sub Business Area": "Bereavement",
+                "LOB": "Back Office",
+                "LOA Date": "",
+                "Back from LOA Date": "",
+                "Site": "Candor TechSpace, Noida",
+            }
+            ex2 = {
+                "BRID": "UK0002",
+                "Name": "Alex Doe",
+                "Class Reference": "",
+                "Work Status": "Production",
+                "Role": "CSA",
+                "FT/PT Status": "Part-time",
+                "FT/PT Hours": 20,
+                "Current Status": "Production",
+                "Training Start": "",
+                "Training End": "",
+                "Nesting Start": "",
+                "Nesting End": "",
+                "Production Start": "2023-06-01",
+                "Terminate Date": "2024-09-30",
+                "Team Leader": "Chris Lee",
+                "AVP": "Samantha Jones",
+                "Business Area": "Retail",
+                "Sub Business Area": "Cards",
+                "LOB": "Voice",
+                "LOA Date": "",
+                "Back from LOA Date": "",
+                "Site": "Manchester, 4 Piccadilly Place",
+            }
+            rows = []
+            for ex in (ex1, ex2):
+                # ensure all expected columns exist (blank when not provided)
+                r = {c: "" for c in cols}
+                r.update(ex)
+                rows.append(r)
+            df = pd.DataFrame(rows, columns=cols)
             return dcc.send_data_frame(df.to_csv, "employee_roster_template.csv", index=False)
 
         # Notes save
