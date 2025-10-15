@@ -1,4 +1,4 @@
-﻿# file: plan_detail/_ui.py
+# file: plan_detail/_ui.py
 from __future__ import annotations
 from dash import html, dcc, dash_table
 import dash_bootstrap_components as dbc
@@ -6,6 +6,7 @@ from ._common import *  # noqa
 from datetime import date, timedelta
 from ._common import _load_or_empty_roster
 from dash import html, dcc, dash_table, Input, Output, State, callback, ctx, no_update
+from plan_detail._expand_week_bar import expand_week_bar_component
 import dash_bootstrap_components as dbc
 import pandas as pd
 from datetime import date, timedelta
@@ -232,11 +233,14 @@ def _lower_tabs() -> dbc.Card:
             dbc.Tabs(id="plan-tabs", active_tab="tab-fw", children=[
                 # Auto-computed tabs ? editable=False
                 dbc.Tab(label="Forecast & Workload", tab_id="tab-fw",
-                        children=[dash_table.DataTable(id="tbl-fw", editable=True,
+                        children=[
+                            # expand_week_bar_component(),
+                            dash_table.DataTable(id="tbl-fw", editable=True,
                                                        style_as_list_view=True,
                                                        style_table={"overflowX":"auto"},
                                                        style_header={"whiteSpace":"pre"},
-                                                       page_size=12)], class_name="ddd"),
+                                                       page_size=12)
+                        ], class_name="ddd"),
                 dbc.Tab(label="Headcount", tab_id="tab-hc",
                         children=[dash_table.DataTable(id="tbl-hc", editable=False,
                                                        style_as_list_view=True,
@@ -785,6 +789,13 @@ options_panel = dbc.Offcanvas(
             dbc.Col(dbc.Button(html.I(className="bi bi-arrows-expand"), id="opt-extend", color="secondary", outline=True,
                                className="w-100 mb-2", title="Extend Plan")),
     ]),
+    html.Small("View Grain"),
+    dbc.Row([
+            dbc.Col(dbc.Button("Day", id="opt-view-day", color="secondary", outline=True,
+                               className="w-100 mb-2", title="Daily View")),
+            dbc.Col(dbc.Button("Interval", id="opt-view-interval", color="secondary", outline=True,
+                               className="w-100 mb-2", title="Interval View")),
+    ]),
     dbc.Row([
             dbc.Col(dbc.Button("Delete Plan", id="opt-delete", color="danger", outline=True,
                                className="w-100 mb-2", title="Delete Plan"), md=12),
@@ -796,6 +807,8 @@ options_panel = dbc.Offcanvas(
     dbc.Tooltip("Save As", target="opt-saveas", placement="left"),
     dbc.Tooltip("Export", target="opt-export", placement="left"),
     dbc.Tooltip("Extend Plan", target="opt-extend", placement="left"),
+    dbc.Tooltip("Daily View", target="opt-view-day", placement="left"),
+    dbc.Tooltip("Interval View", target="opt-view-interval", placement="left"),
 
 
     html.Hr(className="my-3"),
@@ -1072,5 +1085,3 @@ def plan_detail_validation_layout() -> html.Div:
         ],
         style={"display": "none"}
     )
-
-
