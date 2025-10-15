@@ -175,6 +175,89 @@ def bo_rollups(bo_df: pd.DataFrame, settings: dict, week_start: str = "Monday"):
     return {"daily": daily, "weekly": weekly, "monthly": monthly}
 
 
+def bo_erlang_rollups(bo_df: pd.DataFrame, settings: dict, week_start: str = "Monday"):
+    """Daily + week/month FTE for Back Office using Erlang-style staffing on daily totals.
+    Approximates by treating the whole workday as a single interval of length coverage_minutes.
+    Uses target SL and occupancy cap from settings.
+    """
+    if bo_df is None or bo_df.empty:
+        empty = pd.DataFrame(columns=["date","program","fte_req"])
+        return {"daily": empty, "weekly": empty, "monthly": empty}
+
+    hrs    = float(settings.get("hours_per_fte", 8.0) or 8.0)
+    shrink = float(settings.get("bo_shrinkage_pct", settings.get("shrinkage_pct", 0.30)) or 0.30)
+    util   = float(settings.get("util_bo", settings.get("occupancy_cap", 0.85)) or 0.85)
+    # Workday minutes for Erlang bucket and FTE denominator
+    bo_hpd = float(settings.get("bo_hours_per_day", hrs) or hrs)
+    coverage_min = max(1.0, bo_hpd * 60.0)
+
+    target_sl = float(settings.get("bo_target_sl", settings.get("target_sl", 0.8)) or 0.8)
+    T_sec     = float(settings.get("bo_sl_seconds", settings.get("sl_seconds", 20)) or 20.0)
+    occ_cap   = float(util or 0.85)
+
+    df = bo_df.copy()
+    L = {c.lower(): c for c in df.columns}
+    date_c = L.get("date")
+    items_c= L.get("items") or L.get("volume")
+    aht_c  = L.get("aht_sec") or L.get("sut_sec") or L.get("sut")
+    prog_c = L.get("program") or L.get("business area")
+
+    if not items_c:
+        empty = pd.DataFrame(columns=["date","program","fte_req"])
+        return {"daily": empty, "weekly": empty, "monthly": empty}
+
+    # Normalize fields
+    out = pd.DataFrame({
+        "date": pd.to_datetime(df[date_c] if date_c else df.get("date"), errors="coerce").dt.date,
+        "items": pd.to_numeric(df[items_c], errors="coerce").fillna(0.0),
+    })
+    if aht_c:
+        out["aht_sec"] = pd.to_numeric(df[aht_c], errors="coerce").fillna(np.nan)
+    else:
+        out["aht_sec"] = np.nan
+    if prog_c:
+        out["program"] = df[prog_c].astype(str).replace("", "Back Office")
+    else:
+        out["program"] = "Back Office"
+    out = out.dropna(subset=["date"]).copy()
+
+    # Weighted AHT per (date, program)
+    def _agg(grp: pd.DataFrame):
+        it = pd.to_numeric(grp["items"], errors="coerce").fillna(0.0)
+        ah = pd.to_numeric(grp["aht_sec"], errors="coerce")
+        items_sum = float(it.sum())
+        if items_sum <= 0:
+            waht = float(settings.get("target_sut", settings.get("budgeted_sut", 600)) or 600.0)
+        else:
+            waht = float((it * ah.fillna(0.0)).sum() / max(1.0, items_sum))
+        return pd.Series({
+            "items": items_sum,
+            "aht_sec": waht,
+        })
+
+    g = out.groupby(["date","program"], as_index=False).apply(_agg).reset_index(drop=True)
+
+    # Erlang staffing for the day treated as one interval of coverage_min
+    def _staff_seconds_row(row: pd.Series) -> float:
+        calls = float(row.get("items", 0.0) or 0.0)
+        if calls <= 0:
+            return 0.0
+        aht = float(row.get("aht_sec", 0.0) or 0.0)
+        if aht <= 0:
+            return 0.0
+        N, _, _, _ = min_agents(calls, aht, int(round(coverage_min)), target_sl, T_sec, occ_cap)
+        return float(N) * coverage_min * 60.0
+
+    g["_staff_seconds"] = g.apply(_staff_seconds_row, axis=1)
+    denom = hrs * 3600.0 * max(1e-6, (1.0 - shrink))
+    g["fte_req"] = g["_staff_seconds"] / denom if denom > 0 else 0.0
+    daily = g[["date","program","fte_req"]].sort_values(["date","program"]).reset_index(drop=True)
+
+    wk = add_week_month_keys(daily, "date", week_start)
+    weekly  = wk.groupby(["week","program"], as_index=False)["fte_req"].sum().rename(columns={"week":"start_week"})
+    monthly = wk.groupby(["month","program"], as_index=False)["fte_req"].sum().rename(columns={"month":"month_start"})
+    return {"daily": daily, "weekly": weekly, "monthly": monthly}
+
 def chat_fte_daily(chat_df: pd.DataFrame, settings: dict) -> pd.DataFrame:
     """Daily FTE for Chat using Erlang C with concurrency adjustments."""
     if not isinstance(chat_df, pd.DataFrame) or chat_df.empty:
@@ -316,6 +399,9 @@ def required_fte_daily(voice_df: pd.DataFrame, bo_df: pd.DataFrame, ob_df: pd.Da
         model = str(settings.get("bo_capacity_model", "tat")).lower()
         if model == "tat":
             bday = _bo_daily_tat(bo_df, settings)
+            frames.append(bday)
+        elif model == "erlang":
+            bday = bo_erlang_rollups(bo_df, settings)["daily"].rename(columns={"fte_req": "bo_fte"})
             frames.append(bday)
         else:
             # keep existing behavior if you explicitly choose a non-TAT model
@@ -826,6 +912,3 @@ def _last_next_4(df: pd.DataFrame, week_col: str, value_col: str):
     last4 = float(past[value_col].mean()) if not past.empty else 0.0
     next4 = float(future[value_col].mean()) if not future.empty else last4
     return last4, next4
-
-
-
