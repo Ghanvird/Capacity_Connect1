@@ -26,10 +26,10 @@ def _broadcast_weekly_to_daily(df: pd.DataFrame, day_ids: List[str]) -> pd.DataF
     # Identify weekly columns (ISO dates; Mondays)
     week_cols = [c for c in df.columns if c != "metric"]
 
-    # Output skeleton
-    out = pd.DataFrame({"metric": df["metric"].astype(str)})
-    for d in day_ids:
-        out[d] = 0.0
+    # Output skeleton (single allocation to avoid fragmentation)
+    out = pd.DataFrame({"metric": df["metric"].astype(str).tolist()})
+    zeros = pd.DataFrame(0.0, index=out.index, columns=day_ids)
+    out = pd.concat([out, zeros], axis=1)
 
     def is_percent_like(name: str) -> bool:
         s = str(name).strip().lower()
@@ -168,9 +168,10 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         return {k: float(v) for k, v in g.to_dict().items()}
 
     mA = _req_map(req_daily_A); mF = _req_map(req_daily_F)
-    upper_d = pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]})
-    for dcol in day_ids:
-        upper_d[dcol] = 0.0
+    upper_d = pd.concat([
+        pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
+        pd.DataFrame(0.0, index=range(2), columns=day_ids)
+    ], axis=1)
     if mF:
         for k, v in mF.items():
             if k in upper_d.columns:
@@ -220,16 +221,18 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         return d.loc[m]
 
     ch_key = (ch0 or '').strip().lower()
-    shr_daily = pd.DataFrame({"metric": [
+    _shr_rows = [
         "OOO Shrink Hours (#)",
         "In-Office Shrink Hours (#)",
         "OOO Shrinkage %",
         "In-Office Shrinkage %",
         "Overall Shrinkage %",
         "Planned Shrinkage %",
-    ]})
-    for dcol in day_ids:
-        shr_daily[dcol] = np.nan
+    ]
+    shr_daily = pd.concat([
+        pd.DataFrame({"metric": _shr_rows}),
+        pd.DataFrame(np.nan, index=range(len(_shr_rows)), columns=day_ids)
+    ], axis=1)
     try:
         if ch_key in ("back office","bo"):
             dfraw = _safe_filter(load_df("shrinkage_raw_backoffice"), p)
