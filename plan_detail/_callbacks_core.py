@@ -1,4 +1,8 @@
 # file: plan_detail/_callbacks_core.py
+
+
+# file: plan_detail/_callbacks_core.py
+# file: plan_detail/_callbacks_core.py
 from __future__ import annotations
 from dash import dcc, html, dash_table, Input, Output, State, ctx, no_update
 import dash
@@ -926,6 +930,20 @@ def register_plan_detail_core(app: dash.Dash):
             if not n:
                 raise dash.exceptions.PreventUpdate
             return 'interval'
+
+        # Disable Interval view for Back Office plans (daily-only data)
+        @app.callback(
+            Output("opt-view-interval", "disabled", allow_duplicate=True),
+            Input("plan-detail-id", "data"),
+            prevent_initial_call=False,
+        )
+        def _disable_interval_for_bo(pid):
+            try:
+                p = get_plan(pid) or {}
+            except Exception:
+                p = {}
+            ch = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
+            return ch in ("back office", "bo", "backoffice")
 
 
         # Save all tabs
