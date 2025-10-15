@@ -29,9 +29,9 @@ def _broadcast_daily_to_intervals(df: pd.DataFrame, interval_ids: List[str]) -> 
     # Use the first day as representative
     rep_day = day_cols[0]
 
-    out = pd.DataFrame({"metric": df["metric"].astype(str)})
-    for ivl in interval_ids:
-        out[ivl] = 0.0
+    out = pd.DataFrame({"metric": df["metric"].astype(str).tolist()})
+    zeros = pd.DataFrame(0.0, index=out.index, columns=interval_ids)
+    out = pd.concat([out, zeros], axis=1)
 
     def is_percent_like(name: str) -> bool:
         s = str(name).strip().lower()
@@ -178,9 +178,10 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                     return {}
             mF = _agents(vF)
             mA = _agents(vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF)
-            upper_i = pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]})
-            for slot in ivl_ids:
-                upper_i[slot] = 0.0
+            upper_i = pd.concat([
+                pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
+                pd.DataFrame(0.0, index=range(2), columns=ivl_ids)
+            ], axis=1)
             for k, v in mF.items():
                 if k in upper_i.columns:
                     upper_i.loc[upper_i["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
@@ -285,9 +286,10 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
             mF = _chat_agents(volF, ahtF)
             mA = _chat_agents(volA if isinstance(volA, pd.DataFrame) and not volA.empty else volF,
                               ahtA if isinstance(ahtA, pd.DataFrame) and not ahtA.empty else ahtF)
-            upper_i = pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]})
-            for slot in ivl_ids:
-                upper_i[slot] = 0.0
+            upper_i = pd.concat([
+                pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
+                pd.DataFrame(0.0, index=range(2), columns=ivl_ids)
+            ], axis=1)
             for k, v in mF.items():
                 if k in upper_i.columns:
                     upper_i.loc[upper_i["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
@@ -453,9 +455,10 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
 
             mF = _agents(F)
             mA = _agents(A if isinstance(A, pd.DataFrame) and not A.empty else F)
-            upper_i = pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]})
-            for slot in ivl_ids:
-                upper_i[slot] = 0.0
+            upper_i = pd.concat([
+                pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
+                pd.DataFrame(0.0, index=range(2), columns=ivl_ids)
+            ], axis=1)
             for k, v in mF.items():
                 if k in upper_i.columns:
                     upper_i.loc[upper_i["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
