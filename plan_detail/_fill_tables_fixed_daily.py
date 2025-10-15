@@ -8,7 +8,7 @@ from dash import dash_table, html
 from plan_store import get_plan
 from cap_store import resolve_settings
 from capacity_core import required_fte_daily
-from ._common import _week_span, _scope_key, _assemble_voice, _assemble_bo, _assemble_ob
+from ._common import _week_span, _scope_key, _assemble_voice, _assemble_bo, _assemble_ob, _assemble_chat
 from cap_db import load_df
 from common import summarize_shrinkage_bo, summarize_shrinkage_voice
 from ._calc import _fill_tables_fixed
@@ -273,6 +273,104 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     except Exception:
         pass
     shr_d = _round_one_decimal(shr_daily)
+
+    # --- FW daily rows from native time series (no weekly drilling) ---
+    def _series_from_df(df: pd.DataFrame, val_col: str, agg: str = "sum") -> dict:
+        if not isinstance(df, pd.DataFrame) or df.empty or val_col not in df.columns:
+            return {}
+        d = df.copy(); d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.date.astype(str)
+        if agg == "sum":
+            s = d.groupby("date")[val_col].sum()
+        elif agg == "mean":
+            s = d.groupby("date")[val_col].mean()
+        else:
+            s = d.groupby("date")[val_col].sum()
+        return {k: float(v) for k, v in s.to_dict().items()}
+
+    def _weighted_aht(df: pd.DataFrame, vol_col: str, aht_col: str) -> dict:
+        if not isinstance(df, pd.DataFrame) or df.empty or vol_col not in df.columns:
+            return {}
+        d = df.copy(); d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.date.astype(str)
+        vol = pd.to_numeric(d[vol_col], errors="coerce").fillna(0.0)
+        aht = pd.to_numeric(d.get(aht_col), errors="coerce").fillna(np.nan)
+        d["_num"] = vol * aht
+        g_vol = d.groupby("date")[vol_col].sum()
+        g_num = d.groupby("date")["_num"].sum()
+        out = {}
+        for k in g_vol.index:
+            v = float(g_vol.loc[k])
+            out[k] = float(g_num.loc[k] / v) if v > 0 else 0.0
+        return out
+
+    def _write_row(df: pd.DataFrame, row_name: str, mapping: dict):
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return df
+        mser = df["metric"].astype(str).str.strip()
+        if row_name not in mser.values:
+            return df
+        for dcol in day_ids:
+            if dcol in df.columns:
+                val = mapping.get(dcol)
+                if val is not None:
+                    df.loc[mser == row_name, dcol] = float(val)
+        return df
+
+    # Fill per channel
+    ch_key = (ch0 or '').strip().lower()
+    # Voice
+    if ch_key == "voice":
+        vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual"); vT = _assemble_voice(sk, "tactical")
+        for _df in (vF, vA, vT):
+            if isinstance(_df, pd.DataFrame) and not _df.empty:
+                _df["date"] = pd.to_datetime(_df["date"], errors="coerce").dt.date
+        # Daily volume = sum of interval volume per day
+        volF = _series_from_df(vF, "volume")
+        volA = _series_from_df(vA, "volume")
+        volT = _series_from_df(vT, "volume")
+        # Weighted AHT per day
+        ahtF = _weighted_aht(vF, "volume", "aht_sec")
+        ahtA = _weighted_aht(vA, "volume", "aht_sec")
+        fw_d = _write_row(fw_d, "Forecast", volF)
+        fw_d = _write_row(fw_d, "Tactical Forecast", volT)
+        fw_d = _write_row(fw_d, "Actual Volume", volA)
+        fw_d = _write_row(fw_d, "Forecast AHT/SUT", ahtF)
+        fw_d = _write_row(fw_d, "Actual AHT/SUT", ahtA)
+    # Back Office
+    elif ch_key in ("back office", "bo"):
+        bF = _assemble_bo(sk, "forecast"); bA = _assemble_bo(sk, "actual"); bT = _assemble_bo(sk, "tactical")
+        volF = _series_from_df(bF, "items")
+        volA = _series_from_df(bA, "items")
+        volT = _series_from_df(bT, "items")
+        ahtF = _series_from_df(bF, "aht_sec", agg="mean")
+        ahtA = _series_from_df(bA, "aht_sec", agg="mean")
+        fw_d = _write_row(fw_d, "Forecast", volF)
+        fw_d = _write_row(fw_d, "Tactical Forecast", volT)
+        fw_d = _write_row(fw_d, "Actual Volume", volA)
+        fw_d = _write_row(fw_d, "Forecast AHT/SUT", ahtF)
+        fw_d = _write_row(fw_d, "Actual AHT/SUT", ahtA)
+    # Chat
+    elif ch_key == "chat":
+        cF = _assemble_chat(sk, "forecast"); cA = _assemble_chat(sk, "actual"); cT = _assemble_chat(sk, "tactical")
+        volF = _series_from_df(cF, "items"); volA = _series_from_df(cA, "items"); volT = _series_from_df(cT, "items")
+        ahtF = _series_from_df(cF, "aht_sec", agg="mean"); ahtA = _series_from_df(cA, "aht_sec", agg="mean")
+        fw_d = _write_row(fw_d, "Forecast", volF)
+        fw_d = _write_row(fw_d, "Tactical Forecast", volT)
+        fw_d = _write_row(fw_d, "Actual Volume", volA)
+        fw_d = _write_row(fw_d, "Forecast AHT/SUT", ahtF)
+        fw_d = _write_row(fw_d, "Actual AHT/SUT", ahtA)
+    # Outbound
+    elif ch_key in ("outbound", "ob"):
+        oF = _assemble_ob(sk, "forecast"); oA = _assemble_ob(sk, "actual"); oT = _assemble_ob(sk, "tactical")
+        volF = _series_from_df(oF, "opc") or _series_from_df(oF, "items")
+        volA = _series_from_df(oA, "opc") or _series_from_df(oA, "items")
+        volT = _series_from_df(oT, "opc") or _series_from_df(oT, "items")
+        ahtF = _series_from_df(oF, "aht_sec", agg="mean"); ahtA = _series_from_df(oA, "aht_sec", agg="mean")
+        fw_d = _write_row(fw_d, "Forecast", volF)
+        fw_d = _write_row(fw_d, "Tactical Forecast", volT)
+        fw_d = _write_row(fw_d, "Actual Volume", volA)
+        fw_d = _write_row(fw_d, "Forecast AHT/SUT", ahtF)
+        fw_d = _write_row(fw_d, "Actual AHT/SUT", ahtA)
+
 
     return (
         upper_dtbl,
