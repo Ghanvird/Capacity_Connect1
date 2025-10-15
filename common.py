@@ -624,8 +624,12 @@ def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
     d = dff.copy()
     d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
 
-    # Derive explicit buckets
-    d["bucket"] = d.get("activity", "").map(_bo_bucket)
+    # Derive explicit buckets (robust if 'activity' column is missing)
+    if "activity" in d.columns:
+        d["bucket"] = d["activity"].map(_bo_bucket)
+    else:
+        # default to 'other' bucket to avoid crashes; upstream should normalize first
+        d["bucket"] = pd.Series([_bo_bucket("")]*len(d), index=d.index)
 
     keys = ["date", "journey", "sub_business_area", "channel"]
     if "country" in d.columns:
