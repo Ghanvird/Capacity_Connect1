@@ -941,6 +941,11 @@ def layout_for_plan(pid: int) -> html.Div:
         dcc.Interval(id="plan-msg-timer", interval=5000, n_intervals=0, disabled=True),
         dcc.Store(id="plan-debug", storage_type="memory"),
         dcc.Store(id="plan-hydrated", storage_type="memory", data=False),
+        # Interval-day selector (populated when Interval grain is active)
+        html.Div([
+            dbc.Label("Interval Date", html_for="interval-date", className="me-2"),
+            dcc.Dropdown(id="interval-date", placeholder="Select date", clearable=False, style={"maxWidth": "240px"}),
+        ], id="interval-date-wrap", style={"display": "none"}),
         html.Div([
         # Debug store to surface verify_storage logs (optional; safe no-op)
         dcc.Store(id="plan-debug", storage_type="memory"),
@@ -968,6 +973,8 @@ def plan_detail_validation_layout() -> html.Div:
             dcc.Store(id="plan-refresh-tick"),  # ensure present in validation layout too
             dcc.Store(id="plan-grain"),         # ensure present in validation layout too
             dcc.Interval(id="plan-msg-timer"),
+            html.Div(id="interval-date-wrap"),
+            dcc.Dropdown(id="interval-date"),
 
             html.Div(id="plan-hdr-name"),
             html.Div(id="plan-upper"),
