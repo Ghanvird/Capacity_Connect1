@@ -287,16 +287,16 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         volA = _slot_series_for_day(vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF, ref_day, "volume")
         ahtF = _slot_series_for_day(vF, ref_day, "aht_sec")
         ahtA = _slot_series_for_day(vA, ref_day, "aht_sec")
-        mser = fw_i["metric"].astype(str)
+        mser = fw_i["metric"].astype(str).str.lower()
         for lab in ivl_ids:
-            if lab in volF and "Forecast" in mser.values:
-                fw_i.loc[mser == "Forecast", lab] = float(volF[lab])
-            if lab in volA and "Actual Volume" in mser.values:
-                fw_i.loc[mser == "Actual Volume", lab] = float(volA[lab])
-            if lab in ahtF and "Forecast AHT/SUT" in mser.values:
-                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(ahtF[lab])
-            if lab in ahtA and "Actual AHT/SUT" in mser.values:
-                fw_i.loc[mser == "Actual AHT/SUT", lab] = float(ahtA[lab])
+            mask_f = mser.str.contains("forecast") & ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")
+            mask_a = (mser.str.contains("actual") & (mser.str.contains("volume") | ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")))
+            mask_fa = mser.str.contains("forecast") & mser.str.contains("aht|sut")
+            mask_aa = mser.str.contains("actual") & mser.str.contains("aht|sut")
+            if lab in volF: fw_i.loc[mask_f, lab] = float(volF[lab])
+            if lab in volA: fw_i.loc[mask_a, lab] = float(volA[lab])
+            if lab in ahtF: fw_i.loc[mask_fa, lab] = float(ahtF[lab])
+            if lab in ahtA: fw_i.loc[mask_aa, lab] = float(ahtA[lab])
         # Staffing and Erlang rollups
         staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
         occ_cap = float(settings.get("occupancy_cap_voice", 0.85) or 0.85)
@@ -340,14 +340,14 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         volF_map = _slot_series_for_day(volF, ref_day, "items") or _slot_series_for_day(volF, ref_day, "volume")
         volA_map = _slot_series_for_day(volA if isinstance(volA, pd.DataFrame) and not volA.empty else volF, ref_day, "items")
         aht_map  = _slot_series_for_day(ahtF, ref_day, "aht_sec") or _slot_series_for_day(ahtF, ref_day, "aht")
-        mser = fw_i["metric"].astype(str)
+        mser = fw_i["metric"].astype(str).str.lower()
         for lab in ivl_ids:
-            if lab in volF_map and "Forecast" in mser.values:
-                fw_i.loc[mser == "Forecast", lab] = float(volF_map[lab])
-            if lab in volA_map and "Actual Volume" in mser.values:
-                fw_i.loc[mser == "Actual Volume", lab] = float(volA_map[lab])
-            if lab in aht_map and "Forecast AHT/SUT" in mser.values:
-                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(aht_map[lab])
+            mask_f = mser.str.contains("forecast") & ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")
+            mask_a = (mser.str.contains("actual") & (mser.str.contains("volume") | ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")))
+            mask_fa = mser.str.contains("forecast") & mser.str.contains("aht|sut")
+            if lab in volF_map: fw_i.loc[mask_f, lab] = float(volF_map[lab])
+            if lab in volA_map: fw_i.loc[mask_a, lab] = float(volA_map[lab])
+            if lab in aht_map: fw_i.loc[mask_fa, lab] = float(aht_map[lab])
         staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
         ivl_sec = max(60, int(ivl_min) * 60)
         T_sec = float(settings.get("chat_sl_seconds", settings.get("sl_seconds", 20)) or 20.0)
@@ -395,14 +395,14 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         volF = _slot_series_for_day(vF, ref_day, "opc") or _slot_series_for_day(vF, ref_day, "dials") or _slot_series_for_day(vF, ref_day, "calls") or _slot_series_for_day(vF, ref_day, "volume")
         volA = _slot_series_for_day(vA, ref_day, "opc") or _slot_series_for_day(vA, ref_day, "dials") or _slot_series_for_day(vA, ref_day, "calls") or _slot_series_for_day(vA, ref_day, "volume")
         aht_map = _slot_series_for_day(aF, ref_day, "aht_sec") or _slot_series_for_day(aF, ref_day, "aht")
-        mser = fw_i["metric"].astype(str)
+        mser = fw_i["metric"].astype(str).str.lower()
         for lab in ivl_ids:
-            if lab in volF and "Forecast" in mser.values:
-                fw_i.loc[mser == "Forecast", lab] = float(volF[lab])
-            if lab in volA and "Actual Volume" in mser.values:
-                fw_i.loc[mser == "Actual Volume", lab] = float(volA[lab])
-            if lab in aht_map and "Forecast AHT/SUT" in mser.values:
-                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(aht_map[lab])
+            mask_f = mser.str.contains("forecast") & ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")
+            mask_a = (mser.str.contains("actual") & (mser.str.contains("volume") | ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")))
+            mask_fa = mser.str.contains("forecast") & mser.str.contains("aht|sut")
+            if lab in volF: fw_i.loc[mask_f, lab] = float(volF[lab])
+            if lab in volA: fw_i.loc[mask_a, lab] = float(volA[lab])
+            if lab in aht_map: fw_i.loc[mask_fa, lab] = float(aht_map[lab])
         staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
         ivl_sec = max(60, int(ivl_min) * 60)
         T_sec = float(settings.get("ob_sl_seconds", settings.get("sl_seconds", 20)) or 20.0)
