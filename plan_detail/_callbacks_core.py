@@ -1,8 +1,4 @@
 # file: plan_detail/_callbacks_core.py
-
-
-# file: plan_detail/_callbacks_core.py
-# file: plan_detail/_callbacks_core.py
 from __future__ import annotations
 from dash import dcc, html, dash_table, Input, Output, State, ctx, no_update
 import dash
@@ -735,7 +731,8 @@ def register_plan_detail_core(app: dash.Dash):
                         _monday = pd.to_datetime(first_week).date() if first_week else None
                     except Exception:
                         _monday = None
-                    cols, ids = interval_cols_for_day(_monday)
+                    # BA roll-up has no single channel; default coverage start to 08:00
+                    cols, ids = interval_cols_for_day(_monday, start_hhmm="08:00")
                 else:
                     cols, ids = week_cols_for_ba(ba, status_filter="current")
                 # Name and type
@@ -767,7 +764,54 @@ def register_plan_detail_core(app: dash.Dash):
                     _monday = pd.to_datetime(weeks[0]).date() if weeks else None
                 except Exception:
                     _monday = None
-                cols, ivl_ids = interval_cols_for_day(_monday)
+                # Infer earliest available interval start (fallback 08:00) based on uploaded data
+                def _earliest_slot_from_df(df: pd.DataFrame) -> str | None:
+                    try:
+                        if not isinstance(df, pd.DataFrame) or df.empty:
+                            return None
+                        d = df.copy()
+                        L = {str(c).strip().lower(): c for c in d.columns}
+                        c_date = L.get("date") or L.get("day")
+                        if c_date:
+                            d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                            d = d[d[c_date].eq(_monday)]
+                        c_ivl = L.get("interval") or L.get("time")
+                        if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
+                            return None
+                        labs = d[c_ivl].astype(str).str.slice(0,5)
+                        labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
+                        if labs.empty:
+                            return None
+                        return labs.min()
+                    except Exception:
+                        return None
+
+                start_hhmm = None
+                try:
+                    ch0 = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
+                except Exception:
+                    ch0 = ""
+                try:
+                    sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
+                    from cap_store import load_timeseries as _lts
+                    if ch0 == "voice":
+                        for kind in ("voice_forecast_volume", "voice_actual_volume"):
+                            df = _lts(kind, sk)
+                            start_hhmm = start_hhmm or _earliest_slot_from_df(df)
+                    elif ch0 == "chat":
+                        for kind in ("chat_forecast_volume", "chat_actual_volume"):
+                            df = _lts(kind, sk)
+                            start_hhmm = start_hhmm or _earliest_slot_from_df(df)
+                    elif ch0 in ("outbound", "ob"):
+                        for kind in ("ob_forecast_opc","outbound_forecast_opc","ob_forecast_dials","outbound_forecast_dials","ob_forecast_calls",
+                                     "ob_actual_opc","outbound_actual_opc","ob_actual_dials","outbound_actual_dials","ob_actual_calls"):
+                            df = _lts(kind, sk)
+                            start_hhmm = start_hhmm or _earliest_slot_from_df(df)
+                except Exception:
+                    start_hhmm = None
+                if not start_hhmm:
+                    start_hhmm = "08:00"
+                cols, ivl_ids = interval_cols_for_day(_monday, start_hhmm=start_hhmm)
                 week_ids = ivl_ids
             else:
                 cols, week_ids = _week_cols(weeks)
