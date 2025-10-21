@@ -118,7 +118,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     else:
         ref_day = pd.to_datetime(weeks[0]).date() if weeks else dt.date.today()
     rep_day = ref_day.isoformat()
-    # Build simple daily frames by copying weekly Monday values
+    # Build simple daily frames by copying the rep-day's WEEK Monday value (not always first week)
     def weekly_col_to_day(recs):
         df = pd.DataFrame(recs or [])
         out = pd.DataFrame({"metric": df.get("metric", pd.Series(dtype="object"))})
@@ -126,12 +126,19 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
             out[rep_day] = 0.0
         if not isinstance(df, pd.DataFrame) or df.empty:
             return out[["metric", rep_day]]
-        if weeks:
-            w0 = weeks[0]
-        else:
-            w0 = rep_day
-        if w0 in df.columns:
-            out[rep_day] = pd.to_numeric(df[w0], errors="coerce").fillna(0.0)
+        # Find the Monday for the representative day and prefer that week's column
+        try:
+            rep_week = (ref_day - dt.timedelta(days=ref_day.weekday())).isoformat()
+        except Exception:
+            rep_week = None
+        candidates = []
+        if rep_week:
+            candidates.append(rep_week)
+        # fall back through provided plan weeks in order
+        candidates.extend([w for w in (weeks or []) if w not in candidates])
+        picked = next((w for w in candidates if w in df.columns), None)
+        if picked:
+            out[rep_day] = pd.to_numeric(df[picked], errors="coerce").fillna(0.0)
         else:
             # copy first numeric col
             wn = [c for c in df.columns if c != "metric"]
@@ -153,6 +160,16 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     upper_d    = weekly_col_to_day(upper_df_w.to_dict("records"))
 
     # Determine coverage start based on uploaded interval series (earliest slot) or default to 08:00
+    def _pick_ivl_col(df: pd.DataFrame) -> Optional[str]:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return None
+        L = {str(c).strip().lower(): c for c in df.columns}
+        for key in ("interval", "time", "interval_start", "start_time", "slot"):
+            c = L.get(key)
+            if c and c in df.columns:
+                return c
+        return None
+
     def _earliest_slot_from_df(df: pd.DataFrame) -> str | None:
         try:
             if not isinstance(df, pd.DataFrame) or df.empty:
@@ -165,7 +182,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
                 d = d[d[c_date].eq(ref_day)]
             # Require an interval-like column
-            c_ivl = L.get("interval") or L.get("time")
+            c_ivl = _pick_ivl_col(d)
             if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
                 return None
             labs = d[c_ivl].astype(str).str.slice(0, 5)
@@ -249,7 +266,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         # tolerant column resolution
         L = {str(c).strip().lower(): c for c in d.columns}
         c_date = L.get("date") or L.get("day")
-        c_ivl  = L.get("interval") or L.get("time")
+        c_ivl  = _pick_ivl_col(d)
         if not c_ivl:
             return {}
         if c_date:
@@ -268,6 +285,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
             return {}
         d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
         c_date = L.get("date") or L.get("day"); c_ivl = L.get("interval") or L.get("time")
+        c_ivl = _pick_ivl_col(d)
         if not c_ivl:
             return {}
         if c_date:
@@ -404,9 +422,10 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                     return
                 d = df.copy(); d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.date
                 d = d[d["date"].eq(ref_day)]
-                if "interval" not in d.columns:
+                ivc = _pick_ivl_col(d)
+                if not ivc:
                     return
-                labs = d["interval"].astype(str).str.slice(0,5)
+                labs = d[ivc].astype(str).str.slice(0,5)
                 vals = pd.to_numeric(d.get(col_name), errors="coerce").fillna(0.0).tolist()
                 mapping = dict(zip(labs, vals))
                 m = fw_i["metric"].astype(str).str.strip()
@@ -570,6 +589,15 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 sl_pct = 100.0 * _erlang_sl(calls, aht, agents)
                 upper_all.loc[mser == "Projected Handling Capacity (#)", lab] = cap_calls
                 upper_all.loc[mser == "Projected Service Level", lab] = sl_pct
+                # FW Occupancy per slot = min(occ_cap, A/N) * 100
+                try:
+                    A = (calls * aht) / ivl_sec
+                    occ_pct = 100.0 * min(occ_cap, (A / max(agents, 1e-6)) if agents > 0 else 0.0)
+                    fm = fw_i["metric"].astype(str).str.strip()
+                    if "Occupancy" in fm.values and lab in fw_i.columns:
+                        fw_i.loc[fm == "Occupancy", lab] = occ_pct
+                except Exception:
+                    pass
         elif ch0 == "chat":
             sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
             s = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch0)
@@ -659,9 +687,10 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                     return
                 d = vol_df.copy(); d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
                 d = d[d["date"].eq(ref_day)]
-                if "interval" not in d.columns:
+                ivc = _pick_ivl_col(d)
+                if not ivc:
                     return
-                labs = d["interval"].astype(str).str.slice(0,5)
+                labs = d[ivc].astype(str).str.slice(0,5)
                 vol = pd.to_numeric(d.get("items"), errors="coerce").fillna(0.0).tolist()
                 mapping_vol = dict(zip(labs, vol))
                 m = fw_i["metric"].astype(str).str.strip()
@@ -672,8 +701,9 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 if isinstance(aht_df, pd.DataFrame) and not aht_df.empty:
                     ah = aht_df.copy(); ah["date"] = pd.to_datetime(ah.get("date"), errors="coerce").dt.date
                     ah = ah[ah["date"].eq(ref_day)]
-                    if "interval" in ah.columns:
-                        labs2 = ah["interval"].astype(str).str.slice(0,5)
+                    ivc2 = _pick_ivl_col(ah)
+                    if ivc2:
+                        labs2 = ah[ivc2].astype(str).str.slice(0,5)
                         ahts  = pd.to_numeric(ah.filter(regex="aht", axis=1).iloc[:, -1], errors="coerce").fillna(0.0).tolist()
                         mapping_aht = dict(zip(labs2, ahts))
                         if row_name_aht in m.values:
@@ -837,6 +867,15 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 sl_pct = 100.0 * _erlang_sl(calls, aht_eff, agents)
                 upper_all.loc[mser == "Projected Handling Capacity (#)", lab] = cap_calls
                 upper_all.loc[mser == "Projected Service Level", lab] = sl_pct
+                # FW Occupancy for chat per slot
+                try:
+                    A = (calls * aht_eff) / ivl_sec
+                    occ_pct = 100.0 * min(occ_cap, (A / max(agents, 1e-6)) if agents > 0 else 0.0)
+                    fm = fw_i["metric"].astype(str).str.strip()
+                    if "Occupancy" in fm.values and lab in fw_i.columns:
+                        fw_i.loc[fm == "Occupancy", lab] = occ_pct
+                except Exception:
+                    pass
         elif ch0 in ("outbound", "ob"):
             sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
             s = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch0)
@@ -976,8 +1015,9 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                     return
                 d = df.copy(); d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
                 d = d[d["date"].eq(ref_day)]
-                if "interval" in d.columns and d["interval"].notna().any():
-                    labs = d["interval"].astype(str).str.slice(0,5)
+                ivc = _pick_ivl_col(d)
+                if ivc and d[ivc].notna().any():
+                    labs = d[ivc].astype(str).str.slice(0,5)
                     vol = pd.to_numeric(d.get("opc") if "opc" in d.columns else d.get("calls"), errors="coerce").fillna(0.0).tolist()
                     aht = pd.to_numeric(d.get("aht"), errors="coerce").fillna(0.0).tolist()
                     mapping_vol = dict(zip(labs, vol)); mapping_aht = dict(zip(labs, aht))
@@ -1160,6 +1200,15 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 sl_pct = 100.0 * _erlang_sl(calls, aht, agents)
                 upper_all.loc[mser == "Projected Handling Capacity (#)", lab] = cap_calls
                 upper_all.loc[mser == "Projected Service Level", lab] = sl_pct
+                # FW Occupancy for outbound per slot
+                try:
+                    A = (calls * aht) / ivl_sec
+                    occ_pct = 100.0 * min(occ_cap, (A / max(agents, 1e-6)) if agents > 0 else 0.0)
+                    fm = fw_i["metric"].astype(str).str.strip()
+                    if "Occupancy" in fm.values and lab in fw_i.columns:
+                        fw_i.loc[fm == "Occupancy", lab] = occ_pct
+                except Exception:
+                    pass
         else:
             pass
     except Exception:
