@@ -476,7 +476,7 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         except Exception:
             return pd.DataFrame()
 
-    fw_d   = _round_one_decimal(_broadcast_weekly_to_daily(to_df(fw_w),   day_ids, pid=pid, channel=ch0, tab='fw'))
+    fw_d   = (_broadcast_weekly_to_daily(to_df(fw_w),   day_ids, pid=pid, channel=ch0, tab='fw'))
     hc_d   = _round_one_decimal(_broadcast_weekly_to_daily(to_df(hc_w),   day_ids))
     att_d  = _round_one_decimal(_broadcast_weekly_to_daily(to_df(att_w),  day_ids))
     shr_d  = _round_one_decimal(_broadcast_weekly_to_daily(to_df(shr_w),  day_ids))
@@ -1206,10 +1206,10 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         mser = df["metric"].astype(str).str.strip()
         if row_name not in mser.values:
             return df
-        # Clear existing values across all days for this row to avoid weekly/7 remnants
-        df.loc[mser == row_name, day_ids] = [[0.0 for _ in day_ids]]
-        # Vectorized assignment to avoid fragmentation: set only columns present in mapping
+        # Vectorized assignment: set only columns present in mapping
         target_cols = [d for d in day_ids if (d in df.columns) and (d in mapping) and (mapping.get(d) is not None)]
+        if not target_cols:
+            return df
         if target_cols:
             values = [[float(mapping[d]) for d in target_cols]]
             df.loc[mser == row_name, target_cols] = values
