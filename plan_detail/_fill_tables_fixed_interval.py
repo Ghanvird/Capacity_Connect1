@@ -228,7 +228,33 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     bva_i  = _round_one_decimal(_broadcast_daily_to_intervals(bva_d,  ivl_ids))
     nh_i   = _round_one_decimal(_broadcast_daily_to_intervals(nh_d,   ivl_ids))
 
-    # Upper (interval): compute agents per interval for the representative day per channel; fallback to broadcast
+    # Build base upper grid for interval view from weekly upper metrics, replicated across interval slots
+    week_cols_weekly = [c for c in upper_df_w.columns if c != 'metric'] if isinstance(upper_df_w, pd.DataFrame) else []
+    def _week_monday_str(d: dt.date) -> str:
+        try:
+            return (d - dt.timedelta(days=d.weekday())).isoformat()
+        except Exception:
+            return None
+    ref_week = _week_monday_str(ref_day)
+    if isinstance(upper_df_w, pd.DataFrame) and not upper_df_w.empty and ref_week and (ref_week in week_cols_weekly):
+        upper_all = pd.DataFrame({"metric": upper_df_w["metric"].astype(str).tolist()})
+        for iv in ivl_ids:
+            upper_all[iv] = 0.0
+        for _, row in upper_df_w.iterrows():
+            name = str(row.get('metric',''))
+            try:
+                val = float(pd.to_numeric(row.get(ref_week), errors='coerce'))
+            except Exception:
+                val = 0.0
+            for iv in ivl_ids:
+                upper_all.loc[upper_all["metric"].eq(name), iv] = val
+    else:
+        upper_all = pd.concat([
+            pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
+            pd.DataFrame(0.0, index=range(2), columns=ivl_ids)
+        ], axis=1)
+
+    # Upper (interval): compute agents per interval for the representative day per channel; fallback to weekly replicated
     try:
         p = get_plan(pid) or {}
         ch0 = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
@@ -249,17 +275,12 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                     return {}
             mF = _agents(vF)
             mA = _agents(vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF)
-            upper_i = pd.concat([
-                pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
-                pd.DataFrame(0.0, index=range(2), columns=ivl_ids)
-            ], axis=1)
             for k, v in mF.items():
-                if k in upper_i.columns:
-                    upper_i.loc[upper_i["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
+                if k in upper_all.columns:
+                    upper_all.loc[upper_all["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
             for k, v in mA.items():
-                if k in upper_i.columns:
-                    upper_i.loc[upper_i["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
-            upper_tbl = _make_upper_table(_round_one_decimal(upper_i), ivl_cols)
+                if k in upper_all.columns:
+                    upper_all.loc[upper_all["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
             # Also fill FW rows from native interval series for this day
             def _fill_fw_from_voice(df, row_name, col_name):
                 if not isinstance(df, pd.DataFrame) or df.empty:
@@ -357,17 +378,12 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
             mF = _chat_agents(volF, ahtF)
             mA = _chat_agents(volA if isinstance(volA, pd.DataFrame) and not volA.empty else volF,
                               ahtA if isinstance(ahtA, pd.DataFrame) and not ahtA.empty else ahtF)
-            upper_i = pd.concat([
-                pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
-                pd.DataFrame(0.0, index=range(2), columns=ivl_ids)
-            ], axis=1)
             for k, v in mF.items():
-                if k in upper_i.columns:
-                    upper_i.loc[upper_i["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
+                if k in upper_all.columns:
+                    upper_all.loc[upper_all["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
             for k, v in mA.items():
-                if k in upper_i.columns:
-                    upper_i.loc[upper_i["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
-            upper_tbl = _make_upper_table(_round_one_decimal(upper_i), ivl_cols)
+                if k in upper_all.columns:
+                    upper_all.loc[upper_all["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
             # Fill FW rows from native interval series if present; fallback to uniform already set
             def _fill_fw_from_chat(vol_df, aht_df, row_name_vol, row_name_aht):
                 if not isinstance(vol_df, pd.DataFrame) or vol_df.empty:
@@ -526,17 +542,12 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
 
             mF = _agents(F)
             mA = _agents(A if isinstance(A, pd.DataFrame) and not A.empty else F)
-            upper_i = pd.concat([
-                pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
-                pd.DataFrame(0.0, index=range(2), columns=ivl_ids)
-            ], axis=1)
             for k, v in mF.items():
-                if k in upper_i.columns:
-                    upper_i.loc[upper_i["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
+                if k in upper_all.columns:
+                    upper_all.loc[upper_all["metric"].eq("FTE Required @ Forecast Volume"), k] = float(v)
             for k, v in mA.items():
-                if k in upper_i.columns:
-                    upper_i.loc[upper_i["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
-            upper_tbl = _make_upper_table(_round_one_decimal(upper_i), ivl_cols)
+                if k in upper_all.columns:
+                    upper_all.loc[upper_all["metric"].eq("FTE Required @ Actual Volume"), k] = float(v)
             # Fill FW rows from native interval series if present
             def _fill_fw_from_ob(df, row_name_vol, row_name_aht):
                 if not isinstance(df, pd.DataFrame) or df.empty:
@@ -560,9 +571,11 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
             _fill_fw_from_ob(F, "Forecast", "Forecast AHT/SUT")
             _fill_fw_from_ob(A if isinstance(A, pd.DataFrame) and not A.empty else F, "Actual Volume", "Actual AHT/SUT")
         else:
-            upper_tbl = _make_upper_table(_round_one_decimal(_broadcast_daily_to_intervals(upper_d, ivl_ids)), ivl_cols)
+            pass
     except Exception:
-        upper_tbl = _make_upper_table(_round_one_decimal(_broadcast_daily_to_intervals(upper_d, ivl_ids)), ivl_cols)
+        pass
+
+    upper_tbl = _make_upper_table(_round_one_decimal(upper_all), ivl_cols)
 
     return (
         upper_tbl,
