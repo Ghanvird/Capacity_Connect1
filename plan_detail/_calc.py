@@ -1,6 +1,7 @@
 # file: plan_detail/_calc.py
 from __future__ import annotations
 import math
+import re
 import os
 import datetime as dt
 import pandas as pd
@@ -362,6 +363,8 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     )
     loc_first = (p.get("location") or p.get("country") or p.get("site") or "").strip()
     settings = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch_first)
+    # Cache plan scope fields to avoid late shadowing of 'p' elsewhere in this function
+    _plan_BA = p.get("vertical"); _plan_SBA = p.get("sub_ba"); _plan_SITE = (p.get("site") or p.get("location") or p.get("country"))
     try:
         lc_ovr_df = load_df(f"plan_{pid}_lc_overrides")
     except Exception:
@@ -1721,14 +1724,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             L = {str(c).strip().lower(): c for c in v.columns}
             c_date = L.get("date"); c_hours = L.get("hours") or L.get("duration_hours") or L.get("duration")
             c_state= L.get("superstate") or L.get("state")
-            c_ba   = L.get("business area") or L.get("ba")
-            c_sba  = L.get("sub business area") or L.get("sub_ba")
-            c_ch   = L.get("channel")
+            c_ba   = L.get("business area") or L.get("ba") or L.get("vertical")
+            c_sba  = L.get("sub business area") or L.get("sub_ba") or L.get("subba")
+            c_ch   = L.get("channel") or L.get("lob")
             # Prefer matching the plan's specificity: site > location > country > city
             c_site = L.get("site")
-            c_location = L.get("location")
-            c_country = L.get("country")
-            c_city = L.get("city")
 
             mask = pd.Series(True, index=v.index)
             if c_ba and p.get("vertical"): mask &= v[c_ba].astype(str).str.strip().str.lower().eq(p["vertical"].strip().lower())
@@ -1737,7 +1737,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             if loc_first:
                 target = loc_first.strip().lower()
                 matched = False
-                for col in [c_site, c_location, c_country, c_city]:
+                for col in c_site:
                     if col and col in v.columns:
                         loc_l = v[col].astype(str).str.strip().str.lower()
                         if loc_l.eq(target).any():
@@ -2039,6 +2039,27 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
     req_w_forecast = _daily_to_weekly(req_daily_forecast)
     req_w_tactical = _daily_to_weekly(req_daily_tactical)
     req_w_budgeted = _daily_to_weekly(req_daily_budgeted)
+
+    # Override weekly FTE using interval-first daily rollups when available (sumproduct-driven)
+    try:
+        ch_low = (ch_first or '').strip().lower()
+        if ch_low in ("voice","chat","outbound","ob"):
+            df_roll = load_df(f"plan_{pid}_fte_daily_rollups")
+            if isinstance(df_roll, pd.DataFrame) and not df_roll.empty and {"date","fte_forecast","fte_actual"}.issubset(set(df_roll.columns)):
+                d = df_roll.copy()
+                d["date"] = pd.to_datetime(d["date"], errors="coerce")
+                d = d.dropna(subset=["date"]).copy()
+                d["week"] = (d["date"] - pd.to_timedelta(d["date"].dt.weekday, unit="D")).dt.date.astype(str)
+                gF = d.groupby("week", as_index=False)["fte_forecast"].mean().set_index("week")["fte_forecast"].to_dict()
+                gA = d.groupby("week", as_index=False)["fte_actual"].mean().set_index("week")["fte_actual"].to_dict()
+                if gF:
+                    for w, v in gF.items():
+                        req_w_forecast[w] = float(v)
+                if gA:
+                    for w, v in gA.items():
+                        req_w_actual[w] = float(v)
+    except Exception:
+        pass
 
     # Write Overtime Hours (#) from shrinkage raw into FW and merged FW (independent of shrinkage logic)
     if "Overtime Hours (#)" in fw_rows:
@@ -2355,7 +2376,7 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
             # convert occupancy-capped erlangs to calls/interval
             occ_calls_cap = (occ_cap_erlangs * ivl_sec) / max(1.0, aht)
             calls_per_ivl = min(calls_per_ivl, occ_calls_cap)
-            handling_capacity[w] = calls_per_ivl * intervals
+            handling_capacity[w] = calls_per_ivl * intervals  # fallback; will be refined using sumproduct if arrivals present
             # Optional debug for Voice only (does not alter logic)
             if os.environ.get("CAP_DEBUG_VOICE"):
                 try:
@@ -2496,10 +2517,8 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 aht_sut = max(1.0, aht_sut * (1.0 + aht_delta / 100.0))
             else:
                 aht_sut = max(1.0, aht_sut)
-            n = weekly_voice_intervals.get(w)
-            intervals = int(n) if isinstance(n, (int, np.integer)) and n > 0 else intervals_per_week_default
-            calls_per_ivl = weekly_load / float(max(1, intervals))
 
+            # Effective agents for the week (base, without occupancy cap)
             lc = _learning_curve_for_week(settings, lc_ovr_df, w)
             def eff_from_buckets(buckets, prod_pct_list, uplift_pct_list):
                 total = 0.0
@@ -2516,14 +2535,11 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
 
             nest_eff = eff_from_buckets(nest_buckets, lc["nesting_prod_pct"], lc["nesting_aht_uplift_pct"])
             sda_eff  = eff_from_buckets(sda_buckets,  lc["sda_prod_pct"],     lc["sda_aht_uplift_pct"])
-            # For SL projection, use effective agents without applying occupancy cap to N
             v_shr_add = (shrink_delta / 100.0) if (_wf_active(w) and shrink_delta) else 0.0
             v_eff_shr = min(0.99, max(0.0, voice_shr_base + v_shr_add))
-            # Align SL agent base with capacity logic: prefer schedule-based avg supply, then projected HC
             agents_prod = schedule_supply_avg.get(w, None)
             if agents_prod is None or agents_prod <= 0:
                 agents_prod = float(projected_supply.get(w, 0.0))
-            # Robust fallback: derive agents from forecast FTE when no supply is available
             if (agents_prod is None or agents_prod <= 0) and (float(req_w_forecast.get(w, 0.0) or 0.0) > 0.0):
                 try:
                     hrs_per_fte = float(settings.get("hours_per_fte", 8.0) or 8.0)
@@ -2536,16 +2552,167 @@ def _fill_tables_fixed(ptype, pid, fw_cols, _tick, whatif=None, grain: str = 'we
                 daily_intervals = int((24 * 3600) // max(60, ivl_sec))
                 staff_sec_per_day = float(req_w_forecast.get(w, 0.0) or 0.0) * hrs_per_fte * 3600.0 * max(0.01, 1.0 - v_eff_shr) * max(0.01, occ_f)
                 agents_eff_fb = staff_sec_per_day / float(max(1, daily_intervals) * max(60, ivl_sec))
-                # Invert shrink to get pre-shrink agent base for consistent application below
                 agents_prod = agents_eff_fb / max(0.01, 1.0 - v_eff_shr)
-            agents_eff = max(1.0, (float(agents_prod) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
-            sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff, sl_seconds, ivl_sec)
-            proj_sl[w] = 100.0 * sl_frac
+            agents_eff_avg = max(1.0, (float(agents_prod) + nest_eff + sda_eff) * (1.0 - v_eff_shr))
+
+            # Build arrival pattern for the week (prefer Actual > Forecast > Tactical)
+            def _slot_index_from_interval(val: str, ivl_min_local: int) -> int | None:
+                try:
+                    s = str(val or "").strip()
+                    m = re.search(r"(\d{1,2}):(\d{2})", s)
+                    if not m:
+                        return None
+                    hh = int(m.group(1)); mm = int(m.group(2))
+                    hh = min(23, max(0, hh)); mm = min(59, max(0, mm))
+                    start_min = hh * 60 + mm
+                    return int(start_min // max(1, ivl_min_local))
+                except Exception:
+                    return None
+
+            def _arrival_counts_week(src: pd.DataFrame, week_id: str, ivl_min_local: int) -> dict[int, float]:
+                if not isinstance(src, pd.DataFrame) or src.empty:
+                    return {}
+                d = src.copy()
+                if "date" not in d.columns or "interval" not in d.columns:
+                    return {}
+                d["date"] = pd.to_datetime(d["date"], errors="coerce")
+                d = d.dropna(subset=["date"]).copy()
+                start = pd.to_datetime(week_id, errors="coerce")
+                if pd.isna(start):
+                    return {}
+                end = start + pd.to_timedelta(6, unit="D")
+                d = d[(d["date"] >= start) & (d["date"] <= end)]
+                if d.empty:
+                    return {}
+                d["_slot"] = d["interval"].map(lambda s: _slot_index_from_interval(s, ivl_min_local))
+                d["_vol"] = pd.to_numeric(d.get("volume", 0.0), errors="coerce").fillna(0.0)
+                d = d.dropna(subset=["_slot"]).astype({"_slot": int})
+                g = d.groupby("_slot", as_index=False)["_vol"].sum()
+                return dict(zip(g["_slot"], g["_vol"]))
+
+            # Staffing pattern from roster_long (optional)
+            def _staff_counts_week(ivl_min_local: int) -> dict[int, float]:
+                try:
+                    rl = load_roster_long()
+                except Exception:
+                    return {}
+                if not isinstance(rl, pd.DataFrame) or rl.empty:
+                    return {}
+                df = rl.copy()
+                # Scope filters (BA/SubBA/Channel/Site)
+                def _col(df, opts):
+                    for c in opts:
+                        if c in df.columns:
+                            return c
+                    return None
+                c_ba  = _col(df, ["Business Area","business area","vertical"])
+                c_sba = _col(df, ["Sub Business Area","sub business area","sub_ba"])
+                c_lob = _col(df, ["LOB","lob","Channel","channel"])
+                c_site= _col(df, ["Site","site","Location","location","Country","country"])
+                BA  = _plan_BA; SBA = _plan_SBA; LOB = ch_first
+                SITE= _plan_SITE
+                def _match(series, val):
+                    if not val or not isinstance(series, pd.Series):
+                        return pd.Series([True]*len(series))
+                    s = series.astype(str).str.strip().str.lower()
+                    return s.eq(str(val).strip().lower())
+                msk = pd.Series([True]*len(df))
+                if c_ba:  msk &= _match(df[c_ba], BA)
+                if c_sba and (SBA not in (None, "")): msk &= _match(df[c_sba], SBA)
+                if c_lob: msk &= _match(df[c_lob], LOB)
+                if c_site and (SITE not in (None, "")): msk &= _match(df[c_site], SITE)
+                df = df[msk]
+                if "is_leave" in df.columns:
+                    df = df[~df["is_leave"].astype(bool)]
+                if "date" not in df.columns or "entry" not in df.columns:
+                    return {}
+                df["date"] = pd.to_datetime(df["date"], errors="coerce")
+                df = df.dropna(subset=["date"]).copy()
+                start = pd.to_datetime(w, errors="coerce")
+                if pd.isna(start):
+                    return {}
+                end = start + pd.to_timedelta(6, unit="D")
+                df = df[(df["date"] >= start) & (df["date"] <= end)]
+                if df.empty:
+                    return {}
+                # Expand shifts into interval slots across the week (handle cross-midnight)
+                counts: dict[int, float] = {}
+                for _, r in df.iterrows():
+                    try:
+                        s = str(r.get("entry", "")).strip()
+                        m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", s)
+                        if not m:
+                            continue
+                        sh, sm, eh, em = map(int, m.groups())
+                        sh = min(23, max(0, sh)); eh = min(24, max(0, eh))
+                        start_min = sh*60 + sm
+                        end_min   = eh*60 + em
+                        if end_min <= start_min:
+                            end_min += 24*60
+                        span = end_min - start_min
+                        slots = int(max(0, (span + (ivl_min_local-1)) // ivl_min_local))
+                        for k in range(slots):
+                            abs_min = start_min + k*ivl_min_local
+                            slot = int((abs_min % (24*60)) // ivl_min_local)
+                            counts[slot] = counts.get(slot, 0.0) + 1.0
+                    except Exception:
+                        continue
+                return counts
+
+            # Choose best source for arrivals
+            src = vA if (isinstance(vA, pd.DataFrame) and not vA.empty) else (vF if (isinstance(vF, pd.DataFrame) and not vF.empty) else vT)
+            arrival_counts = _arrival_counts_week(src, w, ivl_min)
+            if (not arrival_counts) or weekly_load <= 0:
+                # Fallback to legacy equal distribution
+                n = weekly_voice_intervals.get(w)
+                intervals = int(n) if isinstance(n, (int, np.integer)) and n > 0 else intervals_per_week_default
+                calls_per_ivl = weekly_load / float(max(1, intervals))
+                sl_frac = _erlang_sl(calls_per_ivl, max(1.0, float(aht_sut)), agents_eff_avg, sl_seconds, ivl_sec)
+                proj_sl[w] = 100.0 * sl_frac
+            else:
+                # Optional staffing pattern; fall back to flat if unavailable
+                staff_counts = _staff_counts_week(ivl_min)
+                # Normalize arrival weights
+                total_calls = sum(float(v or 0.0) for v in arrival_counts.values())
+                if total_calls <= 0:
+                    proj_sl[w] = 0.0
+                else:
+                    # Normalize staffing to mean=1 so average agents preserved
+                    agents_by_slot: dict[int, float] = {}
+                    if staff_counts:
+                        vals = np.array(list(staff_counts.values()), dtype=float)
+                        mean_v = float(np.mean(vals)) if vals.size > 0 else 0.0
+                        for slot, _ in arrival_counts.items():
+                            w_s = float(staff_counts.get(slot, mean_v)) if mean_v > 0 else 1.0
+                            agents_by_slot[slot] = max(0.1, agents_eff_avg * (w_s / mean_v if mean_v > 0 else 1.0))
+                    # Weighted SL across intervals by arrivals
+                    # Capacity sumproduct across slots using arrival weights as time proxies
+                    try:
+                        total_w = total_calls
+                        cap_sum = 0.0
+                        for slot, c in arrival_counts.items():
+                            ag = float(agents_by_slot.get(slot, agents_eff_avg)) if agents_by_slot else float(agents_eff_avg)
+                            cap_slot = _erlang_calls_capacity(ag, aht_sut, sl_seconds, ivl_sec, sl_target_pct)
+                            # occupancy cap per-slot
+                            occ_cap_slot = float(occ_frac_w.get(w, 0.85)) * ag
+                            occ_calls_cap_slot = (occ_cap_slot * ivl_sec) / max(1.0, aht_sut)
+                            cap_slot = min(cap_slot, occ_calls_cap_slot)
+                            cap_sum += (float(c or 0.0) / max(1.0, total_w)) * cap_slot
+                        # scale by total intervals in week
+                        handling_capacity[w] = cap_sum * intervals
+                    except Exception:
+                        pass
+                    num = 0.0
+                    for slot, c in arrival_counts.items():
+                        weight = float(c) / total_calls
+                        calls_i = weekly_load * weight
+                        N_i = agents_by_slot.get(slot, agents_eff_avg)
+                        sl_i = _erlang_sl(calls_i, max(1.0, float(aht_sut)), N_i, sl_seconds, ivl_sec)
+                        num += calls_i * sl_i
+                    proj_sl[w] = (100.0 * num / weekly_load) if weekly_load > 0 else 0.0
             if os.environ.get("CAP_DEBUG_VOICE"):
                 try:
-                    print(
-                        f"[VOICE-WEEK-SL][{w}] load={weekly_load:.1f} aht={aht_sut:.1f} intervals={intervals} agents_eff={agents_eff:.2f} sl={proj_sl[w]:.1f}"
-                    )
+                    print(f"[VOICE-WEEK-SL][{w}] load={weekly_load:.1f} aht={aht_sut:.1f} sl={proj_sl[w]:.1f}")
                 except Exception:
                     pass
         elif ch_low in ("back office", "bo"):
