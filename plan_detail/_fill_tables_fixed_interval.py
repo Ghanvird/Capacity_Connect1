@@ -145,9 +145,75 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     upper_df_w = pd.DataFrame(getattr(upper_w, 'data', None) or [])
     upper_d    = weekly_col_to_day(upper_df_w.to_dict("records"))
 
-    # Daily -> intervals
-    ivl_cols, ivl_ids = interval_cols_for_day(monday, ivl_min=ivl_min)
-    fw_i   = _round_one_decimal(_broadcast_daily_to_intervals(fw_d,   ivl_ids))
+    # Determine coverage start based on uploaded interval series (earliest slot) or default to 08:00
+    def _earliest_slot_from_df(df: pd.DataFrame) -> str | None:
+        try:
+            if not isinstance(df, pd.DataFrame) or df.empty:
+                return None
+            d = df.copy()
+            # Normalize date column name
+            L = {str(c).strip().lower(): c for c in d.columns}
+            c_date = L.get("date") or L.get("day")
+            if c_date:
+                d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                d = d[d[c_date].eq(monday)]
+            # Require an interval-like column
+            c_ivl = L.get("interval") or L.get("time")
+            if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
+                return None
+            labs = d[c_ivl].astype(str).str.slice(0, 5)
+            labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
+            if labs.empty:
+                return None
+            return labs.min()
+        except Exception:
+            return None
+
+    def _infer_start_hhmm(plan_dict: dict) -> str:
+        try:
+            ch0 = (plan_dict.get("channel") or plan_dict.get("lob") or "").split(",")[0].strip().lower()
+        except Exception:
+            ch0 = ""
+        # default to 08:00 if nothing found
+        start = None
+        try:
+            if ch0 == "voice":
+                sk = _scope_key(plan_dict.get("vertical"), plan_dict.get("sub_ba"), ch0)
+                vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual")
+                for dfx in (vF, vA):
+                    start = start or _earliest_slot_from_df(dfx)
+            elif ch0 == "chat":
+                sk = _scope_key(plan_dict.get("vertical"), plan_dict.get("sub_ba"), ch0)
+                volF = _load_ts_with_fallback("chat_forecast_volume", sk)
+                volA = _load_ts_with_fallback("chat_actual_volume", sk)
+                for dfx in (volF, volA):
+                    start = start or _earliest_slot_from_df(dfx)
+            elif ch0 in ("outbound", "ob"):
+                sk = _scope_key(plan_dict.get("vertical"), plan_dict.get("sub_ba"), ch0)
+                def _first_non_empty(keys: list[str]) -> pd.DataFrame:
+                    for k in keys:
+                        dfk = _load_ts_with_fallback(k, sk)
+                        if isinstance(dfk, pd.DataFrame) and not dfk.empty:
+                            return dfk
+                    return pd.DataFrame()
+                volF = _first_non_empty(["ob_forecast_opc","outbound_forecast_opc","ob_forecast_dials","outbound_forecast_dials","ob_forecast_calls"])
+                volA = _first_non_empty(["ob_actual_opc","outbound_actual_opc","ob_actual_dials","outbound_actual_dials","ob_actual_calls"])
+                for dfx in (volF, volA):
+                    start = start or _earliest_slot_from_df(dfx)
+        except Exception:
+            start = None
+        return start or "08:00"
+
+    start_hhmm = _infer_start_hhmm(p)
+
+    # Daily -> intervals using inferred start
+    ivl_cols, ivl_ids = interval_cols_for_day(monday, ivl_min=ivl_min, start_hhmm=start_hhmm)
+    # For interval-level FW table, do NOT distribute day values uniformly.
+    # Initialize a blank interval matrix and later populate from uploaded interval series only.
+    fw_i   = pd.DataFrame({"metric": fw_d.get("metric", pd.Series(dtype="object")).astype(str) if isinstance(fw_d, pd.DataFrame) else pd.Series([], dtype="object")})
+    for _slot in ivl_ids:
+        fw_i[_slot] = np.nan
+    fw_i = _round_one_decimal(fw_i)
     hc_i   = _round_one_decimal(_broadcast_daily_to_intervals(hc_d,   ivl_ids))
     att_i  = _round_one_decimal(_broadcast_daily_to_intervals(att_d,  ivl_ids))
     shr_i  = _round_one_decimal(_broadcast_daily_to_intervals(shr_d,  ivl_ids))
@@ -251,7 +317,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                         coverage_min = float(s.get("chat_coverage_minutes", s.get("hours_per_fte", 8.0) * 60.0) or 480.0)
                         ivm = int(float(s.get("chat_interval_minutes", s.get("interval_minutes", 30)) or 30))
                         n = max(1, int(round(coverage_min / ivm)))
-                        slot_labels = interval_cols_for_day(monday, ivm)[1]
+                        slot_labels = interval_cols_for_day(monday, ivm, start_hhmm=start_hhmm)[1]
                         total = float(df["items"].sum())
                         per = total / float(n)
                         # compute agents per slot using concurrency and chat SL/occ caps
@@ -439,7 +505,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 ivm = int(float(s.get("ob_interval_minutes", s.get("interval_minutes", 30)) or 30))
                 coverage_min = float(s.get("ob_coverage_minutes", s.get("hours_per_fte", 8.0) * 60.0) or 480.0)
                 n = max(1, int(round(coverage_min / ivm)))
-                labs = interval_cols_for_day(monday, ivm)[1]
+                labs = interval_cols_for_day(monday, ivm, start_hhmm=start_hhmm)[1]
                 total_calls = float(df.apply(_calls, axis=1).sum())
                 per = total_calls / float(n)
                 target_sl = float(s.get("ob_target_sl", s.get("target_sl", 0.8)) or 0.8)
