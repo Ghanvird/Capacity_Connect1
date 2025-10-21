@@ -6,16 +6,110 @@ import numpy as np
 import datetime as dt
 from typing import List, Tuple, Optional
 from dash import dash_table, html
-
-from common import _hc_lookup, _hhmm_to_minutes, _parse_date_series
 from plan_store import get_plan
-from cap_store import resolve_settings
+from cap_store import load_headcount, resolve_settings
 from capacity_core import required_fte_daily, voice_requirements_interval, min_agents, _ivl_minutes_from_str
 from ._common import _load_ts_with_fallback, _week_span, _scope_key, _assemble_voice, _assemble_bo, _assemble_ob, _assemble_chat
 from cap_db import load_df, save_df
 from cap_store import load_roster_long
 from ._calc import _fill_tables_fixed
 from ._grain_cols import day_cols_for_weeks
+
+def _hhmm_to_minutes(x) -> float:
+    if pd.isna(x): return 0.0
+    s = str(x).strip()
+    if not s: return 0.0
+    # allow "HH:MM", "H:MM", "MM", "H.MM" etc.
+    m = None
+    if ":" in s:
+        parts = s.split(":")
+        if len(parts) >= 2:
+            try:
+                h = int(parts[0]); mm = int(parts[1])
+                return float(h * 60 + mm)
+            except Exception:
+                pass
+    try:
+        # fallback: numeric minutes
+        return float(s)
+    except Exception:
+        return 0.0
+
+def _hc_lookup():
+    """Return simple dict lookups from headcount: BRID→{lm_name, site, city, country, journey, level_3}"""
+    try:
+        hc = load_headcount()
+    except Exception:
+        hc = pd.DataFrame()
+    if not isinstance(hc, pd.DataFrame) or hc.empty:
+        return {}
+    L = {c.lower(): c for c in hc.columns}
+    def col(name):
+        return L.get(name, name)
+    out = {}
+    for _, r in hc.iterrows():
+        brid = str(r.get(col("brid"), "")).strip()
+        if not brid: 
+            continue
+        out[brid] = dict(
+            lm_name = r.get(col("line_manager_full_name")),
+            site    = r.get(col("position_location_building_description")),
+            city    = r.get(col("position_location_city")),
+            country = r.get(col("position_location_country")),
+            journey = r.get(col("journey")),
+            level_3 = r.get(col("level_3")),
+        )
+    return out
+
+def _parse_date_series(series: pd.Series) -> pd.Series:
+    """Parse dates robustly without warnings.
+    Heuristic:
+      - If ISO (YYYY-MM-DD) → explicit format
+      - If slash form → decide mm/dd vs dd/mm by values, then explicit format
+      - If dash form with 2-digit first part → decide similarly
+      - Else → default parser (no dayfirst) to avoid mm/dd + dayfirst warnings
+    """
+    s = pd.Series(series)
+    # Already datetime-like
+    try:
+        if np.issubdtype(s.dtype, np.datetime64):
+            return pd.to_datetime(s, errors="coerce").dt.date
+    except Exception:
+        pass
+
+    sample = s.dropna().astype(str).str.strip()
+    if sample.empty:
+        return pd.to_datetime(s, errors="coerce").dt.date
+
+    # ISO 8601: 2025-09-30
+    iso_mask = sample.str.match(r"^\d{4}-\d{1,2}-\d{1,2}$")
+    if iso_mask.any() and iso_mask.mean() > 0.5:
+        return pd.to_datetime(s, errors="coerce", format="%Y-%m-%d").dt.date
+
+    # Slash separated: 09/30/2025 or 30/09/2025
+    slash_mask = sample.str.match(r"^\d{1,2}/\d{1,2}/\d{2,4}$")
+    if slash_mask.any() and slash_mask.mean() > 0.5:
+        parts = sample[slash_mask].str.extract(r"^(\d{1,2})/(\d{1,2})/(\d{2,4})$")
+        first = pd.to_numeric(parts[0], errors="coerce")
+        if (first > 12).any():
+            fmt = "%d/%m/%Y"
+        else:
+            fmt = "%m/%d/%Y"
+        return pd.to_datetime(s, errors="coerce", format=fmt).dt.date
+
+    # Dash separated ambiguous: 01-02-2025 or 30-09-2025
+    dash_mask = sample.str.match(r"^\d{1,2}-\d{1,2}-\d{2,4}$")
+    if dash_mask.any() and dash_mask.mean() > 0.5:
+        parts = sample[dash_mask].str.extract(r"^(\d{1,2})-(\d{1,2})-(\d{2,4})$")
+        first = pd.to_numeric(parts[0], errors="coerce")
+        if (first > 12).any():
+            fmt = "%d-%m-%Y"
+        else:
+            fmt = "%m-%d-%Y"
+        return pd.to_datetime(s, errors="coerce", format=fmt).dt.date
+
+    # Fallback: default parser
+    return pd.to_datetime(s, errors="coerce").dt.date
 
 def _bo_bucket(activity: str) -> str:
     try:
@@ -476,7 +570,12 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         except Exception:
             return pd.DataFrame()
 
-    fw_d   = (_broadcast_weekly_to_daily(to_df(fw_w),   day_ids, pid=pid, channel=ch0, tab='fw'))
+    # FW daily: start with a blank daily matrix and fill only from uploaded daily/interval series
+    _fw_week_df = to_df(fw_w)
+    _fw_metrics = _fw_week_df.get("metric", pd.Series(dtype="object")).astype(str).tolist() if isinstance(_fw_week_df, pd.DataFrame) else []
+    fw_d = pd.DataFrame({"metric": _fw_metrics})
+    for d in day_ids:
+        fw_d[d] = 0.0
     hc_d   = _round_one_decimal(_broadcast_weekly_to_daily(to_df(hc_w),   day_ids))
     att_d  = _round_one_decimal(_broadcast_weekly_to_daily(to_df(att_w),  day_ids))
     shr_d  = _round_one_decimal(_broadcast_weekly_to_daily(to_df(shr_w),  day_ids))
@@ -544,6 +643,19 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                     except Exception:
                         v = 0.0
                     upper_d.loc[upper_d["metric"].eq(name), d] = v
+    # Ensure rows used later exist
+    try:
+        need = ["Projected Handling Capacity (#)", "Projected Service Level",
+                "FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]
+        have = set(upper_d["metric"].astype(str).tolist())
+        missing = [nm for nm in need if nm not in have]
+        if missing:
+            add = pd.DataFrame({"metric": missing})
+            for d in day_ids:
+                add[d] = 0.0
+            upper_d = pd.concat([upper_d, add], ignore_index=True)
+    except Exception:
+        pass
     # Compute interval → day FTE rollups for Voice/Chat/Outbound
     hrs_per_fte = float(settings.get("hours_per_fte", 8.0) or 8.0)
     def _fte_from_agents_df(df: pd.DataFrame, ivl_col: str = "interval", agents_col: str = "agents") -> float:
