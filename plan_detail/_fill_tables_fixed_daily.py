@@ -4,7 +4,7 @@ import re
 import pandas as pd
 import numpy as np
 import datetime as dt
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from dash import dash_table, html
 
 from common import _hc_lookup, _hhmm_to_minutes, _parse_date_series
@@ -196,10 +196,24 @@ def summarize_shrinkage_voice(dff: pd.DataFrame) -> pd.DataFrame:
     keep = keys + ["OOO Hours", "In Office Hours", "Base Hours"]
     return piv[keep].sort_values(keys)
 
-def _broadcast_weekly_to_daily(df: pd.DataFrame, day_ids: List[str]) -> pd.DataFrame:
-    """Convert a weekly-matrix DataFrame (metric + week_id cols) to a daily-matrix
-    by evenly distributing additive rows across the 7 days of each week.
-    Percent/AHT/SUT-like rows are replicated to each day.
+def _broadcast_weekly_to_daily(
+    df: pd.DataFrame,
+    day_ids: List[str],
+    *,
+    pid: Optional[int] = None,
+    channel: Optional[str] = None,
+    tab: Optional[str] = None,
+) -> pd.DataFrame:
+    """
+    Build a daily-matrix DataFrame from weekly (base), with channel-aware overrides for FW when interval/daily series exist.
+
+    - For Voice/Chat/Outbound (tab == 'fw'):
+      Use uploaded interval series to roll up to daily (sum for volumes, volume-weighted for AHT). If only daily series exist,
+      use them as-is (no weekly/7 split).
+    - For Back Office (tab == 'fw'):
+      Use uploaded daily series as-is (no weekly/7 split).
+    - For all other tabs or when data missing:
+      Fall back to weekly broadcast: additive rows evenly split across 7 days; percent-like rows replicated.
     """
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame(columns=["metric"] + list(day_ids))
@@ -232,7 +246,7 @@ def _broadcast_weekly_to_daily(df: pd.DataFrame, day_ids: List[str]) -> pd.DataF
             continue
         week_to_days[w] = [(monday + dt.timedelta(days=i)).isoformat() for i in range(7)]
 
-    # Fill rows
+    # Fill rows (baseline weekly->daily broadcast)
     for i, row in df.iterrows():
         name = str(row.get("metric", ""))
         replicate = is_percent_like(name)
@@ -254,6 +268,152 @@ def _broadcast_weekly_to_daily(df: pd.DataFrame, day_ids: List[str]) -> pd.DataF
                 for d in days:
                     if d in out.columns:
                         out.at[i, d] = per
+
+    # Channel-aware overrides only for FW grid
+    ch = (channel or "").strip().lower()
+    if (tab or "").strip().lower() != "fw" or not pid or ch == "":
+        return out[["metric"] + list(day_ids)]
+
+    try:
+        p = get_plan(pid) or {}
+    except Exception:
+        p = {}
+    sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch)
+
+    # Helpers for daily maps
+    def _is_interval_level(dfin: pd.DataFrame) -> bool:
+        if not isinstance(dfin, pd.DataFrame) or dfin.empty:
+            return False
+        L = {str(c).strip().lower(): c for c in dfin.columns}
+        c_ivl = L.get("interval") or L.get("time") or L.get("interval_start") or L.get("start_time") or L.get("slot")
+        return bool(c_ivl and (c_ivl in dfin.columns) and dfin[c_ivl].notna().any())
+
+    def _day_sum_map(dfin: pd.DataFrame, val_col: str, pick_first_if_daily: bool = True) -> dict:
+        if not isinstance(dfin, pd.DataFrame) or dfin.empty:
+            return {}
+        d = dfin.copy()
+        L = {str(c).strip().lower(): c for c in d.columns}
+        c_date = L.get("date") or L.get("day")
+        if not c_date or c_date not in d.columns:
+            return {}
+        d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date.astype(str)
+        if _is_interval_level(d):
+            s = d.groupby(c_date)[val_col].sum()
+            return {k: float(v) for k, v in s.to_dict().items()}
+        # Day-level data: pick first non-null per day to "display as uploaded"
+        if pick_first_if_daily:
+            outm = {}
+            for k, sub in d.groupby(c_date):
+                vals = pd.to_numeric(sub.get(val_col), errors="coerce")
+                first = vals.dropna().iloc[0] if not vals.dropna().empty else np.nan
+                outm[k] = float(first) if pd.notna(first) else 0.0
+            return outm
+        # else fallback to sum
+        s = d.groupby(c_date)[val_col].sum()
+        return {k: float(v) for k, v in s.to_dict().items()}
+
+    def _weighted_aht_map(dfin: pd.DataFrame, vol_col: str, aht_col: str) -> dict:
+        if not isinstance(dfin, pd.DataFrame) or dfin.empty:
+            return {}
+        d = dfin.copy()
+        L = {str(c).strip().lower(): c for c in d.columns}
+        c_date = L.get("date") or L.get("day")
+        if not c_date or c_date not in d.columns:
+            return {}
+        d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date.astype(str)
+        if _is_interval_level(d):
+            vol = pd.to_numeric(d.get(vol_col), errors="coerce").fillna(0.0)
+            aht = pd.to_numeric(d.get(aht_col), errors="coerce").fillna(np.nan)
+            d["_num"] = vol * aht
+            g_vol = d.groupby(c_date)[vol_col].sum()
+            g_num = d.groupby(c_date)["_num"].sum()
+            outm = {}
+            for k in g_vol.index:
+                v = float(g_vol.loc[k])
+                outm[k] = float(g_num.loc[k] / v) if v > 0 else 0.0
+            return outm
+        # Day-level: pick first available
+        outm = {}
+        vals = pd.to_numeric(d.get(aht_col), errors="coerce") if aht_col in d.columns else pd.Series(dtype=float)
+        for k, sub in d.groupby(c_date):
+            s = pd.to_numeric(sub.get(aht_col), errors="coerce") if aht_col in sub.columns else pd.Series(dtype=float)
+            first = s.dropna().iloc[0] if not s.dropna().empty else np.nan
+            outm[k] = float(first) if pd.notna(first) else 0.0
+        return outm
+
+    def _write_row_local(df_out: pd.DataFrame, row_name: str, mapping: dict):
+        if not isinstance(df_out, pd.DataFrame) or df_out.empty or not isinstance(mapping, dict) or not mapping:
+            return
+        mser = df_out["metric"].astype(str).str.strip()
+        if row_name not in mser.values:
+            return
+        # Clear existing values for the row to avoid weekly/7 remnants
+        df_out.loc[mser == row_name, day_ids] = [[0.0 for _ in day_ids]]
+        set_cols = [d for d in day_ids if (d in df_out.columns) and (d in mapping) and (mapping.get(d) is not None)]
+        if set_cols:
+            df_out.loc[mser == row_name, set_cols] = [[float(mapping[d]) for d in set_cols]]
+
+    try:
+        m = out["metric"].astype(str).str.strip().tolist()
+        if ch == "voice":
+            vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual"); vT = _assemble_voice(sk, "tactical")
+            volF = _day_sum_map(vF, "volume"); volA = _day_sum_map(vA, "volume"); volT = _day_sum_map(vT, "volume")
+            ahtF = _weighted_aht_map(vF, "volume", "aht_sec"); ahtA = _weighted_aht_map(vA, "volume", "aht_sec")
+            _write_row_local(out, "Forecast", volF)
+            _write_row_local(out, "Tactical Forecast", volT)
+            _write_row_local(out, "Actual Volume", volA)
+            if "Forecast AHT/SUT" in m:
+                _write_row_local(out, "Forecast AHT/SUT", ahtF)
+            if "Actual AHT/SUT" in m:
+                _write_row_local(out, "Actual AHT/SUT", ahtA)
+            if ("AHT/SUT" in m) and ("Forecast AHT/SUT" not in m and "Actual AHT/SUT" not in m):
+                _write_row_local(out, "AHT/SUT", ahtF or ahtA)
+        elif ch == "chat":
+            cF = _assemble_chat(sk, "forecast"); cA = _assemble_chat(sk, "actual"); cT = _assemble_chat(sk, "tactical")
+            volF = _day_sum_map(cF, "items", pick_first_if_daily=True); volA = _day_sum_map(cA, "items", pick_first_if_daily=True); volT = _day_sum_map(cT, "items", pick_first_if_daily=True)
+            ahtF = _weighted_aht_map(cF, "items", "aht_sec"); ahtA = _weighted_aht_map(cA, "items", "aht_sec")
+            _write_row_local(out, "Forecast", volF)
+            _write_row_local(out, "Tactical Forecast", volT)
+            _write_row_local(out, "Actual Volume", volA)
+            if "Forecast AHT/SUT" in m:
+                _write_row_local(out, "Forecast AHT/SUT", ahtF)
+            if "Actual AHT/SUT" in m:
+                _write_row_local(out, "Actual AHT/SUT", ahtA)
+            if ("AHT/SUT" in m) and ("Forecast AHT/SUT" not in m and "Actual AHT/SUT" not in m):
+                _write_row_local(out, "AHT/SUT", ahtF or ahtA)
+        elif ch in ("outbound", "ob"):
+            oF = _assemble_ob(sk, "forecast"); oA = _assemble_ob(sk, "actual"); oT = _assemble_ob(sk, "tactical")
+            # OPC/dials/calls
+            colF = "opc" if "opc" in (oF.columns if isinstance(oF, pd.DataFrame) else []) else "items"
+            colA = "opc" if "opc" in (oA.columns if isinstance(oA, pd.DataFrame) else []) else "items"
+            colT = "opc" if "opc" in (oT.columns if isinstance(oT, pd.DataFrame) else []) else "items"
+            volF = _day_sum_map(oF, colF, pick_first_if_daily=True); volA = _day_sum_map(oA, colA, pick_first_if_daily=True); volT = _day_sum_map(oT, colT, pick_first_if_daily=True)
+            ahtF = _weighted_aht_map(oF, colF, "aht_sec"); ahtA = _weighted_aht_map(oA, colA, "aht_sec")
+            _write_row_local(out, "Forecast", volF)
+            _write_row_local(out, "Tactical Forecast", volT)
+            _write_row_local(out, "Actual Volume", volA)
+            if "Forecast AHT/SUT" in m:
+                _write_row_local(out, "Forecast AHT/SUT", ahtF)
+            if "Actual AHT/SUT" in m:
+                _write_row_local(out, "Actual AHT/SUT", ahtA)
+            if ("AHT/SUT" in m) and ("Forecast AHT/SUT" not in m and "Actual AHT/SUT" not in m):
+                _write_row_local(out, "AHT/SUT", ahtF or ahtA)
+        elif ch in ("back office", "bo"):
+            bF = _assemble_bo(sk, "forecast"); bA = _assemble_bo(sk, "actual"); bT = _assemble_bo(sk, "tactical")
+            volF = _day_sum_map(bF, "items", pick_first_if_daily=True); volA = _day_sum_map(bA, "items", pick_first_if_daily=True); volT = _day_sum_map(bT, "items", pick_first_if_daily=True)
+            ahtF = _day_sum_map(bF, "aht_sec", pick_first_if_daily=True); ahtA = _day_sum_map(bA, "aht_sec", pick_first_if_daily=True)
+            _write_row_local(out, "Forecast", volF)
+            _write_row_local(out, "Tactical Forecast", volT)
+            _write_row_local(out, "Actual Volume", volA)
+            if "Forecast AHT/SUT" in m:
+                _write_row_local(out, "Forecast AHT/SUT", ahtF)
+            if "Actual AHT/SUT" in m:
+                _write_row_local(out, "Actual AHT/SUT", ahtA)
+            if ("AHT/SUT" in m) and ("Forecast AHT/SUT" not in m and "Actual AHT/SUT" not in m):
+                _write_row_local(out, "AHT/SUT", ahtF or ahtA)
+    except Exception:
+        # swallow and keep baseline when data missing
+        pass
 
     return out[["metric"] + list(day_ids)]
 
@@ -293,6 +453,7 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     """
     p = get_plan(pid) or {}
     weeks = _week_span(p.get("start_week"), p.get("end_week"))
+    ch0 = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
     day_cols, day_ids = day_cols_for_weeks(weeks)
 
     # Build weekly columns for reuse
@@ -315,7 +476,7 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         except Exception:
             return pd.DataFrame()
 
-    fw_d   = _round_one_decimal(_broadcast_weekly_to_daily(to_df(fw_w),   day_ids))
+    fw_d   = _round_one_decimal(_broadcast_weekly_to_daily(to_df(fw_w),   day_ids, pid=pid, channel=ch0, tab='fw'))
     hc_d   = _round_one_decimal(_broadcast_weekly_to_daily(to_df(hc_w),   day_ids))
     att_d  = _round_one_decimal(_broadcast_weekly_to_daily(to_df(att_w),  day_ids))
     shr_d  = _round_one_decimal(_broadcast_weekly_to_daily(to_df(shr_w),  day_ids))
@@ -1045,6 +1206,8 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         mser = df["metric"].astype(str).str.strip()
         if row_name not in mser.values:
             return df
+        # Clear existing values across all days for this row to avoid weekly/7 remnants
+        df.loc[mser == row_name, day_ids] = [[0.0 for _ in day_ids]]
         # Vectorized assignment to avoid fragmentation: set only columns present in mapping
         target_cols = [d for d in day_ids if (d in df.columns) and (d in mapping) and (mapping.get(d) is not None)]
         if target_cols:
