@@ -9,7 +9,7 @@ from dash import dash_table
 
 from plan_store import get_plan
 from cap_store import resolve_settings, load_roster_long
-from ._common import _week_span, _scope_key, _assemble_voice, _load_ts_with_fallback
+from ._common import _week_span, _scope_key, _assemble_voice, _assemble_bo, _assemble_ob, _assemble_chat, _load_ts_with_fallback
 from ._calc import _fill_tables_fixed
 from ._grain_cols import interval_cols_for_day
 from capacity_core import voice_requirements_interval, min_agents, _ivl_minutes_from_str
@@ -229,6 +229,121 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     seat_i = _round_one_decimal(_broadcast_daily_to_intervals(seat_d, ivl_ids))
     bva_i  = _round_one_decimal(_broadcast_daily_to_intervals(bva_d,  ivl_ids))
     nh_i   = _round_one_decimal(_broadcast_daily_to_intervals(nh_d,   ivl_ids))
+
+    # --- Populate FW (interval) from native interval time series when available ---
+    def _write_row(df: pd.DataFrame, row_name: str, mapping: dict[str, float]) -> pd.DataFrame:
+        if not isinstance(df, pd.DataFrame) or df.empty or not isinstance(mapping, dict) or not mapping:
+            return df
+        mser = df["metric"].astype(str).str.strip()
+        if row_name not in mser.values:
+            return df
+        cols = [c for c in ivl_ids if (c in df.columns) and (c in mapping) and (mapping.get(c) is not None)]
+        if cols:
+            df.loc[mser == row_name, cols] = [[float(mapping[c]) for c in cols]]
+        return df
+
+    def _slot_series(df: pd.DataFrame, val_col: str) -> dict[str, float]:
+        if not isinstance(df, pd.DataFrame) or df.empty or val_col not in df.columns:
+            return {}
+        d = df.copy()
+        # tolerant column resolution
+        L = {str(c).strip().lower(): c for c in d.columns}
+        c_date = L.get("date") or L.get("day")
+        c_ivl  = L.get("interval") or L.get("time")
+        if not c_ivl:
+            return {}
+        if c_date:
+            d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+            d = d[d[c_date].eq(ref_day)]
+        d = d.dropna(subset=[c_ivl])
+        if d.empty:
+            return {}
+        labs = d[c_ivl].astype(str).str.slice(0,5)
+        vals = pd.to_numeric(d.get(val_col), errors="coerce").fillna(0.0)
+        g = pd.DataFrame({"lab": labs, "val": vals}).groupby("lab", as_index=True)["val"].sum()
+        return {str(k): float(v) for k, v in g.to_dict().items()}
+
+    def _slot_weighted(df: pd.DataFrame, vol_col: str, aht_col: str) -> dict[str, float]:
+        if not isinstance(df, pd.DataFrame) or df.empty or vol_col not in df.columns:
+            return {}
+        d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
+        c_date = L.get("date") or L.get("day"); c_ivl = L.get("interval") or L.get("time")
+        if not c_ivl:
+            return {}
+        if c_date:
+            d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+            d = d[d[c_date].eq(ref_day)]
+        d = d.dropna(subset=[c_ivl])
+        if d.empty:
+            return {}
+        labs = d[c_ivl].astype(str).str.slice(0,5)
+        vol = pd.to_numeric(d.get(vol_col), errors="coerce").fillna(0.0)
+        aht = pd.to_numeric(d.get(aht_col), errors="coerce").fillna(np.nan)
+        num = (vol * aht)
+        df2 = pd.DataFrame({"lab": labs, "num": num, "den": vol})
+        g = df2.groupby("lab", as_index=True)[["num","den"]].sum()
+        out: dict[str, float] = {}
+        for k, row in g.iterrows():
+            den = float(row.get("den", 0.0) or 0.0)
+            out[str(k)] = float(row.get("num", 0.0) / den) if den > 0 else 0.0
+        return out
+
+    try:
+        p = get_plan(pid) or {}
+        ch0 = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
+        sk  = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
+        if ch0 == "voice":
+            vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual"); vT = _assemble_voice(sk, "tactical")
+            volF = _slot_series(vF, "volume"); volA = _slot_series(vA, "volume"); volT = _slot_series(vT, "volume")
+            ahtF = _slot_weighted(vF, "volume", "aht_sec"); ahtA = _slot_weighted(vA, "volume", "aht_sec")
+            fw_i = _write_row(fw_i, "Forecast", volF)
+            fw_i = _write_row(fw_i, "Tactical Forecast", volT)
+            fw_i = _write_row(fw_i, "Actual Volume", volA)
+            fw_i = _write_row(fw_i, "Forecast AHT/SUT", ahtF)
+            fw_i = _write_row(fw_i, "Actual AHT/SUT", ahtA)
+            # fallback for plans with single AHT/SUT row
+            if "AHT/SUT" in fw_i["metric"].astype(str).values and not any(x in fw_i["metric"].astype(str).values for x in ["Forecast AHT/SUT","Actual AHT/SUT"]):
+                use_map = ahtF or ahtA or {}
+                fw_i = _write_row(fw_i, "AHT/SUT", use_map)
+        elif ch0 == "chat":
+            # Chat: try native interval series; otherwise leave blank
+            volF = _slot_series(_load_ts_with_fallback("chat_forecast_volume", sk), "items") or _slot_series(_load_ts_with_fallback("chat_forecast_volume", sk), "volume")
+            volA = _slot_series(_load_ts_with_fallback("chat_actual_volume",   sk), "items") or _slot_series(_load_ts_with_fallback("chat_actual_volume",   sk), "volume")
+            ahtF = _slot_series(_load_ts_with_fallback("chat_forecast_aht",    sk), "aht_sec") or _slot_series(_load_ts_with_fallback("chat_forecast_aht",    sk), "aht")
+            ahtA = _slot_series(_load_ts_with_fallback("chat_actual_aht",      sk), "aht_sec") or _slot_series(_load_ts_with_fallback("chat_actual_aht",      sk), "aht")
+            fw_i = _write_row(fw_i, "Forecast", volF)
+            fw_i = _write_row(fw_i, "Actual Volume", volA)
+            fw_i = _write_row(fw_i, "Forecast AHT/SUT", ahtF)
+            fw_i = _write_row(fw_i, "Actual AHT/SUT", ahtA)
+            if "AHT/SUT" in fw_i["metric"].astype(str).values and not any(x in fw_i["metric"].astype(str).values for x in ["Forecast AHT/SUT","Actual AHT/SUT"]):
+                use_map = ahtF or ahtA or {}
+                fw_i = _write_row(fw_i, "AHT/SUT", use_map)
+        elif ch0 in ("outbound","ob"):
+            def _first_non_empty(keys: list[str]) -> pd.DataFrame:
+                for k in keys:
+                    dfk = _load_ts_with_fallback(k, sk)
+                    if isinstance(dfk, pd.DataFrame) and not dfk.empty:
+                        return dfk
+                return pd.DataFrame()
+            vF = _first_non_empty(["ob_forecast_opc","outbound_forecast_opc","ob_forecast_dials","outbound_forecast_dials","ob_forecast_calls"]) 
+            vA = _first_non_empty(["ob_actual_opc","outbound_actual_opc","ob_actual_dials","outbound_actual_dials","ob_actual_calls"]) 
+            aF = _load_ts_with_fallback("ob_forecast_aht", sk)
+            aA = _load_ts_with_fallback("ob_actual_aht",   sk)
+            volF = _slot_series(vF, "opc") or _slot_series(vF, "dials") or _slot_series(vF, "calls") or _slot_series(vF, "volume")
+            volA = _slot_series(vA, "opc") or _slot_series(vA, "dials") or _slot_series(vA, "calls") or _slot_series(vA, "volume")
+            ahtF = _slot_series(aF, "aht_sec") or _slot_series(aF, "aht")
+            ahtA = _slot_series(aA, "aht_sec") or _slot_series(aA, "aht")
+            fw_i = _write_row(fw_i, "Forecast", volF)
+            fw_i = _write_row(fw_i, "Actual Volume", volA)
+            fw_i = _write_row(fw_i, "Forecast AHT/SUT", ahtF)
+            fw_i = _write_row(fw_i, "Actual AHT/SUT", ahtA)
+            if "AHT/SUT" in fw_i["metric"].astype(str).values and not any(x in fw_i["metric"].astype(str).values for x in ["Forecast AHT/SUT","Actual AHT/SUT"]):
+                use_map = ahtF or ahtA or {}
+                fw_i = _write_row(fw_i, "AHT/SUT", use_map)
+        else:
+            pass
+    except Exception:
+        pass
 
     # Build base upper grid for interval view from weekly upper metrics, replicated across interval slots
     week_cols_weekly = [c for c in upper_df_w.columns if c != 'metric'] if isinstance(upper_df_w, pd.DataFrame) else []
