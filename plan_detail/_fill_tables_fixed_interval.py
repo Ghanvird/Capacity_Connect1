@@ -48,41 +48,97 @@ def _slot_series_for_day(df: pd.DataFrame, day: dt.date, val_col: str) -> Dict[s
         d = d[d[c_date].eq(day)]
     if d.empty:
         return {}
-    labs = d[c_ivl].astype(str).str.slice(0, 5)
+    labs = pd.to_datetime(d[c_ivl], errors="coerce").dt.strftime("%H:%M")
     vals = pd.to_numeric(d.get(val_col), errors="coerce").fillna(0.0)
     g = pd.DataFrame({"lab": labs, "val": vals}).groupby("lab", as_index=True)["val"].sum()
     return {str(k): float(v) for k, v in g.to_dict().items()}
 
 
-def _infer_start_hhmm(plan: dict, day: dt.date, ch: str, sk: str) -> str:
-    def _earliest_from(df: pd.DataFrame) -> Optional[str]:
+# def _infer_start_hhmm(plan: dict, day: dt.date, ch: str, sk: str) -> str:
+#     def _earliest_from(df: pd.DataFrame) -> Optional[str]:
+#         try:
+#             if not isinstance(df, pd.DataFrame) or df.empty:
+#                 return None
+#             d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
+#             c_date = L.get("date") or L.get("day"); ivc = _pick_ivl_col(d)
+#             if not ivc:
+#                 return None
+#             if c_date:
+#                 d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+#                 d = d[d[c_date].eq(day)]
+#             if d.empty:
+#                 return None
+#             labs = d[ivc].astype(str).str.slice(0, 5)
+#             labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
+#             return None if labs.empty else str(labs.min())
+#         except Exception:
+#             return None
+
+#     start = None
+#     try:
+#         if ch == "voice":
+#             for df in (_assemble_voice(sk, "forecast"), _assemble_voice(sk, "actual")):
+#                 start = start or _earliest_from(df)
+#         elif ch == "chat":
+#             for key in ("chat_forecast_volume", "chat_actual_volume"):
+#                 df = _load_ts_with_fallback(key, sk)
+#                 start = start or _earliest_from(df)
+#         elif ch in ("outbound", "ob"):
+#             for key in (
+#                 "ob_forecast_opc","outbound_forecast_opc","ob_actual_opc","outbound_actual_opc",
+#                 "ob_forecast_dials","outbound_forecast_dials","ob_actual_dials","outbound_actual_dials",
+#                 "ob_forecast_calls","outbound_forecast_calls","ob_actual_calls","outbound_actual_calls",
+#             ):
+#                 df = _load_ts_with_fallback(key, sk)
+#                 start = start or _earliest_from(df)
+#     except Exception:
+#         start = None
+#     return start or "08:00"
+
+def _infer_start_end_hhmm(plan: dict, day: dt.date, ch: str, sk: str) -> Tuple[str, str]:
+    """
+    Infer the earliest and latest hh:mm interval for a given day/channel/skill.
+
+    Returns:
+        (start, end) as strings in "HH:MM" format.
+        Defaults to ("08:00", "23:30") if no data is found.
+    """
+    def _bounds_from(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
         try:
             if not isinstance(df, pd.DataFrame) or df.empty:
-                return None
-            d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
-            c_date = L.get("date") or L.get("day"); ivc = _pick_ivl_col(d)
+                return None, None
+            d = df.copy()
+            L = {str(c).strip().lower(): c for c in d.columns}
+            c_date = L.get("date") or L.get("day")
+            ivc = _pick_ivl_col(d)
             if not ivc:
-                return None
+                return None, None
             if c_date:
                 d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
                 d = d[d[c_date].eq(day)]
             if d.empty:
-                return None
+                return None, None
             labs = d[ivc].astype(str).str.slice(0, 5)
             labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
-            return None if labs.empty else str(labs.min())
+            if labs.empty:
+                return None, None
+            return str(labs.min()), str(labs.max())
         except Exception:
-            return None
+            return None, None
 
-    start = None
+    start, end = None, None
     try:
         if ch == "voice":
             for df in (_assemble_voice(sk, "forecast"), _assemble_voice(sk, "actual")):
-                start = start or _earliest_from(df)
+                s, e = _bounds_from(df)
+                start = start or s
+                end = end or e
         elif ch == "chat":
             for key in ("chat_forecast_volume", "chat_actual_volume"):
                 df = _load_ts_with_fallback(key, sk)
-                start = start or _earliest_from(df)
+                s, e = _bounds_from(df)
+                start = start or s
+                end = end or e
         elif ch in ("outbound", "ob"):
             for key in (
                 "ob_forecast_opc","outbound_forecast_opc","ob_actual_opc","outbound_actual_opc",
@@ -90,11 +146,13 @@ def _infer_start_hhmm(plan: dict, day: dt.date, ch: str, sk: str) -> str:
                 "ob_forecast_calls","outbound_forecast_calls","ob_actual_calls","outbound_actual_calls",
             ):
                 df = _load_ts_with_fallback(key, sk)
-                start = start or _earliest_from(df)
+                s, e = _bounds_from(df)
+                start = start or s
+                end = end or e
     except Exception:
-        start = None
-    return start or "08:00"
+        start, end = None, None
 
+    return (start or "08:00", end or "23:30")
 
 def _staff_by_slot_for_day(plan: dict, day: dt.date, ivl_ids: List[str], start_hhmm: str, ivl_min: int) -> Dict[str, float]:
     try:
@@ -232,7 +290,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     sk = _scope_key(plan.get("vertical"), plan.get("sub_ba"), ch)
     settings = resolve_settings(ba=plan.get("vertical"), subba=plan.get("sub_ba"), lob=ch)
 
-    start_hhmm = _infer_start_hhmm(plan, ref_day, ch, sk)
+    start_hhmm = _infer_start_end_hhmm(plan, ref_day, ch, sk)
     ivl_cols, ivl_ids = interval_cols_for_day(ref_day, ivl_min=ivl_min, start_hhmm=start_hhmm)
 
     # FW metrics
