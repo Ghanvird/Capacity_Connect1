@@ -11,6 +11,7 @@ from dash import dash_table
 from plan_store import get_plan
 from cap_store import resolve_settings, load_roster_long
 from ._common import _load_ts_with_fallback, _week_span, _scope_key, _assemble_voice, _assemble_chat, _assemble_ob
+from ._calc import _fill_tables_fixed
 from ._grain_cols import day_cols_for_weeks
 
 
@@ -177,17 +178,15 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     sk = _scope_key(plan.get("vertical"), plan.get("sub_ba"), ch)
     settings = resolve_settings(ba=plan.get("vertical"), subba=plan.get("sub_ba"), lob=ch)
 
-    # FW metrics (attempt persistence, else defaults)
-    try:
-        fw_saved = pd.DataFrame()
-    except Exception:
-        fw_saved = pd.DataFrame()
+    # FW metrics shaped to match weekly FW spec (fields/ordering)
     fw_metrics = FW_ROWS_DEFAULT.copy()
     try:
-        from cap_db import load_df as _ldf
-        df_fw = _ldf(f"plan_{pid}_fw")
-        if isinstance(df_fw, pd.DataFrame) and not df_fw.empty and "metric" in df_fw.columns:
-            fw_metrics = df_fw["metric"].astype(str).tolist()
+        weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
+        weekly = _fill_tables_fixed(ptype, pid, weekly_fw_cols, _tick, whatif=whatif, grain='week')
+        (_upper_wk, fw_wk, *_rest) = weekly
+        fw_week_df = pd.DataFrame(fw_wk or [])
+        if isinstance(fw_week_df, pd.DataFrame) and not fw_week_df.empty and "metric" in fw_week_df.columns:
+            fw_metrics = fw_week_df["metric"].astype(str).tolist()
     except Exception:
         pass
 
@@ -196,8 +195,18 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     for d in day_ids:
         fw_d[d] = 0.0
 
-    # Upper daily table skeleton
-    upper = pd.DataFrame({"metric": UPPER_ROWS})
+    # Upper daily table skeleton; shape to weekly upper spec where available
+    upper_rows = UPPER_ROWS.copy()
+    try:
+        weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
+        weekly = _fill_tables_fixed(ptype, pid, weekly_fw_cols, _tick, whatif=whatif, grain='week')
+        (upper_wk, *_rest) = weekly
+        upper_df_w = pd.DataFrame(getattr(upper_wk, 'data', None) or [])
+        if isinstance(upper_df_w, pd.DataFrame) and not upper_df_w.empty and "metric" in upper_df_w.columns:
+            upper_rows = upper_df_w["metric"].astype(str).tolist()
+    except Exception:
+        pass
+    upper = pd.DataFrame({"metric": upper_rows})
     for d in day_ids:
         upper[d] = 0.0
 
