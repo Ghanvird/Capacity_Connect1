@@ -764,7 +764,15 @@ def register_plan_detail_core(app: dash.Dash):
                     _monday = pd.to_datetime(weeks[0]).date() if weeks else None
                 except Exception:
                     _monday = None
-                # Infer earliest available interval start (fallback 08:00) based on uploaded data
+                # Infer earliest/latest available interval slots (fallback 08:00) based on uploaded data
+                def _to_hm(x):
+                    try:
+                        t = pd.to_datetime(str(x), errors='coerce')
+                        if pd.isna(t):
+                            return None
+                        return t.strftime('%H:%M')
+                    except Exception:
+                        return None
                 def _earliest_slot_from_df(df: pd.DataFrame) -> str | None:
                     try:
                         if not isinstance(df, pd.DataFrame) or df.empty:
@@ -775,18 +783,31 @@ def register_plan_detail_core(app: dash.Dash):
                         if c_date:
                             d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
                             d = d[d[c_date].eq(_monday)]
-                        c_ivl = L.get("interval") or L.get("time")
+                        c_ivl = L.get("interval") or L.get("time") or L.get("interval_start") or L.get("start_time") or L.get("interval start") or L.get("start time")
                         if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
                             return None
-                        labs = d[c_ivl].astype(str).str.slice(0,5)
-                        labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
-                        if labs.empty:
+                        labs = d[c_ivl].astype(str).map(_to_hm).dropna()
+                        return None if labs.empty else str(min(labs))
+                    except Exception:
+                        return None
+                def _latest_slot_from_df(df: pd.DataFrame) -> str | None:
+                    try:
+                        if not isinstance(df, pd.DataFrame) or df.empty:
                             return None
-                        return labs.min()
+                        d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
+                        c_date = L.get("date") or L.get("day")
+                        if c_date:
+                            d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                            d = d[d[c_date].eq(_monday)]
+                        c_ivl = L.get("interval") or L.get("time") or L.get("interval_start") or L.get("start_time") or L.get("interval start") or L.get("start time")
+                        if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
+                            return None
+                        labs = d[c_ivl].astype(str).map(_to_hm).dropna()
+                        return None if labs.empty else str(max(labs))
                     except Exception:
                         return None
 
-                start_hhmm = None
+                start_hhmm = None; end_hhmm = None
                 try:
                     ch0 = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
                 except Exception:
@@ -798,20 +819,23 @@ def register_plan_detail_core(app: dash.Dash):
                         for kind in ("voice_forecast_volume", "voice_actual_volume"):
                             df = _lts(kind, sk)
                             start_hhmm = start_hhmm or _earliest_slot_from_df(df)
+                            end_hhmm   = end_hhmm   or _latest_slot_from_df(df)
                     elif ch0 == "chat":
                         for kind in ("chat_forecast_volume", "chat_actual_volume"):
                             df = _lts(kind, sk)
                             start_hhmm = start_hhmm or _earliest_slot_from_df(df)
+                            end_hhmm   = end_hhmm   or _latest_slot_from_df(df)
                     elif ch0 in ("outbound", "ob"):
                         for kind in ("ob_forecast_opc","outbound_forecast_opc","ob_forecast_dials","outbound_forecast_dials","ob_forecast_calls",
                                      "ob_actual_opc","outbound_actual_opc","ob_actual_dials","outbound_actual_dials","ob_actual_calls"):
                             df = _lts(kind, sk)
                             start_hhmm = start_hhmm or _earliest_slot_from_df(df)
+                            end_hhmm   = end_hhmm   or _latest_slot_from_df(df)
                 except Exception:
                     start_hhmm = None
                 if not start_hhmm:
                     start_hhmm = "08:00"
-                cols, ivl_ids = interval_cols_for_day(_monday, start_hhmm=start_hhmm)
+                cols, ivl_ids = interval_cols_for_day(_monday, start_hhmm=start_hhmm, end_hhmm=end_hhmm)
                 week_ids = ivl_ids
             else:
                 cols, week_ids = _week_cols(weeks)
