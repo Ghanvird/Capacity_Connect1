@@ -1,7 +1,7 @@
 from __future__ import annotations
 import datetime as dt
 import pandas as pd
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 
 def day_cols_for_weeks(weeks: List[str]) -> Tuple[List[dict], List[str]]:
@@ -36,19 +36,45 @@ def day_cols_for_weeks(weeks: List[str]) -> Tuple[List[dict], List[str]]:
     return cols, ids
 
 
-def interval_cols_for_day(day: dt.date | None = None, ivl_min: int = 30) -> Tuple[List[dict], List[str]]:
+def interval_cols_for_day(
+    day: dt.date | None = None,
+    ivl_min: int = 30,
+    start_hhmm: Optional[str] = None,
+    end_hhmm: Optional[str] = None,
+) -> Tuple[List[dict], List[str]]:
     """Return DataTable columns and interval ids (HH:MM) for a single day.
-    Intended as a compact interval view template.
+    - start_hhmm: optional start clock time (e.g., "08:00"). Defaults to 00:00.
+    - end_hhmm: optional end clock time (exclusive). Defaults to 24:00 of the same day.
     """
     if not isinstance(ivl_min, int) or ivl_min <= 0:
         ivl_min = 30
     if day is None:
         day = dt.date.today()
-    # Build HH:MM slots
+
+    def _parse_hhmm(s: Optional[str], default_h: int, default_m: int) -> dt.time:
+        if not s:
+            return dt.time(default_h, default_m)
+        try:
+            hh, mm = s.strip().split(":", 1)
+            h = max(0, min(23, int(hh)))
+            m = max(0, min(59, int(mm)))
+            return dt.time(h, m)
+        except Exception:
+            return dt.time(default_h, default_m)
+
+    start_t = _parse_hhmm(start_hhmm, 0, 0)
+    end_t   = _parse_hhmm(end_hhmm, 23, 59)
+
+    # Build HH:MM slots from start_t up to and including the last slot that starts before end-of-window+1min
     ids: List[str] = []
-    t = dt.datetime.combine(day, dt.time(0, 0))
-    end = t + dt.timedelta(days=1)
-    while t < end:
+    t = dt.datetime.combine(day, start_t)
+    last_start = dt.datetime.combine(day, end_t)
+    # If end < start, clamp to same-day end (23:59)
+    if last_start <= t:
+        last_start = dt.datetime.combine(day, dt.time(23, 59))
+    # Emit slots while the start time is within the window and a full interval fits before midnight
+    day_end = dt.datetime.combine(day, dt.time(23, 59))
+    while t <= last_start and (t + dt.timedelta(minutes=ivl_min)) <= (day_end + dt.timedelta(minutes=1)):
         ids.append(t.strftime("%H:%M"))
         t += dt.timedelta(minutes=ivl_min)
 
