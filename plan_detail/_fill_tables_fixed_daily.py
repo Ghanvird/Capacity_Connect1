@@ -168,10 +168,41 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         return {k: float(v) for k, v in g.to_dict().items()}
 
     mA = _req_map(req_daily_A); mF = _req_map(req_daily_F)
-    upper_d = pd.concat([
-        pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
-        pd.DataFrame(0.0, index=range(2), columns=day_ids)
-    ], axis=1)
+
+    # Build upper using weekly upper spec/values, then override FTE rows with daily values
+    upper_week_df = pd.DataFrame(getattr(upper_w, 'data', None) or [])
+    if not isinstance(upper_week_df, pd.DataFrame) or upper_week_df.empty:
+        # Fallback to just the two FTE rows if weekly upper is unavailable
+        upper_d = pd.concat([
+            pd.DataFrame({"metric": ["FTE Required @ Forecast Volume", "FTE Required @ Actual Volume"]}),
+            pd.DataFrame(0.0, index=range(2), columns=day_ids)
+        ], axis=1)
+    else:
+        weekly_ids = [c for c in upper_week_df.columns if c != 'metric']
+        # Map each day to its week's Monday and copy the weekly value
+        def _week_of_day(d):
+            try:
+                t = pd.to_datetime(d).date()
+                monday = (t - dt.timedelta(days=t.weekday())).isoformat()
+                return monday
+            except Exception:
+                return None
+        day_to_week = {d: _week_of_day(d) for d in day_ids}
+        # Initialize upper_d with all weekly metrics
+        upper_d = pd.DataFrame({"metric": upper_week_df["metric"].astype(str).tolist()})
+        for d in day_ids:
+            upper_d[d] = 0.0
+        for _, row in upper_week_df.iterrows():
+            name = str(row.get('metric',''))
+            for d in day_ids:
+                w = day_to_week.get(d)
+                if w and w in weekly_ids:
+                    try:
+                        v = float(pd.to_numeric(row.get(w), errors='coerce'))
+                    except Exception:
+                        v = 0.0
+                    upper_d.loc[upper_d["metric"].eq(name), d] = v
+    # Override the two rows with daily requirements (erlang/TAT used inside required_fte_daily per channel)
     if mF:
         for k, v in mF.items():
             if k in upper_d.columns:
