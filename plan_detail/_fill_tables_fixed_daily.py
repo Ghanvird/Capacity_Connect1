@@ -7,16 +7,194 @@ import datetime as dt
 from typing import List, Tuple
 from dash import dash_table, html
 
+from common import _hc_lookup, _hhmm_to_minutes, _parse_date_series
 from plan_store import get_plan
 from cap_store import resolve_settings
 from capacity_core import required_fte_daily, voice_requirements_interval, min_agents, _ivl_minutes_from_str
 from ._common import _load_ts_with_fallback, _week_span, _scope_key, _assemble_voice, _assemble_bo, _assemble_ob, _assemble_chat
 from cap_db import load_df, save_df
 from cap_store import load_roster_long
-from common import summarize_shrinkage_bo, summarize_shrinkage_voice
 from ._calc import _fill_tables_fixed
 from ._grain_cols import day_cols_for_weeks
 
+def _bo_bucket(activity: str) -> str:
+    try:
+        if isinstance(activity, str):
+            s = activity
+        elif pd.isna(activity):
+            s = ""
+        else:
+            s = str(activity)
+    except Exception:
+        s = ""
+    s = s.strip().lower()
+    # flexible matching
+    if "divert" in s: return "diverted"
+    if "down" in s or s == "downtime": return "downtime"
+    if "staff complement" in s or s == "staff complement": return "staff_complement"
+    if "flex" in s or s == "flexitime": return "flextime"
+    if "lend" in s or s == "lend staff": return "lend_staff"
+    if "borrow" in s or s == "borrowed staff": return "borrowed_staff"
+    if "overtime" in s or s=="ot" or s == "overtime": return "overtime"
+    if "core time" in s or s=="core": return "core_time"
+    if "time worked" in s: return "time_worked"
+    if "work out" in s or "workout" in s: return "work_out"
+    return "other"
+
+
+def summarize_shrinkage_bo(dff: pd.DataFrame) -> pd.DataFrame:
+    """Daily BO summary in hours with buckets needed for new shrinkage formula.
+    Buckets come from `_bo_bucket` applied to the free-text `activity` field.
+    Returns per-day rows including:
+      - "OOO Hours"      := Downtime
+      - "In Office Hours": Diverted Time
+      - "Base Hours"     := Staff Complement
+      - "TTW Hours"      := Staff Complement - Downtime + Flexi + Overtime + Borrowed - Lend
+    """
+    if dff is None or dff.empty:
+        return pd.DataFrame()
+    d = dff.copy()
+    d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
+
+    # Derive explicit buckets (robust if 'activity' column is missing)
+    if "activity" in d.columns:
+        d["bucket"] = d["activity"].map(_bo_bucket)
+    else:
+        # default to 'other' bucket to avoid crashes; upstream should normalize first
+        d["bucket"] = pd.Series([_bo_bucket("")]*len(d), index=d.index)
+
+    keys = ["date", "journey", "sub_business_area", "channel"]
+    if "country" in d.columns:
+        keys.append("country")
+    if "site" in d.columns:
+        keys.append("site")
+
+    # Use hour granularity directly if present
+    if "time_hours" in d.columns:
+        val_col = "time_hours"
+        factor = 1.0
+    else:
+        val_col = "duration_seconds"
+        factor = 1.0 / 3600.0
+
+    agg = (
+        d.groupby(keys + ["bucket"], dropna=False)[val_col]
+         .sum()
+         .reset_index()
+    )
+    pivot = agg.pivot_table(index=keys, columns="bucket", values=val_col, fill_value=0.0).reset_index()
+
+    def _col(frame: pd.DataFrame, names: list[str]) -> pd.Series:
+        for nm in names:
+            if nm in frame.columns:
+                return frame[nm]
+        return pd.Series(0.0, index=frame.index)
+
+    sc  = _col(pivot, ["staff_complement"]) * factor
+    dwn = _col(pivot, ["downtime"]) * factor
+    flx = _col(pivot, ["flextime"]) * factor
+    ot  = _col(pivot, ["overtime"]) * factor
+    bor = _col(pivot, ["borrowed_staff", "borrowed"]) * factor
+    lnd = _col(pivot, ["lend_staff", "lend"]) * factor
+    div = _col(pivot, ["diverted"]) * factor
+
+    ttw = sc - dwn + flx + ot + bor - lnd
+
+    pivot["OOO Hours"] = dwn
+    pivot["In Office Hours"] = div
+    pivot["Base Hours"] = sc
+    pivot["TTW Hours"] = ttw
+
+    pivot = pivot.rename(columns={
+        "journey": "Business Area",
+        "sub_business_area": "Sub Business Area",
+        "channel": "Channel",
+        "country": "Country",
+        "site": "Site",
+    })
+
+    keep_keys = [c for c in ["date", "Business Area", "Sub Business Area", "Channel", "Country", "Site"] if c in pivot.columns]
+    keep = keep_keys + ["OOO Hours", "In Office Hours", "Base Hours", "TTW Hours"]
+    return pivot[keep].sort_values(keep_keys)
+
+def normalize_shrinkage_voice(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty: return pd.DataFrame()
+    L = {c.lower(): c for c in df.columns}
+    def pick(*names):
+        for n in names:
+            if n.lower() in L: return L[n.lower()]
+        return None
+    col_date = pick("Date")
+    col_state = pick("Superstate")
+    col_hours = pick("Hours")
+    col_brid  = pick("BRID","AgentID(BRID)","Employee Id","EmployeeID")
+    if not (col_date and col_state and col_hours and col_brid):
+        return pd.DataFrame()
+
+    dff = df.copy()
+    dff.rename(columns={col_date:"date", col_state:"superstate", col_hours:"hours_raw", col_brid:"brid"}, inplace=True)
+    dff["date"] = _parse_date_series(dff["date"])  # robust date parsing
+    dff["brid"] = dff["brid"].astype(str).str.strip()
+    # convert HH:MM -> minutes, then to hours (as per spec they divide by 60)
+    mins = dff["hours_raw"].map(_hhmm_to_minutes).fillna(0.0)
+    dff["hours"] = mins/60.0
+
+    # enrich from headcount
+    hc = _hc_lookup()
+    dff["TL Name"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("lm_name"))
+    dff["Site"]    = dff["brid"].map(lambda x: (hc.get(x) or {}).get("site"))
+    dff["City"]    = dff["brid"].map(lambda x: (hc.get(x) or {}).get("city"))
+    dff["Country"] = dff["brid"].map(lambda x: (hc.get(x) or {}).get("country"))
+    dff["Business Area"] = dff.get("Business Area", pd.Series(index=dff.index)).fillna(dff["brid"].map(lambda x: (hc.get(x) or {}).get("journey")))
+    dff["Sub Business Area"] = dff.get("Sub Business Area", pd.Series(index=dff.index)).fillna(dff["brid"].map(lambda x: (hc.get(x) or {}).get("level_3")))
+    if "Channel" not in dff.columns:
+        dff["Channel"] = "Voice"
+
+    # defaults so the pivot in summarize_shrinkage_voice never drops rows
+    for col, default in [("Business Area", "All"), ("Sub Business Area", "All"), ("Country", "All")]:
+        if col not in dff.columns:
+            dff[col] = default
+        else:
+            dff[col] = dff[col].replace("", np.nan).fillna(default)
+    dff["Channel"] = dff["Channel"].replace("", np.nan).fillna("Voice")
+    return dff
+
+def summarize_shrinkage_voice(dff: pd.DataFrame) -> pd.DataFrame:
+    if dff is None or dff.empty:
+        return pd.DataFrame()
+    d = dff.copy()
+
+    keys = ["date", "Business Area", "Sub Business Area", "Channel"]
+    if "Country" in d.columns and d["Country"].notna().any():
+        keys.append("Country")
+
+    piv = d.pivot_table(index=keys, columns="superstate", values="hours", aggfunc="sum", fill_value=0.0).reset_index()
+
+    def _series(name: str) -> pd.Series:
+        return piv[name] if name in piv.columns else pd.Series(0.0, index=piv.index)
+
+    ooo_codes = [
+        "SC_ABSENCE_TOTAL",
+        "SC_A_Sick_Long_Term",
+        "SC_HOLIDAY",
+        "SC_VACATION",
+        "SC_LEAVE",
+        "SC_UNPAID",
+    ]
+    ino_codes = [
+        "SC_TRAINING_TOTAL",
+        "SC_BREAKS",
+        "SC_SYSTEM_EXCEPTION",
+        "SC_MEETING",
+        "SC_COACHING",
+    ]
+
+    piv["OOO Hours"] = sum((_series(code) for code in ooo_codes))
+    piv["In Office Hours"] = sum((_series(code) for code in ino_codes))
+    piv["Base Hours"] = _series("SC_INCLUDED_TIME")
+
+    keep = keys + ["OOO Hours", "In Office Hours", "Base Hours"]
+    return piv[keep].sort_values(keys)
 
 def _broadcast_weekly_to_daily(df: pd.DataFrame, day_ids: List[str]) -> pd.DataFrame:
     """Convert a weekly-matrix DataFrame (metric + week_id cols) to a daily-matrix
@@ -894,6 +1072,11 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         fw_d = _write_row(fw_d, "Actual Volume", volA)
         fw_d = _write_row(fw_d, "Forecast AHT/SUT", ahtF)
         fw_d = _write_row(fw_d, "Actual AHT/SUT", ahtA)
+        # Fallback for plans with a single AHT/SUT row
+        mvals = fw_d["metric"].astype(str)
+        if "AHT/SUT" in mvals.values and not any(x in mvals.values for x in ["Forecast AHT/SUT","Actual AHT/SUT"]):
+            use_map = ahtF or ahtA or {}
+            fw_d = _write_row(fw_d, "AHT/SUT", use_map)
     # Back Office
     elif ch_key in ("back office", "bo"):
         bF = _assemble_bo(sk, "forecast"); bA = _assemble_bo(sk, "actual"); bT = _assemble_bo(sk, "tactical")
@@ -908,6 +1091,10 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         fw_d = _write_row(fw_d, "Actual Volume", volA)
         fw_d = _write_row(fw_d, "Forecast AHT/SUT", ahtF)
         fw_d = _write_row(fw_d, "Actual AHT/SUT", ahtA)
+        mvals = fw_d["metric"].astype(str)
+        if "AHT/SUT" in mvals.values and not any(x in mvals.values for x in ["Forecast AHT/SUT","Actual AHT/SUT"]):
+            use_map = ahtF or ahtA or {}
+            fw_d = _write_row(fw_d, "AHT/SUT", use_map)
     # Chat
     elif ch_key == "chat":
         cF = _assemble_chat(sk, "forecast"); cA = _assemble_chat(sk, "actual"); cT = _assemble_chat(sk, "tactical")
@@ -922,6 +1109,10 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         fw_d = _write_row(fw_d, "Actual Volume", volA)
         fw_d = _write_row(fw_d, "Forecast AHT/SUT", ahtF)
         fw_d = _write_row(fw_d, "Actual AHT/SUT", ahtA)
+        mvals = fw_d["metric"].astype(str)
+        if "AHT/SUT" in mvals.values and not any(x in mvals.values for x in ["Forecast AHT/SUT","Actual AHT/SUT"]):
+            use_map = ahtF or ahtA or {}
+            fw_d = _write_row(fw_d, "AHT/SUT", use_map)
     # Outbound
     elif ch_key in ("outbound", "ob"):
         oF = _assemble_ob(sk, "forecast"); oA = _assemble_ob(sk, "actual"); oT = _assemble_ob(sk, "tactical")
@@ -934,6 +1125,10 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         fw_d = _write_row(fw_d, "Actual Volume", volA)
         fw_d = _write_row(fw_d, "Forecast AHT/SUT", ahtF)
         fw_d = _write_row(fw_d, "Actual AHT/SUT", ahtA)
+        mvals = fw_d["metric"].astype(str)
+        if "AHT/SUT" in mvals.values and not any(x in mvals.values for x in ["Forecast AHT/SUT","Actual AHT/SUT"]):
+            use_map = ahtF or ahtA or {}
+            fw_d = _write_row(fw_d, "AHT/SUT", use_map)
 
 
     return (
