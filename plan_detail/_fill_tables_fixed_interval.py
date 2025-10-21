@@ -2,7 +2,7 @@ from __future__ import annotations
 import pandas as pd
 import numpy as np
 import datetime as dt
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 from dash import dash_table
 
 from plan_store import get_plan
@@ -90,7 +90,7 @@ def _make_upper_table(upper_ivl: pd.DataFrame, ivl_cols: List[dict]):
     )
 
 
-def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None, ivl_min: int = 30):
+def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None, ivl_min: int = 30, sel_date: Optional[str] = None):
     """Interval view (representative day):
     1) Reuse weekly engine then daily reshape
     2) Split first-day values across HH:MM intervals uniformly (percent-like rows replicated)
@@ -107,9 +107,15 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         roster_rec, bulk_files_rec, notes_rec,
     ) = weekly
 
-    # Weekly -> daily (single representative day = first week Monday)
-    monday = pd.to_datetime(weeks[0]).date() if weeks else dt.date.today()
-    rep_day = monday.isoformat()
+    # Weekly -> daily (representative day = selected date or first week Monday)
+    if sel_date:
+        try:
+            ref_day = pd.to_datetime(sel_date).date()
+        except Exception:
+            ref_day = pd.to_datetime(weeks[0]).date() if weeks else dt.date.today()
+    else:
+        ref_day = pd.to_datetime(weeks[0]).date() if weeks else dt.date.today()
+    rep_day = ref_day.isoformat()
     # Build simple daily frames by copying weekly Monday values
     def weekly_col_to_day(recs):
         df = pd.DataFrame(recs or [])
@@ -155,7 +161,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
             c_date = L.get("date") or L.get("day")
             if c_date:
                 d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
-                d = d[d[c_date].eq(monday)]
+                d = d[d[c_date].eq(ref_day)]
             # Require an interval-like column
             c_ivl = L.get("interval") or L.get("time")
             if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
@@ -206,7 +212,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     start_hhmm = _infer_start_hhmm(p)
 
     # Daily -> intervals using inferred start
-    ivl_cols, ivl_ids = interval_cols_for_day(monday, ivl_min=ivl_min, start_hhmm=start_hhmm)
+    ivl_cols, ivl_ids = interval_cols_for_day(ref_day, ivl_min=ivl_min, start_hhmm=start_hhmm)
     # For interval-level FW table, do NOT distribute day values uniformly.
     # Initialize a blank interval matrix and later populate from uploaded interval series only.
     fw_i   = pd.DataFrame({"metric": fw_d.get("metric", pd.Series(dtype="object")).astype(str) if isinstance(fw_d, pd.DataFrame) else pd.Series([], dtype="object")})
@@ -234,7 +240,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 try:
                     iv = voice_requirements_interval(df, settings)
                     iv = iv.copy(); iv["date"] = pd.to_datetime(iv["date"], errors="coerce").dt.date
-                    iv = iv[iv["date"].eq(monday)]
+                    iv = iv[iv["date"].eq(ref_day)]
                     lab = iv.get("interval")
                     if lab is None: return {}
                     s = lab.astype(str).str.slice(0,5)
@@ -259,7 +265,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 if not isinstance(df, pd.DataFrame) or df.empty:
                     return
                 d = df.copy(); d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.date
-                d = d[d["date"].eq(monday)]
+                d = d[d["date"].eq(ref_day)]
                 if "interval" not in d.columns:
                     return
                 labs = d["interval"].astype(str).str.slice(0,5)
@@ -310,13 +316,13 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                     df["date"] = pd.to_datetime(df[c_date] if c_date else df.get("date"), errors="coerce").dt.date
                     df["items"] = pd.to_numeric(df[c_itm] if c_itm else df.get("items"), errors="coerce").fillna(0.0)
                     df = df.dropna(subset=["date"]).copy()
-                    df = df[df["date"].eq(monday)]
+                    df = df[df["date"].eq(ref_day)]
                     # If no interval column, distribute uniformly across coverage window
                     if not c_ivl or c_ivl not in df.columns or df[c_ivl].isna().all():
                         coverage_min = float(s.get("chat_coverage_minutes", s.get("hours_per_fte", 8.0) * 60.0) or 480.0)
                         ivm = int(float(s.get("chat_interval_minutes", s.get("interval_minutes", 30)) or 30))
                         n = max(1, int(round(coverage_min / ivm)))
-                        slot_labels = interval_cols_for_day(monday, ivm, start_hhmm=start_hhmm)[1]
+                        slot_labels = interval_cols_for_day(ref_day, ivm, start_hhmm=start_hhmm)[1]
                         total = float(df["items"].sum())
                         per = total / float(n)
                         # compute agents per slot using concurrency and chat SL/occ caps
@@ -367,7 +373,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 if not isinstance(vol_df, pd.DataFrame) or vol_df.empty:
                     return
                 d = vol_df.copy(); d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
-                d = d[d["date"].eq(monday)]
+                d = d[d["date"].eq(ref_day)]
                 if "interval" not in d.columns:
                     return
                 labs = d["interval"].astype(str).str.slice(0,5)
@@ -380,7 +386,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                             fw_i.loc[m == row_name_vol, slot] = float(mapping_vol[slot])
                 if isinstance(aht_df, pd.DataFrame) and not aht_df.empty:
                     ah = aht_df.copy(); ah["date"] = pd.to_datetime(ah.get("date"), errors="coerce").dt.date
-                    ah = ah[ah["date"].eq(monday)]
+                    ah = ah[ah["date"].eq(ref_day)]
                     if "interval" in ah.columns:
                         labs2 = ah["interval"].astype(str).str.slice(0,5)
                         ahts  = pd.to_numeric(ah.filter(regex="aht", axis=1).iloc[:, -1], errors="coerce").fillna(0.0).tolist()
@@ -453,7 +459,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 out["rpc"] = out.get("rpc", 0.0)
                 out["aht"] = pd.to_numeric(out.get("aht"), errors="coerce").fillna(float(s.get("ob_aht_sec", s.get("target_aht", 240)) or 240.0))
                 # limit to representative day
-                out = out.dropna(subset=["date"]).copy(); out = out[out["date"].eq(monday)]
+                out = out.dropna(subset=["date"]).copy(); out = out[out["date"].eq(ref_day)]
                 return out
 
             F = _expected(volF, connF, rpcF, rpcrF, ahtF)
@@ -504,7 +510,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 ivm = int(float(s.get("ob_interval_minutes", s.get("interval_minutes", 30)) or 30))
                 coverage_min = float(s.get("ob_coverage_minutes", s.get("hours_per_fte", 8.0) * 60.0) or 480.0)
                 n = max(1, int(round(coverage_min / ivm)))
-                labs = interval_cols_for_day(monday, ivm, start_hhmm=start_hhmm)[1]
+                labs = interval_cols_for_day(ref_day, ivm, start_hhmm=start_hhmm)[1]
                 total_calls = float(df.apply(_calls, axis=1).sum())
                 per = total_calls / float(n)
                 target_sl = float(s.get("ob_target_sl", s.get("target_sl", 0.8)) or 0.8)
@@ -536,7 +542,7 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                 if not isinstance(df, pd.DataFrame) or df.empty:
                     return
                 d = df.copy(); d["date"] = pd.to_datetime(d.get("date"), errors="coerce").dt.date
-                d = d[d["date"].eq(monday)]
+                d = d[d["date"].eq(ref_day)]
                 if "interval" in d.columns and d["interval"].notna().any():
                     labs = d["interval"].astype(str).str.slice(0,5)
                     vol = pd.to_numeric(d.get("opc") if "opc" in d.columns else d.get("calls"), errors="coerce").fillna(0.0).tolist()
