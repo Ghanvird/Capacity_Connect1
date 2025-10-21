@@ -34,6 +34,35 @@ def _pick_ivl_col(df: pd.DataFrame) -> Optional[str]:
     return None
 
 
+def _parse_time_any(s: str) -> Optional[dt.time]:
+    try:
+        if s is None:
+            return None
+        t = str(s).strip()
+        if not t:
+            return None
+        # Try common 12h and 24h formats
+        for fmt in ("%I:%M:%S %p", "%I:%M %p", "%H:%M:%S", "%H:%M"):
+            try:
+                return dt.datetime.strptime(t, fmt).time()
+            except Exception:
+                pass
+        # Fallback: pandas parser
+        ts = pd.to_datetime(t, errors="coerce")
+        if pd.isna(ts):
+            return None
+        return ts.time()
+    except Exception:
+        return None
+
+
+def _fmt_hhmm(t: dt.time) -> str:
+    try:
+        return f"{t.hour:02d}:{t.minute:02d}"
+    except Exception:
+        return "00:00"
+
+
 def _slot_series_for_day(df: pd.DataFrame, day: dt.date, val_col: str) -> Dict[str, float]:
     if not isinstance(df, pd.DataFrame) or df.empty or val_col not in df.columns:
         return {}
@@ -48,69 +77,23 @@ def _slot_series_for_day(df: pd.DataFrame, day: dt.date, val_col: str) -> Dict[s
         d = d[d[c_date].eq(day)]
     if d.empty:
         return {}
-    labs = pd.to_datetime(d[c_ivl], errors="coerce").dt.strftime("%H:%M")
+    labs_raw = d[c_ivl].astype(str)
+    labs = labs_raw.map(lambda x: _fmt_hhmm(_parse_time_any(x)) if _parse_time_any(x) else None)
     vals = pd.to_numeric(d.get(val_col), errors="coerce").fillna(0.0)
-    g = pd.DataFrame({"lab": labs, "val": vals}).groupby("lab", as_index=True)["val"].sum()
+    tmp = pd.DataFrame({"lab": labs, "val": vals}).dropna(subset=["lab"]).copy()
+    if tmp.empty:
+        return {}
+    g = tmp.groupby("lab", as_index=True)["val"].sum()
     return {str(k): float(v) for k, v in g.to_dict().items()}
 
 
-# def _infer_start_hhmm(plan: dict, day: dt.date, ch: str, sk: str) -> str:
-#     def _earliest_from(df: pd.DataFrame) -> Optional[str]:
-#         try:
-#             if not isinstance(df, pd.DataFrame) or df.empty:
-#                 return None
-#             d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
-#             c_date = L.get("date") or L.get("day"); ivc = _pick_ivl_col(d)
-#             if not ivc:
-#                 return None
-#             if c_date:
-#                 d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
-#                 d = d[d[c_date].eq(day)]
-#             if d.empty:
-#                 return None
-#             labs = d[ivc].astype(str).str.slice(0, 5)
-#             labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
-#             return None if labs.empty else str(labs.min())
-#         except Exception:
-#             return None
-
-#     start = None
-#     try:
-#         if ch == "voice":
-#             for df in (_assemble_voice(sk, "forecast"), _assemble_voice(sk, "actual")):
-#                 start = start or _earliest_from(df)
-#         elif ch == "chat":
-#             for key in ("chat_forecast_volume", "chat_actual_volume"):
-#                 df = _load_ts_with_fallback(key, sk)
-#                 start = start or _earliest_from(df)
-#         elif ch in ("outbound", "ob"):
-#             for key in (
-#                 "ob_forecast_opc","outbound_forecast_opc","ob_actual_opc","outbound_actual_opc",
-#                 "ob_forecast_dials","outbound_forecast_dials","ob_actual_dials","outbound_actual_dials",
-#                 "ob_forecast_calls","outbound_forecast_calls","ob_actual_calls","outbound_actual_calls",
-#             ):
-#                 df = _load_ts_with_fallback(key, sk)
-#                 start = start or _earliest_from(df)
-#     except Exception:
-#         start = None
-#     return start or "08:00"
-
-def _infer_start_end_hhmm(plan: dict, day: dt.date, ch: str, sk: str) -> Tuple[str, str]:
-    """
-    Infer the earliest and latest hh:mm interval for a given day/channel/skill.
-
-    Returns:
-        (start, end) as strings in "HH:MM" format.
-        Defaults to ("08:00", "23:30") if no data is found.
-    """
-    def _bounds_from(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
+def _infer_window(plan: dict, day: dt.date, ch: str, sk: str) -> Tuple[str, Optional[str]]:
+    def _window_from(df: pd.DataFrame) -> Tuple[Optional[str], Optional[str]]:
         try:
             if not isinstance(df, pd.DataFrame) or df.empty:
                 return None, None
-            d = df.copy()
-            L = {str(c).strip().lower(): c for c in d.columns}
-            c_date = L.get("date") or L.get("day")
-            ivc = _pick_ivl_col(d)
+            d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
+            c_date = L.get("date") or L.get("day"); ivc = _pick_ivl_col(d)
             if not ivc:
                 return None, None
             if c_date:
@@ -118,27 +101,26 @@ def _infer_start_end_hhmm(plan: dict, day: dt.date, ch: str, sk: str) -> Tuple[s
                 d = d[d[c_date].eq(day)]
             if d.empty:
                 return None, None
-            labs = d[ivc].astype(str).str.slice(0, 5)
-            labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
-            if labs.empty:
+            times = d[ivc].astype(str).map(_parse_time_any).dropna()
+            if times.empty:
                 return None, None
-            return str(labs.min()), str(labs.max())
+            tmin = min(times)
+            tmax = max(times)
+            return _fmt_hhmm(tmin), _fmt_hhmm(tmax)
         except Exception:
             return None, None
 
-    start, end = None, None
+    start = None; end = None
     try:
         if ch == "voice":
             for df in (_assemble_voice(sk, "forecast"), _assemble_voice(sk, "actual")):
-                s, e = _bounds_from(df)
-                start = start or s
-                end = end or e
+                s, e = _window_from(df)
+                start = start or s; end = end or e
         elif ch == "chat":
             for key in ("chat_forecast_volume", "chat_actual_volume"):
                 df = _load_ts_with_fallback(key, sk)
-                s, e = _bounds_from(df)
-                start = start or s
-                end = end or e
+                s, e = _window_from(df)
+                start = start or s; end = end or e
         elif ch in ("outbound", "ob"):
             for key in (
                 "ob_forecast_opc","outbound_forecast_opc","ob_actual_opc","outbound_actual_opc",
@@ -146,13 +128,12 @@ def _infer_start_end_hhmm(plan: dict, day: dt.date, ch: str, sk: str) -> Tuple[s
                 "ob_forecast_calls","outbound_forecast_calls","ob_actual_calls","outbound_actual_calls",
             ):
                 df = _load_ts_with_fallback(key, sk)
-                s, e = _bounds_from(df)
-                start = start or s
-                end = end or e
+                s, e = _window_from(df)
+                start = start or s; end = end or e
     except Exception:
         start, end = None, None
+    return (start or "08:00"), end
 
-    return (start or "08:00", end or "23:30")
 
 def _staff_by_slot_for_day(plan: dict, day: dt.date, ivl_ids: List[str], start_hhmm: str, ivl_min: int) -> Dict[str, float]:
     try:
@@ -290,8 +271,8 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     sk = _scope_key(plan.get("vertical"), plan.get("sub_ba"), ch)
     settings = resolve_settings(ba=plan.get("vertical"), subba=plan.get("sub_ba"), lob=ch)
 
-    start_hhmm = _infer_start_end_hhmm(plan, ref_day, ch, sk)
-    ivl_cols, ivl_ids = interval_cols_for_day(ref_day, ivl_min=ivl_min, start_hhmm=start_hhmm)
+    start_hhmm, end_hhmm = _infer_window(plan, ref_day, ch, sk)
+    ivl_cols, ivl_ids = interval_cols_for_day(ref_day, ivl_min=ivl_min, start_hhmm=start_hhmm, end_hhmm=end_hhmm)
 
     # FW metrics
     # Shape FW rows to match weekly view spec (fields/ordering), falling back to defaults
@@ -345,16 +326,16 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         volA = _slot_series_for_day(vA if isinstance(vA, pd.DataFrame) and not vA.empty else vF, ref_day, "volume")
         ahtF = _slot_series_for_day(vF, ref_day, "aht_sec")
         ahtA = _slot_series_for_day(vA, ref_day, "aht_sec")
-        mser = fw_i["metric"].astype(str).str.lower()
+        mser = fw_i["metric"].astype(str)
         for lab in ivl_ids:
-            mask_f = mser.str.contains("forecast") & ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")
-            mask_a = (mser.str.contains("actual") & (mser.str.contains("volume") | ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")))
-            mask_fa = mser.str.contains("forecast") & mser.str.contains("aht|sut")
-            mask_aa = mser.str.contains("actual") & mser.str.contains("aht|sut")
-            if lab in volF: fw_i.loc[mask_f, lab] = float(volF[lab])
-            if lab in volA: fw_i.loc[mask_a, lab] = float(volA[lab])
-            if lab in ahtF: fw_i.loc[mask_fa, lab] = float(ahtF[lab])
-            if lab in ahtA: fw_i.loc[mask_aa, lab] = float(ahtA[lab])
+            if lab in volF and "Forecast" in mser.values:
+                fw_i.loc[mser == "Forecast", lab] = float(volF[lab])
+            if lab in volA and "Actual Volume" in mser.values:
+                fw_i.loc[mser == "Actual Volume", lab] = float(volA[lab])
+            if lab in ahtF and "Forecast AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(ahtF[lab])
+            if lab in ahtA and "Actual AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Actual AHT/SUT", lab] = float(ahtA[lab])
         # Staffing and Erlang rollups
         staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
         occ_cap = float(settings.get("occupancy_cap_voice", 0.85) or 0.85)
@@ -398,14 +379,14 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         volF_map = _slot_series_for_day(volF, ref_day, "items") or _slot_series_for_day(volF, ref_day, "volume")
         volA_map = _slot_series_for_day(volA if isinstance(volA, pd.DataFrame) and not volA.empty else volF, ref_day, "items")
         aht_map  = _slot_series_for_day(ahtF, ref_day, "aht_sec") or _slot_series_for_day(ahtF, ref_day, "aht")
-        mser = fw_i["metric"].astype(str).str.lower()
+        mser = fw_i["metric"].astype(str)
         for lab in ivl_ids:
-            mask_f = mser.str.contains("forecast") & ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")
-            mask_a = (mser.str.contains("actual") & (mser.str.contains("volume") | ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")))
-            mask_fa = mser.str.contains("forecast") & mser.str.contains("aht|sut")
-            if lab in volF_map: fw_i.loc[mask_f, lab] = float(volF_map[lab])
-            if lab in volA_map: fw_i.loc[mask_a, lab] = float(volA_map[lab])
-            if lab in aht_map: fw_i.loc[mask_fa, lab] = float(aht_map[lab])
+            if lab in volF_map and "Forecast" in mser.values:
+                fw_i.loc[mser == "Forecast", lab] = float(volF_map[lab])
+            if lab in volA_map and "Actual Volume" in mser.values:
+                fw_i.loc[mser == "Actual Volume", lab] = float(volA_map[lab])
+            if lab in aht_map and "Forecast AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(aht_map[lab])
         staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
         ivl_sec = max(60, int(ivl_min) * 60)
         T_sec = float(settings.get("chat_sl_seconds", settings.get("sl_seconds", 20)) or 20.0)
@@ -453,14 +434,14 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
         volF = _slot_series_for_day(vF, ref_day, "opc") or _slot_series_for_day(vF, ref_day, "dials") or _slot_series_for_day(vF, ref_day, "calls") or _slot_series_for_day(vF, ref_day, "volume")
         volA = _slot_series_for_day(vA, ref_day, "opc") or _slot_series_for_day(vA, ref_day, "dials") or _slot_series_for_day(vA, ref_day, "calls") or _slot_series_for_day(vA, ref_day, "volume")
         aht_map = _slot_series_for_day(aF, ref_day, "aht_sec") or _slot_series_for_day(aF, ref_day, "aht")
-        mser = fw_i["metric"].astype(str).str.lower()
+        mser = fw_i["metric"].astype(str)
         for lab in ivl_ids:
-            mask_f = mser.str.contains("forecast") & ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")
-            mask_a = (mser.str.contains("actual") & (mser.str.contains("volume") | ~mser.str.contains("aht|sut|occupancy|overtime|backlog|queue")))
-            mask_fa = mser.str.contains("forecast") & mser.str.contains("aht|sut")
-            if lab in volF: fw_i.loc[mask_f, lab] = float(volF[lab])
-            if lab in volA: fw_i.loc[mask_a, lab] = float(volA[lab])
-            if lab in aht_map: fw_i.loc[mask_fa, lab] = float(aht_map[lab])
+            if lab in volF and "Forecast" in mser.values:
+                fw_i.loc[mser == "Forecast", lab] = float(volF[lab])
+            if lab in volA and "Actual Volume" in mser.values:
+                fw_i.loc[mser == "Actual Volume", lab] = float(volA[lab])
+            if lab in aht_map and "Forecast AHT/SUT" in mser.values:
+                fw_i.loc[mser == "Forecast AHT/SUT", lab] = float(aht_map[lab])
         staff = _staff_by_slot_for_day(plan, ref_day, ivl_ids, start_hhmm, ivl_min)
         ivl_sec = max(60, int(ivl_min) * 60)
         T_sec = float(settings.get("ob_sl_seconds", settings.get("sl_seconds", 20)) or 20.0)
