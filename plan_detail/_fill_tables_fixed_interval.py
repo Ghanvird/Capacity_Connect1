@@ -132,6 +132,52 @@ def _infer_window(plan: dict, day: dt.date, ch: str, sk: str) -> Tuple[str, Opti
                 start = start or s; end = end or e
     except Exception:
         start, end = None, None
+    # Fallback: roster window
+    if not start or not end:
+        try:
+            rl = load_roster_long()
+        except Exception:
+            rl = pd.DataFrame()
+        if isinstance(rl, pd.DataFrame) and not rl.empty:
+            df = rl.copy()
+            def _col(opts):
+                for c in opts:
+                    if c in df.columns:
+                        return c
+                return None
+            c_ba  = _col(["Business Area","business area","vertical"]) 
+            c_sba = _col(["Sub Business Area","sub business area","sub_ba"]) 
+            c_lob = _col(["LOB","lob","Channel","channel"]) 
+            c_site= _col(["Site","site","Location","location","Country","country"]) 
+            BA  = plan.get("vertical"); SBA = plan.get("sub_ba"); LOB = (plan.get("channel") or plan.get("lob") or "").split(",")[0].strip()
+            SITE= (plan.get("site") or plan.get("location") or plan.get("country") or "").strip()
+            def _match(series, val):
+                if not val or not isinstance(series, pd.Series):
+                    return pd.Series(True, index=series.index)
+                s = series.astype(str).str.strip().str.lower()
+                return s.eq(str(val).strip().lower())
+            msk = pd.Series(True, index=df.index)
+            if c_ba:  msk &= _match(df[c_ba], BA)
+            if c_sba and (SBA not in (None, "")): msk &= _match(df[c_sba], SBA)
+            if c_lob: msk &= _match(df[c_lob], LOB)
+            if c_site and (SITE not in (None, "")): msk &= _match(df[c_site], SITE)
+            df = df[msk]
+            if "date" in df.columns:
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+                df = df[df["date"].eq(day)]
+            times: List[dt.time] = []
+            if "entry" in df.columns:
+                for s in df["entry"].astype(str):
+                    m = re.match(r"^(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)\s*-\s*(\d{1,2}:\d{2}(?::\d{2})?\s*(?:AM|PM|am|pm)?)$", s)
+                    if not m:
+                        continue
+                    t1 = _parse_time_any(m.group(1)); t2 = _parse_time_any(m.group(2))
+                    if t1: times.append(t1)
+                    if t2: times.append(t2)
+            if times:
+                tmin = min(times); tmax = max(times)
+                if not start: start = _fmt_hhmm(tmin)
+                if not end:   end   = _fmt_hhmm(tmax)
     return (start or "08:00"), end
 
 
