@@ -2622,7 +2622,7 @@ def register_plan_detail_core(app: dash.Dash):
                 except Exception:
                     continue
                 for i in range(7):
-                    d = (base + pd.Timedelta(days=i)).date().isoformat()
+                    d = (base + dt.timedelta(days=i)).isoformat()
                     dates.append(d)
             # Deduplicate preserve order
             seen = set(); ordered = []
@@ -2643,6 +2643,89 @@ def register_plan_detail_core(app: dash.Dash):
             if g == 'interval':
                 return {"display": "inline-flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}
             return {"display": "none"}
+
+        # When interval date changes, update lower grid columns' headers to reflect the selected date
+        @app.callback(
+            Output("tbl-fw", "columns", allow_duplicate=True),
+            Output("tbl-hc", "columns", allow_duplicate=True),
+            Output("tbl-attr", "columns", allow_duplicate=True),
+            Output("tbl-shr", "columns", allow_duplicate=True),
+            Output("tbl-train", "columns", allow_duplicate=True),
+            Output("tbl-ratio", "columns", allow_duplicate=True),
+            Output("tbl-seat", "columns", allow_duplicate=True),
+            Output("tbl-bva", "columns", allow_duplicate=True),
+            Output("tbl-nh", "columns", allow_duplicate=True),
+            Input("interval-date", "value"),
+            State("plan-grain", "data"),
+            State("plan-detail-id", "data"),
+            prevent_initial_call=True,
+        )
+        def _update_interval_columns(sel_date, grain, pid):
+            g = str(grain or 'week').lower()
+            if g != 'interval' or not sel_date:
+                raise dash.exceptions.PreventUpdate
+            try:
+                day = pd.to_datetime(sel_date).date()
+            except Exception:
+                raise dash.exceptions.PreventUpdate
+            # infer coverage start like in interval init
+            try:
+                p = get_plan(pid) or {}
+            except Exception:
+                p = {}
+            from plan_detail._common import _scope_key, _load_ts_with_fallback
+            from plan_detail._common import _assemble_voice
+            def _pick_ivl_col(df: pd.DataFrame):
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    return None
+                L = {str(c).strip().lower(): c for c in df.columns}
+                for k in ("interval","time","interval_start","start_time","slot"):
+                    c = L.get(k)
+                    if c and c in df.columns:
+                        return c
+                return None
+            def _earliest_slot(df: pd.DataFrame) -> str | None:
+                try:
+                    if not isinstance(df, pd.DataFrame) or df.empty:
+                        return None
+                    d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
+                    c_date = L.get("date") or L.get("day")
+                    c_ivl  = _pick_ivl_col(d)
+                    if c_date:
+                        d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                        d = d[d[c_date].eq(day)]
+                    if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
+                        return None
+                    labs = d[c_ivl].astype(str).str.slice(0,5)
+                    labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
+                    return None if labs.empty else labs.min()
+                except Exception:
+                    return None
+            start_hhmm = None
+            try:
+                ch0 = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
+                sk  = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
+                if ch0 == "voice":
+                    vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual")
+                    for dfx in (vF, vA):
+                        start_hhmm = start_hhmm or _earliest_slot(dfx)
+                elif ch0 == "chat":
+                    for key in ("chat_forecast_volume","chat_actual_volume"):
+                        dfx = _load_ts_with_fallback(key, sk)
+                        start_hhmm = start_hhmm or _earliest_slot(dfx)
+                elif ch0 in ("outbound","ob"):
+                    for key in ("ob_forecast_opc","outbound_forecast_opc","ob_actual_opc","outbound_actual_opc",
+                                 "ob_forecast_dials","outbound_forecast_dials","ob_actual_dials","outbound_actual_dials",
+                                 "ob_forecast_calls","outbound_forecast_calls","ob_actual_calls","outbound_actual_calls"):
+                        dfx = _load_ts_with_fallback(key, sk)
+                        start_hhmm = start_hhmm or _earliest_slot(dfx)
+            except Exception:
+                start_hhmm = None
+            if not start_hhmm:
+                start_hhmm = "08:00"
+            from plan_detail._grain_cols import interval_cols_for_day
+            cols, _ = interval_cols_for_day(day, start_hhmm=start_hhmm)
+            return (cols,)*9
 
         @app.callback(
             Output("opt-created-by", "children", allow_duplicate=True),
