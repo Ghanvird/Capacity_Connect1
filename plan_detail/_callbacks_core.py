@@ -2679,11 +2679,19 @@ def register_plan_detail_core(app: dash.Dash):
                 if not isinstance(df, pd.DataFrame) or df.empty:
                     return None
                 L = {str(c).strip().lower(): c for c in df.columns}
-                for k in ("interval","time","interval_start","start_time","slot"):
+                for k in ("interval","time","interval_start","start_time","interval start","start time","slot"):
                     c = L.get(k)
                     if c and c in df.columns:
                         return c
                 return None
+            def _to_hm(x):
+                try:
+                    t = pd.to_datetime(str(x), errors='coerce')
+                    if pd.isna(t):
+                        return None
+                    return t.strftime('%H:%M')
+                except Exception:
+                    return None
             def _earliest_slot(df: pd.DataFrame) -> str | None:
                 try:
                     if not isinstance(df, pd.DataFrame) or df.empty:
@@ -2696,12 +2704,28 @@ def register_plan_detail_core(app: dash.Dash):
                         d = d[d[c_date].eq(day)]
                     if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
                         return None
-                    labs = d[c_ivl].astype(str).str.slice(0,5)
-                    labs = labs[labs.str.match(r"^\d{2}:\d{2}$")]
-                    return None if labs.empty else labs.min()
+                    labs = d[c_ivl].astype(str).map(_to_hm).dropna()
+                    return None if labs.empty else str(min(labs))
+                except Exception:
+                    return None
+            def _latest_slot(df: pd.DataFrame) -> str | None:
+                try:
+                    if not isinstance(df, pd.DataFrame) or df.empty:
+                        return None
+                    d = df.copy(); L = {str(c).strip().lower(): c for c in d.columns}
+                    c_date = L.get("date") or L.get("day")
+                    c_ivl  = _pick_ivl_col(d)
+                    if c_date:
+                        d[c_date] = pd.to_datetime(d[c_date], errors="coerce").dt.date
+                        d = d[d[c_date].eq(day)]
+                    if not c_ivl or c_ivl not in d.columns or d[c_ivl].isna().all():
+                        return None
+                    labs = d[c_ivl].astype(str).map(_to_hm).dropna()
+                    return None if labs.empty else str(max(labs))
                 except Exception:
                     return None
             start_hhmm = None
+            end_hhmm = None
             try:
                 ch0 = (p.get("channel") or p.get("lob") or "").split(",")[0].strip().lower()
                 sk  = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
@@ -2709,22 +2733,25 @@ def register_plan_detail_core(app: dash.Dash):
                     vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual")
                     for dfx in (vF, vA):
                         start_hhmm = start_hhmm or _earliest_slot(dfx)
+                        end_hhmm   = end_hhmm   or _latest_slot(dfx)
                 elif ch0 == "chat":
                     for key in ("chat_forecast_volume","chat_actual_volume"):
                         dfx = _load_ts_with_fallback(key, sk)
                         start_hhmm = start_hhmm or _earliest_slot(dfx)
+                        end_hhmm   = end_hhmm   or _latest_slot(dfx)
                 elif ch0 in ("outbound","ob"):
                     for key in ("ob_forecast_opc","outbound_forecast_opc","ob_actual_opc","outbound_actual_opc",
                                  "ob_forecast_dials","outbound_forecast_dials","ob_actual_dials","outbound_actual_dials",
                                  "ob_forecast_calls","outbound_forecast_calls","ob_actual_calls","outbound_actual_calls"):
                         dfx = _load_ts_with_fallback(key, sk)
                         start_hhmm = start_hhmm or _earliest_slot(dfx)
+                        end_hhmm   = end_hhmm   or _latest_slot(dfx)
             except Exception:
                 start_hhmm = None
             if not start_hhmm:
                 start_hhmm = "08:00"
             from plan_detail._grain_cols import interval_cols_for_day
-            cols, _ = interval_cols_for_day(day, start_hhmm=start_hhmm)
+            cols, _ = interval_cols_for_day(day, start_hhmm=start_hhmm, end_hhmm=end_hhmm)
             return (cols,)*9
 
         @app.callback(
