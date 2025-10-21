@@ -12,6 +12,8 @@ from dash import dash_table
 from plan_store import get_plan
 from cap_store import resolve_settings, load_roster_long
 from ._grain_cols import interval_cols_for_day
+from ._common import _week_span
+from ._calc import _fill_tables_fixed
 from ._common import (
     _scope_key,
     _assemble_voice,
@@ -234,30 +236,43 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
     ivl_cols, ivl_ids = interval_cols_for_day(ref_day, ivl_min=ivl_min, start_hhmm=start_hhmm)
 
     # FW metrics
+    # Shape FW rows to match weekly view spec (fields/ordering), falling back to defaults
+    fw_metrics: List[str] = []
     try:
-        fw_saved = _load_ts_with_fallback(f"plan_{pid}_fw", "")  # not a real scope; try cap_db
-        fw_metrics = []
+        weeks = _week_span(plan.get("start_week"), plan.get("end_week"))
+        weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
+        weekly = _fill_tables_fixed(ptype, pid, weekly_fw_cols, _tick, whatif=whatif, grain='week')
+        (_upper_w, fw_w, *_rest) = weekly
+        fw_df = pd.DataFrame(fw_w or [])
+        if isinstance(fw_df, pd.DataFrame) and not fw_df.empty and "metric" in fw_df.columns:
+            fw_metrics = fw_df["metric"].astype(str).tolist()
     except Exception:
-        fw_saved = None
         fw_metrics = []
-    if isinstance(fw_saved, pd.DataFrame) and not fw_saved.empty and "metric" in fw_saved.columns:
-        fw_metrics = fw_saved["metric"].astype(str).tolist()
     if not fw_metrics:
-        fw_metrics = [
-            "Forecast", "Tactical Forecast", "Actual Volume",
-            "Forecast AHT/SUT", "Actual AHT/SUT", "Occupancy",
-        ]
+        fw_metrics = ["Forecast","Tactical Forecast","Actual Volume","Forecast AHT/SUT","Actual AHT/SUT","Occupancy"]
     fw_i = pd.DataFrame({"metric": fw_metrics})
     for lab in ivl_ids:
         fw_i[lab] = np.nan
 
-    # Upper rows
-    upper = pd.DataFrame({"metric": [
+    # Upper rows shaped to match weekly Upper spec (fields/ordering)
+    upper_rows: List[str] = [
         "FTE Required @ Forecast Volume",
         "FTE Required @ Actual Volume",
         "Projected Handling Capacity (#)",
         "Projected Service Level",
-    ]})
+    ]
+    try:
+        # Reuse weekly call above to pick weekly upper spec
+        weeks = _week_span(plan.get("start_week"), plan.get("end_week"))
+        weekly_fw_cols = [{"name": "Metric", "id": "metric", "editable": False}] + [{"name": w, "id": w} for w in weeks]
+        weekly = _fill_tables_fixed(ptype, pid, weekly_fw_cols, _tick, whatif=whatif, grain='week')
+        (upper_wk, *_rest) = weekly
+        upper_df_w = pd.DataFrame(getattr(upper_wk, 'data', None) or [])
+        if isinstance(upper_df_w, pd.DataFrame) and not upper_df_w.empty and "metric" in upper_df_w.columns:
+            upper_rows = upper_df_w["metric"].astype(str).tolist()
+    except Exception:
+        pass
+    upper = pd.DataFrame({"metric": upper_rows})
     for lab in ivl_ids:
         upper[lab] = 0.0
 
