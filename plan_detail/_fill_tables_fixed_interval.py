@@ -1,4 +1,6 @@
 from __future__ import annotations
+import math
+import re
 import pandas as pd
 import numpy as np
 import datetime as dt
@@ -6,7 +8,7 @@ from typing import List, Tuple, Optional
 from dash import dash_table
 
 from plan_store import get_plan
-from cap_store import resolve_settings
+from cap_store import resolve_settings, load_roster_long
 from ._common import _week_span, _scope_key, _assemble_voice, _load_ts_with_fallback
 from ._calc import _fill_tables_fixed
 from ._grain_cols import interval_cols_for_day
@@ -301,6 +303,158 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
             _fill_fw_from_voice(vA, "Actual Volume", "volume")
             _fill_fw_from_voice(vF, "Forecast AHT/SUT", "aht_sec")
             _fill_fw_from_voice(vA, "Actual AHT/SUT", "aht_sec")
+            # Interval-level capacity and service level using roster staffing (Voice)
+            def _parse_hhmm_to_min(hhmm: str) -> int:
+                try:
+                    h, m = hhmm.split(":", 1)
+                    return int(h) * 60 + int(m)
+                except Exception:
+                    return 0
+            cov_start_min = _parse_hhmm_to_min(start_hhmm)
+            ivl_sec = max(60, int(ivl_min) * 60)
+            T_sec = int(float(settings.get("sl_seconds", 20) or 20))
+            target_sl_pct = float(settings.get("target_sl", 0.8) or 0.8) * 100.0
+            occ_cap = float(settings.get("occupancy_cap_voice", 0.85) or 0.85)
+            def _erlang_c(A: float, N: int) -> float:
+                if N <= 0: return 1.0
+                if A <= 0: return 0.0
+                if A >= N: return 1.0
+                term = 1.0; ssum = term
+                for k in range(1, N):
+                    term *= A / k
+                    ssum += term
+                term *= A / N
+                last = term * (N / (N - A))
+                denom = ssum + last
+                if denom <= 0: return 1.0
+                p0 = 1.0 / denom
+                return last * p0
+            def _erlang_sl(calls: float, aht: float, agents: float) -> float:
+                if aht <= 0 or ivl_sec <= 0 or agents <= 0: return 0.0
+                if calls <= 0: return 1.0
+                A = (calls * aht) / ivl_sec
+                pw = _erlang_c(A, int(math.floor(agents)))
+                return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (T_sec / max(1.0, aht)))))
+            def _erlang_calls_capacity(agents: float, aht: float) -> float:
+                if agents <= 0 or aht <= 0: return 0.0
+                target = target_sl_pct / 100.0
+                def sl_for(x: int) -> float:
+                    return _erlang_sl(x, aht, agents)
+                hi = max(1, int((agents * ivl_sec) / aht))
+                if sl_for(hi) < target:
+                    cap_hi = hi
+                else:
+                    lo = 0
+                    cap_hi = hi
+                    while sl_for(cap_hi) >= target and cap_hi < 10000000:
+                        lo = cap_hi
+                        cap_hi *= 2
+                    while lo < cap_hi:
+                        mid = (lo + cap_hi + 1) // 2
+                        if sl_for(mid) >= target:
+                            lo = mid
+                        else:
+                            cap_hi = mid - 1
+                    cap_hi = lo
+                occ_erlangs = occ_cap * agents
+                occ_calls_cap = (occ_erlangs * ivl_sec) / max(1.0, aht)
+                return float(min(cap_hi, occ_calls_cap))
+            # staffing by interval slot from roster
+            def _staff_by_slot_for_day() -> dict[str, float]:
+                try:
+                    rl = load_roster_long()
+                except Exception:
+                    return {}
+                if not isinstance(rl, pd.DataFrame) or rl.empty:
+                    return {}
+                df = rl.copy()
+                def _col(opts):
+                    for c in opts:
+                        if c in df.columns:
+                            return c
+                    return None
+                c_ba  = _col(["Business Area","business area","vertical"]) 
+                c_sba = _col(["Sub Business Area","sub business area","sub_ba"]) 
+                c_lob = _col(["LOB","lob","Channel","channel"]) 
+                c_site= _col(["Site","site","Location","location","Country","country"]) 
+                BA  = p.get("vertical"); SBA = p.get("sub_ba"); LOB = (p.get("channel") or p.get("lob") or "").split(",")[0].strip()
+                SITE= (p.get("site") or p.get("location") or p.get("country") or "").strip()
+                def _match(series, val):
+                    if not val or not isinstance(series, pd.Series):
+                        return pd.Series([True]*len(series))
+                    s = series.astype(str).str.strip().str.lower()
+                    return s.eq(str(val).strip().lower())
+                msk = pd.Series([True]*len(df))
+                if c_ba:  msk &= _match(df[c_ba], BA)
+                if c_sba and (SBA not in (None, "")): msk &= _match(df[c_sba], SBA)
+                if c_lob: msk &= _match(df[c_lob], LOB)
+                if c_site and (SITE not in (None, "")): msk &= _match(df[c_site], SITE)
+                df = df[msk]
+                if "is_leave" in df.columns:
+                    df = df[~df["is_leave"].astype(bool)]
+                if "date" not in df.columns or "entry" not in df.columns:
+                    return {}
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+                df = df[df["date"].eq(ref_day)]
+                if df.empty:
+                    return {}
+                slots = {lab: 0.0 for lab in ivl_ids}
+                for _, rr in df.iterrows():
+                    try:
+                        sft = str(rr.get("entry", "")).strip()
+                        m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", sft)
+                        if not m:
+                            continue
+                        sh, sm, eh, em = map(int, m.groups())
+                        sh = min(23, max(0, sh)); eh = min(24, max(0, eh))
+                        start_min = sh*60 + sm
+                        end_min   = eh*60 + em
+                        if end_min <= start_min:
+                            end_min += 24*60
+                        for idx2, lab2 in enumerate(ivl_ids):
+                            slot_abs = cov_start_min + idx2*ivl_min
+                            slot_rel = slot_abs
+                            if slot_rel < start_min:
+                                slot_rel += 24*60
+                            if start_min <= slot_rel < end_min:
+                                slots[lab2] = slots.get(lab2, 0.0) + 1.0
+                    except Exception:
+                        continue
+                return slots
+            staff_counts = _staff_by_slot_for_day()
+            # extract per-slot forecast volume and aht
+            def _slot_map(df: pd.DataFrame, val_col: str) -> dict[str, float]:
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    return {}
+                d2 = df.copy(); d2["date"] = pd.to_datetime(d2.get("date"), errors="coerce").dt.date
+                d2 = d2[d2["date"].eq(ref_day)]
+                if "interval" not in d2.columns:
+                    return {}
+                labs2 = d2["interval"].astype(str).str.slice(0,5)
+                vals2 = pd.to_numeric(d2.get(val_col), errors="coerce").fillna(0.0).tolist()
+                return dict(zip(labs2, vals2))
+            vol_map = _slot_map(vF, "volume")
+            aht_map = _slot_map(vF, "aht_sec")
+            # ensure rows exist
+            if "Projected Handling Capacity (#)" not in upper_all["metric"].astype(str).values:
+                upper_all = pd.concat([upper_all, pd.DataFrame({"metric":["Projected Handling Capacity (#)"]})], ignore_index=True)
+                for iv in ivl_ids:
+                    if iv not in upper_all.columns:
+                        upper_all[iv] = 0.0
+            if "Projected Service Level" not in upper_all["metric"].astype(str).values:
+                upper_all = pd.concat([upper_all, pd.DataFrame({"metric":["Projected Service Level"]})], ignore_index=True)
+                for iv in ivl_ids:
+                    if iv not in upper_all.columns:
+                        upper_all[iv] = 0.0
+            mser = upper_all["metric"].astype(str)
+            for lab in ivl_ids:
+                agents = float(staff_counts.get(lab, 0.0) or 0.0)
+                aht = float(aht_map.get(lab, aht_map.get(ivl_ids[0], 300.0)) or 300.0)
+                calls = float(vol_map.get(lab, 0.0))
+                cap_calls = _erlang_calls_capacity(agents, aht)
+                sl_pct = 100.0 * _erlang_sl(calls, aht, agents)
+                upper_all.loc[mser == "Projected Handling Capacity (#)", lab] = cap_calls
+                upper_all.loc[mser == "Projected Service Level", lab] = sl_pct
         elif ch0 == "chat":
             sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
             s = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch0)
@@ -415,6 +569,159 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
             _fill_fw_from_chat(volA if isinstance(volA, pd.DataFrame) and not volA.empty else volF,
                                ahtA if isinstance(ahtA, pd.DataFrame) and not ahtA.empty else ahtF,
                                "Actual Volume", "Actual AHT/SUT")
+            # Interval-level capacity and service level (Chat)
+            def _parse_hhmm_to_min(hhmm: str) -> int:
+                try:
+                    h, m = hhmm.split(":", 1)
+                    return int(h) * 60 + int(m)
+                except Exception:
+                    return 0
+            cov_start_min = _parse_hhmm_to_min(start_hhmm)
+            ivl_sec = max(60, int(ivl_min) * 60)
+            T_sec = int(float(s.get("chat_sl_seconds", s.get("sl_seconds", 20)) or 20))
+            target_sl_pct = float(s.get("chat_target_sl", s.get("target_sl", 0.8)) or 0.8) * 100.0
+            occ_cap = float(s.get("occupancy_cap_chat", s.get("util_chat", s.get("occupancy_cap_voice", 0.85))) or 0.85)
+            conc = float(s.get("chat_concurrency", 1.5) or 1.0)
+            def _erlang_c(A: float, N: int) -> float:
+                if N <= 0: return 1.0
+                if A <= 0: return 0.0
+                if A >= N: return 1.0
+                term = 1.0; ssum = term
+                for k in range(1, N):
+                    term *= A / k
+                    ssum += term
+                term *= A / N
+                last = term * (N / (N - A))
+                denom = ssum + last
+                if denom <= 0: return 1.0
+                p0 = 1.0 / denom
+                return last * p0
+            def _erlang_sl(calls: float, aht: float, agents: float) -> float:
+                if aht <= 0 or ivl_sec <= 0 or agents <= 0: return 0.0
+                if calls <= 0: return 1.0
+                A = (calls * aht) / ivl_sec
+                pw = _erlang_c(A, int(math.floor(agents)))
+                return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (T_sec / max(1.0, aht)))))
+            def _erlang_calls_capacity(agents: float, aht: float) -> float:
+                if agents <= 0 or aht <= 0: return 0.0
+                target = target_sl_pct / 100.0
+                def sl_for(x: int) -> float:
+                    return _erlang_sl(x, aht, agents)
+                hi = max(1, int((agents * ivl_sec) / aht))
+                if sl_for(hi) < target:
+                    cap_hi = hi
+                else:
+                    lo = 0
+                    cap_hi = hi
+                    while sl_for(cap_hi) >= target and cap_hi < 10000000:
+                        lo = cap_hi
+                        cap_hi *= 2
+                    while lo < cap_hi:
+                        mid = (lo + cap_hi + 1) // 2
+                        if sl_for(mid) >= target:
+                            lo = mid
+                        else:
+                            cap_hi = mid - 1
+                    cap_hi = lo
+                occ_erlangs = occ_cap * agents
+                occ_calls_cap = (occ_erlangs * ivl_sec) / max(1.0, aht)
+                return float(min(cap_hi, occ_calls_cap))
+            # staffing counts by slot
+            def _staff_by_slot_for_day() -> dict[str, float]:
+                try:
+                    rl = load_roster_long()
+                except Exception:
+                    return {}
+                if not isinstance(rl, pd.DataFrame) or rl.empty:
+                    return {}
+                df = rl.copy()
+                def _col(opts):
+                    for c in opts:
+                        if c in df.columns:
+                            return c
+                    return None
+                c_ba  = _col(["Business Area","business area","vertical"]) 
+                c_sba = _col(["Sub Business Area","sub business area","sub_ba"]) 
+                c_lob = _col(["LOB","lob","Channel","channel"]) 
+                c_site= _col(["Site","site","Location","location","Country","country"]) 
+                BA  = p.get("vertical"); SBA = p.get("sub_ba"); LOB = (p.get("channel") or p.get("lob") or "").split(",")[0].strip()
+                SITE= (p.get("site") or p.get("location") or p.get("country") or "").strip()
+                def _match(series, val):
+                    if not val or not isinstance(series, pd.Series):
+                        return pd.Series([True]*len(series))
+                    s = series.astype(str).str.strip().str.lower()
+                    return s.eq(str(val).strip().lower())
+                msk = pd.Series([True]*len(df))
+                if c_ba:  msk &= _match(df[c_ba], BA)
+                if c_sba and (SBA not in (None, "")): msk &= _match(df[c_sba], SBA)
+                if c_lob: msk &= _match(df[c_lob], LOB)
+                if c_site and (SITE not in (None, "")): msk &= _match(df[c_site], SITE)
+                df = df[msk]
+                if "is_leave" in df.columns:
+                    df = df[~df["is_leave"].astype(bool)]
+                if "date" not in df.columns or "entry" not in df.columns:
+                    return {}
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+                df = df[df["date"].eq(ref_day)]
+                if df.empty:
+                    return {}
+                slots = {lab: 0.0 for lab in ivl_ids}
+                for _, rr in df.iterrows():
+                    try:
+                        sft = str(rr.get("entry", "")).strip()
+                        m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", sft)
+                        if not m:
+                            continue
+                        sh, sm, eh, em = map(int, m.groups())
+                        sh = min(23, max(0, sh)); eh = min(24, max(0, eh))
+                        start_min = sh*60 + sm
+                        end_min   = eh*60 + em
+                        if end_min <= start_min:
+                            end_min += 24*60
+                        for idx2, lab2 in enumerate(ivl_ids):
+                            slot_abs = cov_start_min + idx2*ivl_min
+                            slot_rel = slot_abs
+                            if slot_rel < start_min:
+                                slot_rel += 24*60
+                            if start_min <= slot_rel < end_min:
+                                slots[lab2] = slots.get(lab2, 0.0) + 1.0
+                    except Exception:
+                        continue
+                return slots
+            staff_counts = _staff_by_slot_for_day()
+            # per-slot items and aht
+            def _slot_map(df: pd.DataFrame, val_col: str) -> dict[str, float]:
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    return {}
+                d2 = df.copy(); d2["date"] = pd.to_datetime(d2.get("date"), errors="coerce").dt.date
+                d2 = d2[d2["date"].eq(ref_day)]
+                if "interval" not in d2.columns:
+                    return {}
+                labs2 = d2["interval"].astype(str).str.slice(0,5)
+                vals2 = pd.to_numeric(d2.get(val_col), errors="coerce").fillna(0.0).tolist()
+                return dict(zip(labs2, vals2))
+            vol_map = _slot_map(volF, "items")
+            aht_map = _slot_map(ahtF, "aht_sec") if isinstance(ahtF, pd.DataFrame) else {}
+            # ensure rows exist
+            if "Projected Handling Capacity (#)" not in upper_all["metric"].astype(str).values:
+                upper_all = pd.concat([upper_all, pd.DataFrame({"metric":["Projected Handling Capacity (#)"]})], ignore_index=True)
+                for iv in ivl_ids:
+                    if iv not in upper_all.columns:
+                        upper_all[iv] = 0.0
+            if "Projected Service Level" not in upper_all["metric"].astype(str).values:
+                upper_all = pd.concat([upper_all, pd.DataFrame({"metric":["Projected Service Level"]})], ignore_index=True)
+                for iv in ivl_ids:
+                    if iv not in upper_all.columns:
+                        upper_all[iv] = 0.0
+            mser = upper_all["metric"].astype(str)
+            for lab in ivl_ids:
+                agents = float(staff_counts.get(lab, 0.0) or 0.0)
+                aht_eff = float(aht_map.get(lab, aht_map.get(ivl_ids[0], 240.0)) or 240.0) / max(0.1, conc)
+                calls = float(vol_map.get(lab, 0.0))
+                cap_calls = _erlang_calls_capacity(agents, aht_eff)
+                sl_pct = 100.0 * _erlang_sl(calls, aht_eff, agents)
+                upper_all.loc[mser == "Projected Handling Capacity (#)", lab] = cap_calls
+                upper_all.loc[mser == "Projected Service Level", lab] = sl_pct
         elif ch0 in ("outbound", "ob"):
             sk = _scope_key(p.get("vertical"), p.get("sub_ba"), ch0)
             s = resolve_settings(ba=p.get("vertical"), subba=p.get("sub_ba"), lob=ch0)
@@ -570,6 +877,174 @@ def _fill_tables_fixed_interval(ptype, pid, _fw_cols_unused, _tick, whatif=None,
                                 fw_i.loc[m == row_name_aht, slot] = float(mapping_aht[slot])
             _fill_fw_from_ob(F, "Forecast", "Forecast AHT/SUT")
             _fill_fw_from_ob(A if isinstance(A, pd.DataFrame) and not A.empty else F, "Actual Volume", "Actual AHT/SUT")
+            # Interval-level capacity and service level (Outbound)
+            def _parse_hhmm_to_min(hhmm: str) -> int:
+                try:
+                    h, m = hhmm.split(":", 1)
+                    return int(h) * 60 + int(m)
+                except Exception:
+                    return 0
+            cov_start_min = _parse_hhmm_to_min(start_hhmm)
+            ivl_sec = max(60, int(ivl_min) * 60)
+            T_sec = int(float(s.get("ob_sl_seconds", s.get("sl_seconds", 20)) or 20))
+            target_sl_pct = float(s.get("ob_target_sl", s.get("target_sl", 0.8)) or 0.8) * 100.0
+            occ_cap = float(s.get("occupancy_cap_ob", s.get("util_ob", s.get("occupancy_cap_voice", 0.85))) or 0.85)
+            def _erlang_c(A: float, N: int) -> float:
+                if N <= 0: return 1.0
+                if A <= 0: return 0.0
+                if A >= N: return 1.0
+                term = 1.0; ssum = term
+                for k in range(1, N):
+                    term *= A / k
+                    ssum += term
+                term *= A / N
+                last = term * (N / (N - A))
+                denom = ssum + last
+                if denom <= 0: return 1.0
+                p0 = 1.0 / denom
+                return last * p0
+            def _erlang_sl(calls: float, aht: float, agents: float) -> float:
+                if aht <= 0 or ivl_sec <= 0 or agents <= 0: return 0.0
+                if calls <= 0: return 1.0
+                A = (calls * aht) / ivl_sec
+                pw = _erlang_c(A, int(math.floor(agents)))
+                return max(0.0, min(1.0, 1.0 - pw * math.exp(-max(0.0, (agents - A)) * (T_sec / max(1.0, aht)))))
+            def _erlang_calls_capacity(agents: float, aht: float) -> float:
+                if agents <= 0 or aht <= 0: return 0.0
+                target = target_sl_pct / 100.0
+                def sl_for(x: int) -> float:
+                    return _erlang_sl(x, aht, agents)
+                hi = max(1, int((agents * ivl_sec) / aht))
+                if sl_for(hi) < target:
+                    cap_hi = hi
+                else:
+                    lo = 0
+                    cap_hi = hi
+                    while sl_for(cap_hi) >= target and cap_hi < 10000000:
+                        lo = cap_hi
+                        cap_hi *= 2
+                    while lo < cap_hi:
+                        mid = (lo + cap_hi + 1) // 2
+                        if sl_for(mid) >= target:
+                            lo = mid
+                        else:
+                            cap_hi = mid - 1
+                    cap_hi = lo
+                occ_erlangs = occ_cap * agents
+                occ_calls_cap = (occ_erlangs * ivl_sec) / max(1.0, aht)
+                return float(min(cap_hi, occ_calls_cap))
+            # staffing counts by slot
+            def _staff_by_slot_for_day() -> dict[str, float]:
+                try:
+                    rl = load_roster_long()
+                except Exception:
+                    return {}
+                if not isinstance(rl, pd.DataFrame) or rl.empty:
+                    return {}
+                df = rl.copy()
+                def _col(opts):
+                    for c in opts:
+                        if c in df.columns:
+                            return c
+                    return None
+                c_ba  = _col(["Business Area","business area","vertical"]) 
+                c_sba = _col(["Sub Business Area","sub business area","sub_ba"]) 
+                c_lob = _col(["LOB","lob","Channel","channel"]) 
+                c_site= _col(["Site","site","Location","location","Country","country"]) 
+                BA  = p.get("vertical"); SBA = p.get("sub_ba"); LOB = (p.get("channel") or p.get("lob") or "").split(",")[0].strip()
+                SITE= (p.get("site") or p.get("location") or p.get("country") or "").strip()
+                def _match(series, val):
+                    if not val or not isinstance(series, pd.Series):
+                        return pd.Series([True]*len(series))
+                    s = series.astype(str).str.strip().str.lower()
+                    return s.eq(str(val).strip().lower())
+                msk = pd.Series([True]*len(df))
+                if c_ba:  msk &= _match(df[c_ba], BA)
+                if c_sba and (SBA not in (None, "")): msk &= _match(df[c_sba], SBA)
+                if c_lob: msk &= _match(df[c_lob], LOB)
+                if c_site and (SITE not in (None, "")): msk &= _match(df[c_site], SITE)
+                df = df[msk]
+                if "is_leave" in df.columns:
+                    df = df[~df["is_leave"].astype(bool)]
+                if "date" not in df.columns or "entry" not in df.columns:
+                    return {}
+                df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date
+                df = df[df["date"].eq(ref_day)]
+                if df.empty:
+                    return {}
+                slots = {lab: 0.0 for lab in ivl_ids}
+                for _, rr in df.iterrows():
+                    try:
+                        sft = str(rr.get("entry", "")).strip()
+                        m = re.match(r"^(\d{1,2}):(\d{2})\s*-\s*(\d{1,2}):(\d{2})$", sft)
+                        if not m:
+                            continue
+                        sh, sm, eh, em = map(int, m.groups())
+                        sh = min(23, max(0, sh)); eh = min(24, max(0, eh))
+                        start_min = sh*60 + sm
+                        end_min   = eh*60 + em
+                        if end_min <= start_min:
+                            end_min += 24*60
+                        for idx2, lab2 in enumerate(ivl_ids):
+                            slot_abs = cov_start_min + idx2*ivl_min
+                            slot_rel = slot_abs
+                            if slot_rel < start_min:
+                                slot_rel += 24*60
+                            if start_min <= slot_rel < end_min:
+                                slots[lab2] = slots.get(lab2, 0.0) + 1.0
+                    except Exception:
+                        continue
+                return slots
+            staff_counts = _staff_by_slot_for_day()
+            # Map expected calls per slot from F
+            def _calls_map(df: pd.DataFrame) -> dict[str, float]:
+                if not isinstance(df, pd.DataFrame) or df.empty:
+                    return {}
+                d2 = df.copy(); d2["date"] = pd.to_datetime(d2.get("date"), errors="coerce").dt.date
+                d2 = d2[d2["date"].eq(ref_day)]
+                if "interval" not in d2.columns:
+                    return {}
+                labs2 = d2["interval"].astype(str).str.slice(0,5)
+                def _calls_row(row):
+                    opc = float(row.get("opc", 0.0) or 0.0)
+                    rpc_ct = float(row.get("rpc", 0.0) or 0.0)
+                    conn = row.get("connect_rate", None)
+                    rpcr = row.get("rpc_rate", None)
+                    try: conn = float(conn)
+                    except Exception: conn = None
+                    try: rpcr = float(rpcr)
+                    except Exception: rpcr = None
+                    if rpc_ct and rpc_ct > 0: return rpc_ct
+                    if (conn is not None) and (rpcr is not None): return opc * conn * rpcr
+                    if conn is not None: return opc * conn
+                    return opc
+                calls = d2.apply(_calls_row, axis=1).astype(float).tolist()
+                return dict(zip(labs2, calls))
+            calls_map = _calls_map(F)
+            aht_map = {}
+            if isinstance(F, pd.DataFrame) and not F.empty and "aht" in F.columns:
+                d3 = F.copy(); d3 = d3[d3["date"].eq(ref_day)]
+                labs3 = d3["interval"].astype(str).str.slice(0,5)
+                aht_map = dict(zip(labs3, pd.to_numeric(d3.get("aht"), errors="coerce").fillna(0.0).tolist()))
+            if "Projected Handling Capacity (#)" not in upper_all["metric"].astype(str).values:
+                upper_all = pd.concat([upper_all, pd.DataFrame({"metric":["Projected Handling Capacity (#)"]})], ignore_index=True)
+                for iv in ivl_ids:
+                    if iv not in upper_all.columns:
+                        upper_all[iv] = 0.0
+            if "Projected Service Level" not in upper_all["metric"].astype(str).values:
+                upper_all = pd.concat([upper_all, pd.DataFrame({"metric":["Projected Service Level"]})], ignore_index=True)
+                for iv in ivl_ids:
+                    if iv not in upper_all.columns:
+                        upper_all[iv] = 0.0
+            mser = upper_all["metric"].astype(str)
+            for lab in ivl_ids:
+                agents = float(staff_counts.get(lab, 0.0) or 0.0)
+                aht = float(aht_map.get(lab, aht_map.get(ivl_ids[0], 240.0)) or 240.0)
+                calls = float(calls_map.get(lab, 0.0))
+                cap_calls = _erlang_calls_capacity(agents, aht)
+                sl_pct = 100.0 * _erlang_sl(calls, aht, agents)
+                upper_all.loc[mser == "Projected Handling Capacity (#)", lab] = cap_calls
+                upper_all.loc[mser == "Projected Service Level", lab] = sl_pct
         else:
             pass
     except Exception:
