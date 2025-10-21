@@ -210,27 +210,34 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     for d in day_ids:
         upper[d] = 0.0
 
+    # Helper to match FW rows by label variations
+    mser_all = fw_d["metric"].astype(str).str.lower()
+    def _mask_forecast_vol():
+        return mser_all.str.contains("forecast") & ~mser_all.str.contains("aht|sut|occupancy|overtime|backlog|queue")
+    def _mask_tactical_vol():
+        return mser_all.str.contains("tactical") & ~mser_all.str.contains("aht|sut|occupancy|overtime|backlog|queue")
+    def _mask_actual_vol():
+        return (mser_all.str.contains("actual") & (mser_all.str.contains("volume") | ~mser_all.str.contains("aht|sut|occupancy|overtime|backlog|queue")))
+    def _mask_forecast_aht():
+        return mser_all.str.contains("forecast") & mser_all.str.contains("aht|sut")
+    def _mask_actual_aht():
+        return mser_all.str.contains("actual") & mser_all.str.contains("aht|sut")
+    def _mask_occupancy():
+        return mser_all.str.contains("occupancy")
+
     # Channel-specific fills for FW
     if ch == "voice":
         vF = _assemble_voice(sk, "forecast"); vA = _assemble_voice(sk, "actual"); vT = _assemble_voice(sk, "tactical")
         volF = _series_sum_by_day(vF, "volume"); volA = _series_sum_by_day(vA, "volume"); volT = _series_sum_by_day(vT, "volume")
         ahtF = _weighted_aht_by_day(vF, "volume", "aht_sec"); ahtA = _weighted_aht_by_day(vA, "volume", "aht_sec")
-        mser = fw_d["metric"].astype(str)
-        if "Forecast" in mser.values:
-            for d in day_ids:
-                if d in volF: fw_d.loc[mser == "Forecast", d] = float(volF[d])
-        if "Tactical Forecast" in mser.values:
-            for d in day_ids:
-                if d in volT: fw_d.loc[mser == "Tactical Forecast", d] = float(volT[d])
-        if "Actual Volume" in mser.values:
-            for d in day_ids:
-                if d in volA: fw_d.loc[mser == "Actual Volume", d] = float(volA[d])
-        if "Forecast AHT/SUT" in mser.values:
-            for d in day_ids:
-                if d in ahtF: fw_d.loc[mser == "Forecast AHT/SUT", d] = float(ahtF[d])
-        if "Actual AHT/SUT" in mser.values:
-            for d in day_ids:
-                if d in ahtA: fw_d.loc[mser == "Actual AHT/SUT", d] = float(ahtA[d])
+        m_f = _mask_forecast_vol(); m_t = _mask_tactical_vol(); m_a = _mask_actual_vol()
+        m_fa = _mask_forecast_aht(); m_aa = _mask_actual_aht()
+        for d in day_ids:
+            if d in volF: fw_d.loc[m_f, d] = float(volF[d])
+            if d in volT: fw_d.loc[m_t, d] = float(volT[d])
+            if d in volA: fw_d.loc[m_a, d] = float(volA[d])
+            if d in ahtF: fw_d.loc[m_fa, d] = float(ahtF[d])
+            if d in ahtA: fw_d.loc[m_aa, d] = float(ahtA[d])
 
     elif ch == "chat":
         cF = _assemble_chat(sk, "forecast"); cA = _assemble_chat(sk, "actual"); cT = _assemble_chat(sk, "tactical")
@@ -238,19 +245,12 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         volA = _series_sum_by_day(cA, "items") or _series_sum_by_day(cA, "volume")
         volT = _series_sum_by_day(cT, "items") or _series_sum_by_day(cT, "volume")
         ahtF = _series_sum_by_day(_assemble_chat(sk, "forecast"), "aht_sec")
-        mser = fw_d["metric"].astype(str)
-        if "Forecast" in mser.values:
-            for d in day_ids:
-                if d in volF: fw_d.loc[mser == "Forecast", d] = float(volF[d])
-        if "Tactical Forecast" in mser.values:
-            for d in day_ids:
-                if d in volT: fw_d.loc[mser == "Tactical Forecast", d] = float(volT[d])
-        if "Actual Volume" in mser.values:
-            for d in day_ids:
-                if d in volA: fw_d.loc[mser == "Actual Volume", d] = float(volA[d])
-        if "Forecast AHT/SUT" in mser.values:
-            for d in day_ids:
-                if d in ahtF: fw_d.loc[mser == "Forecast AHT/SUT", d] = float(ahtF[d])
+        m_f = _mask_forecast_vol(); m_t = _mask_tactical_vol(); m_a = _mask_actual_vol(); m_fa = _mask_forecast_aht()
+        for d in day_ids:
+            if d in volF: fw_d.loc[m_f, d] = float(volF[d])
+            if d in volT: fw_d.loc[m_t, d] = float(volT[d])
+            if d in volA: fw_d.loc[m_a, d] = float(volA[d])
+            if d in ahtF: fw_d.loc[m_fa, d] = float(ahtF[d])
 
     elif ch in ("outbound", "ob"):
         oF = _assemble_ob(sk, "forecast"); oA = _assemble_ob(sk, "actual"); oT = _assemble_ob(sk, "tactical")
@@ -259,19 +259,12 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
         colT = "opc" if isinstance(oT, pd.DataFrame) and ("opc" in oT.columns) else "items"
         volF = _series_sum_by_day(oF, colF); volA = _series_sum_by_day(oA, colA); volT = _series_sum_by_day(oT, colT)
         ahtF = _series_sum_by_day(oF, "aht_sec")
-        mser = fw_d["metric"].astype(str)
-        if "Forecast" in mser.values:
-            for d in day_ids:
-                if d in volF: fw_d.loc[mser == "Forecast", d] = float(volF[d])
-        if "Tactical Forecast" in mser.values:
-            for d in day_ids:
-                if d in volT: fw_d.loc[mser == "Tactical Forecast", d] = float(volT[d])
-        if "Actual Volume" in mser.values:
-            for d in day_ids:
-                if d in volA: fw_d.loc[mser == "Actual Volume", d] = float(volA[d])
-        if "Forecast AHT/SUT" in mser.values:
-            for d in day_ids:
-                if d in ahtF: fw_d.loc[mser == "Forecast AHT/SUT", d] = float(ahtF[d])
+        m_f = _mask_forecast_vol(); m_t = _mask_tactical_vol(); m_a = _mask_actual_vol(); m_fa = _mask_forecast_aht()
+        for d in day_ids:
+            if d in volF: fw_d.loc[m_f, d] = float(volF[d])
+            if d in volT: fw_d.loc[m_t, d] = float(volT[d])
+            if d in volA: fw_d.loc[m_a, d] = float(volA[d])
+            if d in ahtF: fw_d.loc[m_fa, d] = float(ahtF[d])
 
     # Occupancy daily (best-effort when interval series + roster are available)
     try:
