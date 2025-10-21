@@ -843,9 +843,10 @@ def register_plan_detail_core(app: dash.Dash):
             State("plan-grain", "data"),
             State("plan-whatif", "data"),            # what-if deltas
             Input("fw-backlog-carryover", "value"),  # backlog toggle now triggers refresh
+            Input("interval-date", "value"),         # selected date for interval grain
             prevent_initial_call=True,
         )
-        def _fill_tables(ptype, pid, fw_cols, _tick, grain, whatif, backlog_toggle):
+        def _fill_tables(ptype, pid, fw_cols, _tick, grain, whatif, backlog_toggle, interval_date):
             w = dict(whatif or {})
             try:
                 w["backlog_carryover"] = bool(backlog_toggle)
@@ -866,7 +867,7 @@ def register_plan_detail_core(app: dash.Dash):
             elif g == 'day':
                 results = _fill_tables_fixed_daily(ptype, pid, fw_cols, _tick, w)
             elif g == 'interval':
-                results = _fill_tables_fixed_interval(ptype, pid, fw_cols, _tick, w)
+                results = _fill_tables_fixed_interval(ptype, pid, fw_cols, _tick, w, sel_date=interval_date)
             else:
                 results = _fill_tables_fixed(ptype, pid, fw_cols, _tick, w, grain='week')
 
@@ -2595,6 +2596,53 @@ def register_plan_detail_core(app: dash.Dash):
                 except Exception:
                     return 0
             return f(d.get("aht_delta")), f(d.get("shrink_delta")), f(d.get("attr_delta")), f(d.get("vol_delta"))
+        
+        @app.callback(
+            Output("interval-date", "options", allow_duplicate=True),
+            Output("interval-date", "value", allow_duplicate=True),
+            Input("plan-detail-id", "data"),
+            Input("plan-refresh-tick", "data"),
+            Input("plan-grain", "data"),
+            prevent_initial_call=True,
+        )
+        def _interval_date_options(pid, _tick, grain):
+            # Only populate when interval grain is active
+            if str(grain or 'week').lower() != 'interval' or not pid:
+                raise dash.exceptions.PreventUpdate
+            try:
+                p = get_plan(pid) or {}
+            except Exception:
+                p = {}
+            weeks = _week_span(p.get("start_week"), p.get("end_week"))
+            # Build list of ISO dates across plan weeks (Mon..Sun per week)
+            dates = []
+            for w in weeks or []:
+                try:
+                    base = pd.to_datetime(w).date()
+                except Exception:
+                    continue
+                for i in range(7):
+                    d = (base + pd.Timedelta(days=i)).date().isoformat()
+                    dates.append(d)
+            # Deduplicate preserve order
+            seen = set(); ordered = []
+            for d in dates:
+                if d not in seen:
+                    seen.add(d); ordered.append(d)
+            opts = [{"label": pd.to_datetime(d).strftime("%a %Y-%m-%d"), "value": d} for d in ordered]
+            value = ordered[0] if ordered else None
+            return opts, value
+
+        @app.callback(
+            Output("interval-date-wrap", "style", allow_duplicate=True),
+            Input("plan-grain", "data"),
+            prevent_initial_call=True,
+        )
+        def _toggle_interval_date_wrap(grain):
+            g = str(grain or 'week').lower()
+            if g == 'interval':
+                return {"display": "inline-flex", "alignItems": "center", "gap": "8px", "marginBottom": "8px"}
+            return {"display": "none"}
 
         @app.callback(
             Output("opt-created-by", "children", allow_duplicate=True),
