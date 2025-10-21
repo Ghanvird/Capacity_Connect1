@@ -15,8 +15,12 @@ from capacity_core import voice_requirements_interval, min_agents, _ivl_minutes_
 
 def _broadcast_daily_to_intervals(df: pd.DataFrame, interval_ids: List[str]) -> pd.DataFrame:
     """Convert a daily-matrix DataFrame (metric + date cols) to an interval-matrix
-    for a single representative day by uniformly distributing additive rows across intervals.
-    Percent/AHT/SUT-like rows are replicated per interval.
+    for a single representative day without aggregating/splitting values.
+
+    Behavior:
+    - For percent/rate/AHT/SUT-like rows: replicate the day's value to every interval column.
+    - For other rows: also replicate the day's value to every interval column (no equal distribution).
+      This avoids manufacturing interval-level splits and keeps day-level inputs "as-is".
     """
     if not isinstance(df, pd.DataFrame) or df.empty:
         return pd.DataFrame(columns=["metric"] + list(interval_ids))
@@ -44,20 +48,15 @@ def _broadcast_daily_to_intervals(df: pd.DataFrame, interval_ids: List[str]) -> 
             or ("aht/sut" in s)
         )
 
-    n = max(1, len(interval_ids))
     for i, row in df.iterrows():
         name = str(row.get("metric", ""))
         try:
             val = float(pd.to_numeric(row.get(rep_day), errors="coerce"))
         except Exception:
             val = 0.0
-        if is_percent_like(name):
-            for ivl in interval_ids:
-                out.at[i, ivl] = val
-        else:
-            per = float(val) / float(n)
-            for ivl in interval_ids:
-                out.at[i, ivl] = per
+        # Replicate for all rows (no equal distribution)
+        for ivl in interval_ids:
+            out.at[i, ivl] = val
 
     return out[["metric"] + list(interval_ids)]
 
