@@ -962,6 +962,26 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                 psl = 100.0 * (num / tot_vol)
             upper_d.loc[upper_d["metric"].eq("Projected Handling Capacity (#)") , dd] = phc
             upper_d.loc[upper_d["metric"].eq("Projected Service Level")         , dd] = psl
+            # FW daily Occupancy (load-weighted across intervals)
+            try:
+                fm = fw_d["metric"].astype(str).str.strip()
+                if "Occupancy" in fm.values:
+                    ivl_sec = max(60, int(float(settings.get("interval_minutes", 30) or 30)) * 60)
+                    occ_cap = float(settings.get("occupancy_cap_voice", 0.85) or 0.85)
+                    if tot_vol > 0:
+                        num_occ = 0.0
+                        for lab, v in vols.items():
+                            aht = float(ahts.get(lab, ahts.get(next(iter(ahts), lab), 300.0)) or 300.0)
+                            ag  = float(staff.get(lab, 0.0) or 0.0)
+                            A = (float(v or 0.0) * aht) / ivl_sec
+                            occ = min(occ_cap, (A / max(ag, 1e-6)) if ag > 0 else 0.0)
+                            num_occ += float(v or 0.0) * occ
+                        occ_day_pct = 100.0 * (num_occ / tot_vol)
+                    else:
+                        occ_day_pct = 0.0
+                    fw_d.loc[fm == "Occupancy", dd] = float(occ_day_pct)
+            except Exception:
+                pass
     elif ch0 == "chat":
         # Chat: concurrency-aware Erlang rollup
         for dd in day_ids:
@@ -1023,6 +1043,26 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                 psl=100.0*(num/tot_vol)
             upper_d.loc[upper_d["metric"].eq("Projected Handling Capacity (#)") , dd] = phc
             upper_d.loc[upper_d["metric"].eq("Projected Service Level")         , dd] = psl
+            # FW daily Occupancy (load-weighted across intervals)
+            try:
+                fm = fw_d["metric"].astype(str).str.strip()
+                if "Occupancy" in fm.values:
+                    ivl_sec = max(60, int(float(settings.get("chat_interval_minutes", settings.get("interval_minutes", 30)) or 30)) * 60)
+                    occ_cap = float(settings.get("occupancy_cap_chat", settings.get("util_chat", settings.get("occupancy_cap_voice", 0.85))) or 0.85)
+                    if tot_vol > 0:
+                        num_occ = 0.0
+                        for lab, v in vols.items():
+                            aht = float(ahts.get(lab, ahts.get(next(iter(ahts), lab), 240.0)) or 240.0) / max(0.1, conc)
+                            ag  = float(staff.get(lab, 0.0) or 0.0)
+                            A = (float(v or 0.0) * aht) / ivl_sec
+                            occ = min(occ_cap, (A / max(ag, 1e-6)) if ag > 0 else 0.0)
+                            num_occ += float(v or 0.0) * occ
+                        occ_day_pct = 100.0 * (num_occ / tot_vol)
+                    else:
+                        occ_day_pct = 0.0
+                    fw_d.loc[fm == "Occupancy", dd] = float(occ_day_pct)
+            except Exception:
+                pass
     elif ch0 in ("outbound","ob"):
         for dd in day_ids:
             try:
@@ -1108,6 +1148,24 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
                 psl=100.0*(num/tot_vol)
             upper_d.loc[upper_d["metric"].eq("Projected Handling Capacity (#)") , dd]=phc
             upper_d.loc[upper_d["metric"].eq("Projected Service Level")         , dd]=psl
+            # FW daily Occupancy (load-weighted across intervals)
+            try:
+                fm = fw_d["metric"].astype(str).str.strip()
+                if "Occupancy" in fm.values:
+                    if tot_vol > 0:
+                        num_occ = 0.0
+                        for lab, v in calls.items():
+                            aht = float(aht_map.get(lab, aht_map.get(next(iter(aht_map), lab), 240.0)) or 240.0)
+                            ag  = float(staff.get(lab, 0.0) or 0.0)
+                            A = (float(v or 0.0) * aht) / ivl_sec
+                            occ = min(occ, (A / max(ag, 1e-6)) if ag > 0 else 0.0)
+                            num_occ += float(v or 0.0) * occ
+                        occ_day_pct = 100.0 * (num_occ / tot_vol)
+                    else:
+                        occ_day_pct = 0.0
+                    fw_d.loc[fm == "Occupancy", dd] = float(occ_day_pct)
+            except Exception:
+                pass
 
     # Persist rollups for reuse: date, metric, value
     try:
