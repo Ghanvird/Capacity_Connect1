@@ -319,6 +319,55 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
             out[k] = float(g_num.loc[k] / v) if v > 0 else 0.0
         return out
 
+    def _is_interval_level(df: pd.DataFrame) -> bool:
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return False
+        L = {str(c).strip().lower(): c for c in df.columns}
+        c_ivl = L.get("interval") or L.get("time")
+        if not c_ivl or c_ivl not in df.columns:
+            return False
+        return df[c_ivl].notna().any()
+
+    def _series_day_aware(df: pd.DataFrame, val_col: str, default_agg: str = "sum", no_agg_if_daylevel: bool = True) -> dict:
+        """Return date->value mapping.
+        - If interval-level data present and default_agg provided: aggregate by date using default_agg.
+        - If day-level (no interval labels) and no_agg_if_daylevel: pick first non-null per date (no aggregation).
+        """
+        if not isinstance(df, pd.DataFrame) or df.empty or val_col not in df.columns:
+            return {}
+        d = df.copy(); d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.date.astype(str)
+        if _is_interval_level(d):
+            return _series_from_df(d, val_col, agg=default_agg)
+        # Day-level: no aggregation (take first per date)
+        d = d.dropna(subset=["date"])  # keep clean
+        out = {}
+        for k, sub in d.groupby("date"):
+            # first non-null value in val_col
+            vals = pd.to_numeric(sub[val_col], errors="coerce")
+            first = vals.dropna().iloc[0] if not vals.dropna().empty else np.nan
+            out[k] = float(first) if pd.notna(first) else 0.0
+        return out
+
+    def _aht_day_aware(df: pd.DataFrame, vol_col: str, aht_col: str, default_agg: str = "mean") -> dict:
+        """AHT mapping with interval-aware behavior.
+        - If interval-level present: use volume-weighted AHT.
+        - If day-level: no aggregation; take first available AHT per day (assumes provided per-day values).
+        """
+        if not isinstance(df, pd.DataFrame) or df.empty:
+            return {}
+        if _is_interval_level(df):
+            # Weighted across intervals
+            return _weighted_aht(df, vol_col, aht_col)
+        # Day-level: pick first available value per date
+        d = df.copy(); d["date"] = pd.to_datetime(d["date"], errors="coerce").dt.date.astype(str)
+        vals = pd.to_numeric(d.get(aht_col), errors="coerce") if aht_col in d.columns else pd.Series(dtype=float)
+        out = {}
+        for k, sub in d.groupby("date"):
+            s = pd.to_numeric(sub.get(aht_col), errors="coerce") if aht_col in sub.columns else pd.Series(dtype=float)
+            first = s.dropna().iloc[0] if not s.dropna().empty else np.nan
+            out[k] = float(first) if pd.notna(first) else 0.0
+        return out
+
     def _write_row(df: pd.DataFrame, row_name: str, mapping: dict):
         if not isinstance(df, pd.DataFrame) or df.empty:
             return df
@@ -355,11 +404,12 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     # Back Office
     elif ch_key in ("back office", "bo"):
         bF = _assemble_bo(sk, "forecast"); bA = _assemble_bo(sk, "actual"); bT = _assemble_bo(sk, "tactical")
-        volF = _series_from_df(bF, "items")
-        volA = _series_from_df(bA, "items")
-        volT = _series_from_df(bT, "items")
-        ahtF = _series_from_df(bF, "aht_sec", agg="mean")
-        ahtA = _series_from_df(bA, "aht_sec", agg="mean")
+        # No aggregation for BO: treat data as day-level and take first value per day
+        volF = _series_day_aware(bF, "items", default_agg="sum", no_agg_if_daylevel=True)
+        volA = _series_day_aware(bA, "items", default_agg="sum", no_agg_if_daylevel=True)
+        volT = _series_day_aware(bT, "items", default_agg="sum", no_agg_if_daylevel=True)
+        ahtF = _aht_day_aware(bF, "items", "aht_sec", default_agg="mean")
+        ahtA = _aht_day_aware(bA, "items", "aht_sec", default_agg="mean")
         fw_d = _write_row(fw_d, "Forecast", volF)
         fw_d = _write_row(fw_d, "Tactical Forecast", volT)
         fw_d = _write_row(fw_d, "Actual Volume", volA)
@@ -368,8 +418,12 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     # Chat
     elif ch_key == "chat":
         cF = _assemble_chat(sk, "forecast"); cA = _assemble_chat(sk, "actual"); cT = _assemble_chat(sk, "tactical")
-        volF = _series_from_df(cF, "items"); volA = _series_from_df(cA, "items"); volT = _series_from_df(cT, "items")
-        ahtF = _series_from_df(cF, "aht_sec", agg="mean"); ahtA = _series_from_df(cA, "aht_sec", agg="mean")
+        # Interval → day sum; if day-level provided, no aggregation (first per day)
+        volF = _series_day_aware(cF, "items", default_agg="sum", no_agg_if_daylevel=True)
+        volA = _series_day_aware(cA, "items", default_agg="sum", no_agg_if_daylevel=True)
+        volT = _series_day_aware(cT, "items", default_agg="sum", no_agg_if_daylevel=True)
+        ahtF = _aht_day_aware(cF, "items", "aht_sec", default_agg="mean")
+        ahtA = _aht_day_aware(cA, "items", "aht_sec", default_agg="mean")
         fw_d = _write_row(fw_d, "Forecast", volF)
         fw_d = _write_row(fw_d, "Tactical Forecast", volT)
         fw_d = _write_row(fw_d, "Actual Volume", volA)
@@ -378,10 +432,10 @@ def _fill_tables_fixed_daily(ptype, pid, _fw_cols_unused, _tick, whatif=None):
     # Outbound
     elif ch_key in ("outbound", "ob"):
         oF = _assemble_ob(sk, "forecast"); oA = _assemble_ob(sk, "actual"); oT = _assemble_ob(sk, "tactical")
-        volF = _series_from_df(oF, "opc") or _series_from_df(oF, "items")
-        volA = _series_from_df(oA, "opc") or _series_from_df(oA, "items")
-        volT = _series_from_df(oT, "opc") or _series_from_df(oT, "items")
-        ahtF = _series_from_df(oF, "aht_sec", agg="mean"); ahtA = _series_from_df(oA, "aht_sec", agg="mean")
+        volF = _series_day_aware(oF, "opc", default_agg="sum", no_agg_if_daylevel=True) or _series_day_aware(oF, "items", default_agg="sum", no_agg_if_daylevel=True)
+        volA = _series_day_aware(oA, "opc", default_agg="sum", no_agg_if_daylevel=True) or _series_day_aware(oA, "items", default_agg="sum", no_agg_if_daylevel=True)
+        volT = _series_day_aware(oT, "opc", default_agg="sum", no_agg_if_daylevel=True) or _series_day_aware(oT, "items", default_agg="sum", no_agg_if_daylevel=True)
+        ahtF = _aht_day_aware(oF, "opc", "aht_sec", default_agg="mean"); ahtA = _aht_day_aware(oA, "opc", "aht_sec", default_agg="mean")
         fw_d = _write_row(fw_d, "Forecast", volF)
         fw_d = _write_row(fw_d, "Tactical Forecast", volT)
         fw_d = _write_row(fw_d, "Actual Volume", volA)
